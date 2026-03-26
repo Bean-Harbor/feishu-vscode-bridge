@@ -14,4 +14,10 @@ path = "src/lib.rs"
 name = "bridge-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "setup-gui"
+path = "src/bin/setup_gui.rs"
+
 [dependencies]
+eframe = "0.28"
+open = "5"
