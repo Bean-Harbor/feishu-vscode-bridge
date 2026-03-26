@@ -1,0 +1,17 @@
+[package]
+name = "feishu-vscode-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Feishu <-> VS Code command bridge with plan execution and continue-all support"
+repository = "https://github.com/Bean-Harbor/feishu-vscode-bridge"
+
+[lib]
+name = "feishu_vscode_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bridge-cli"
+path = "src/main.rs"
+
+[dependencies]
