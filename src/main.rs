@@ -1,5 +1,10 @@
-use feishu_vscode_bridge::feishu::FeishuClient;
-use feishu_vscode_bridge::{execute_continue_all, parse_intent, Intent, StepResult};
+use std::sync::Mutex;
+
+use feishu_vscode_bridge::feishu::{FeishuClient, InboundMessage};
+use feishu_vscode_bridge::vscode;
+use feishu_vscode_bridge::{help_text, parse_intent, Intent, MessageDedup};
+
+static DEDUP: Mutex<Option<MessageDedup>> = Mutex::new(None);
 
 fn main() {
     let arg = std::env::args()
@@ -12,8 +17,10 @@ fn main() {
     }
 }
 
-/// 启动 WebSocket 长连接，监听飞书消息并自动回复
 fn run_listen() {
+    // 初始化去重器（TTL 600 秒）
+    *DEDUP.lock().unwrap() = Some(MessageDedup::new(600));
+
     let mut client = match FeishuClient::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -33,32 +40,78 @@ fn run_listen() {
     }
 }
 
-/// 处理一条来自飞书的用户消息
-fn handle_message(client: &FeishuClient, msg: feishu_vscode_bridge::feishu::InboundMessage) {
+fn handle_message(client: &FeishuClient, msg: InboundMessage) {
+    // 去重
+    if let Ok(mut guard) = DEDUP.lock() {
+        if let Some(dedup) = guard.as_mut() {
+            if dedup.is_duplicate(&msg.message_id) {
+                return;
+            }
+        }
+    }
+
     println!("📩 收到消息 [{}]: {}", msg.sender_id, msg.text);
 
-    let reply_text = match parse_intent(&msg.text) {
-        Intent::ContinueAll => {
-            let mut steps = vec![
-                "git -C harborbeacon-desktop status".to_string(),
-                "git -C harborbeacon-desktop add -A".to_string(),
-                "git -C harborbeacon-desktop push".to_string(),
-            ];
-            let summary = execute_continue_all(&mut steps, |s| {
-                StepResult::Ok(format!("ok: {s}"))
-            });
-            summary.lines.join("\n")
-        }
-        Intent::Continue => "收到继续。请在接入层执行下一步。".to_string(),
-        Intent::Status => "状态查询：待接入会话存储。".to_string(),
-        Intent::Help | Intent::Unknown => {
-            "bridge-cli 指令:\n  执行全部 - 一键执行所有步骤\n  继续 - 执行下一步\n  状态 - 查看进度"
-                .to_string()
-        }
-    };
+    let reply_text = dispatch(&msg.text);
 
     if let Err(e) = client.reply(&msg, &reply_text) {
         eprintln!("❌ 回复失败: {e}");
+    }
+}
+
+fn dispatch(text: &str) -> String {
+    match parse_intent(text) {
+        // ── VS Code ──
+        Intent::OpenFile { path, line } => {
+            let r = vscode::open_file(&path, line);
+            r.to_reply(&format!("打开 {path}"))
+        }
+        Intent::OpenFolder { path } => {
+            let r = vscode::open_folder(&path);
+            r.to_reply(&format!("打开目录 {path}"))
+        }
+        Intent::InstallExtension { ext_id } => {
+            let r = vscode::install_extension(&ext_id);
+            r.to_reply(&format!("安装扩展 {ext_id}"))
+        }
+        Intent::UninstallExtension { ext_id } => {
+            let r = vscode::uninstall_extension(&ext_id);
+            r.to_reply(&format!("卸载扩展 {ext_id}"))
+        }
+        Intent::ListExtensions => {
+            let r = vscode::list_extensions();
+            r.to_reply("已安装扩展")
+        }
+        Intent::DiffFiles { file1, file2 } => {
+            let r = vscode::diff_files(&file1, &file2);
+            r.to_reply(&format!("diff {file1} {file2}"))
+        }
+
+        // ── Git ──
+        Intent::GitStatus { repo } => {
+            let r = vscode::git_status(repo.as_deref());
+            r.to_reply("Git 状态")
+        }
+        Intent::GitPull { repo } => {
+            let r = vscode::git_pull(repo.as_deref());
+            r.to_reply("Git Pull")
+        }
+        Intent::GitPushAll { repo, message } => {
+            let r = vscode::git_push_all(repo.as_deref(), &message);
+            r.to_reply("Git Push")
+        }
+
+        // ── Shell ──
+        Intent::RunShell { cmd } => {
+            let r = vscode::run_shell(&cmd);
+            r.to_reply(&format!("$ {cmd}"))
+        }
+
+        // ── 帮助 ──
+        Intent::Help => help_text().to_string(),
+        Intent::Unknown(raw) => {
+            format!("❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令")
+        }
     }
 }
 
