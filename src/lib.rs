@@ -7,6 +7,8 @@ pub enum Intent {
     Unknown,
 }
 
+pub mod feishu;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepResult {
     Ok(String),

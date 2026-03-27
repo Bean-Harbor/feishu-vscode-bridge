@@ -44,7 +44,11 @@ fn open_workspace_directory() -> Result<(), String> {
 fn launch_vscode_for_workspace() -> Result<(), String> {
     let workspace = workspace_dir()?;
 
-    if let Ok(status) = Command::new("code").arg(".").current_dir(&workspace).status() {
+    if let Ok(status) = Command::new("code")
+        .arg(".")
+        .current_dir(&workspace)
+        .status()
+    {
         if status.success() {
             return Ok(());
         }
@@ -58,8 +62,12 @@ fn launch_vscode_for_workspace() -> Result<(), String> {
                 "{local}\\Programs\\Microsoft VS Code\\Code.exe"
             )));
         }
-        candidates.push(PathBuf::from(r"C:\Program Files\Microsoft VS Code\Code.exe"));
-        candidates.push(PathBuf::from(r"C:\Program Files (x86)\Microsoft VS Code\Code.exe"));
+        candidates.push(PathBuf::from(
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+        ));
+        candidates.push(PathBuf::from(
+            r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
+        ));
 
         for path in candidates {
             if path.exists() {
@@ -89,7 +97,12 @@ fn launch_vscode_for_workspace() -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
-        for binary in ["code", "/usr/bin/code", "/usr/local/bin/code", "/snap/bin/code"] {
+        for binary in [
+            "code",
+            "/usr/bin/code",
+            "/usr/local/bin/code",
+            "/snap/bin/code",
+        ] {
             let result = Command::new(binary)
                 .arg(".")
                 .current_dir(&workspace)
@@ -114,8 +127,9 @@ fn short_path_label(path: &Path) -> String {
 struct SetupWizard {
     step: Step,
     vscode_status: Option<VscodeStatus>,
-    webhook_url: String,
-    sign_secret: String,
+    app_id: String,
+    app_secret: String,
+    chat_id: String,
     config_saved: bool,
     save_error: Option<String>,
     action_message: Option<String>,
@@ -126,8 +140,9 @@ impl Default for SetupWizard {
         Self {
             step: Step::Welcome,
             vscode_status: None,
-            webhook_url: String::new(),
-            sign_secret: String::new(),
+            app_id: String::new(),
+            app_secret: String::new(),
+            chat_id: String::new(),
             config_saved: false,
             save_error: None,
             action_message: None,
@@ -313,11 +328,7 @@ impl SetupWizard {
                     .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                     .show(column, |ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new(steps[index].0)
-                                    .strong()
-                                    .color(fill),
-                            );
+                            ui.label(egui::RichText::new(steps[index].0).strong().color(fill));
                             ui.label(
                                 egui::RichText::new(steps[index].1)
                                     .small()
@@ -426,10 +437,7 @@ impl SetupWizard {
                         );
                     }
                     if ui.button("打开项目目录").clicked() {
-                        self.set_action_result(
-                            open_workspace_directory(),
-                            "已打开当前项目目录。",
-                        );
+                        self.set_action_result(open_workspace_directory(), "已打开当前项目目录。");
                     }
                     if ui.button("重新检测").clicked() {
                         self.action_message = None;
@@ -466,12 +474,12 @@ impl SetupWizard {
                 egui::Frame::group(ui.style())
                     .inner_margin(egui::Margin::same(14.0))
                     .show(ui, |ui| {
-                    ui.label(egui::RichText::new("安装步骤").strong());
-                    ui.add_space(4.0);
-                    ui.label("1. 点击下方「打开下载页」按钮");
-                    ui.label("2. 根据您的操作系统下载并运行安装包");
-                    ui.label("3. 安装完成后，回到本页面点击「重新检测」");
-                });
+                        ui.label(egui::RichText::new("安装步骤").strong());
+                        ui.add_space(4.0);
+                        ui.label("1. 点击下方「打开下载页」按钮");
+                        ui.label("2. 根据您的操作系统下载并运行安装包");
+                        ui.label("3. 安装完成后，回到本页面点击「重新检测」");
+                    });
 
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
@@ -501,7 +509,7 @@ impl SetupWizard {
     fn ui_feishu(&mut self, ui: &mut egui::Ui) {
         let input_width = ui.available_width();
 
-        ui.heading("填写飞书机器人配置");
+        ui.heading("填写飞书应用配置");
         ui.add_space(8.0);
 
         egui::Frame::group(ui.style())
@@ -509,40 +517,52 @@ impl SetupWizard {
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("你需要准备").strong());
                 ui.add_space(8.0);
-                ui.label("1. 飞书群机器人生成的 Webhook URL");
-                ui.label("2. 若开启签名校验，则准备对应的 Sign Secret");
+                ui.label("1. 在飞书开放平台创建应用后获取的 App ID");
+                ui.label("2. 对应的 App Secret");
                 ui.label("3. 保存后会直接写入项目根目录 .env");
             });
 
         ui.add_space(14.0);
 
-        ui.label(egui::RichText::new("飞书机器人 Webhook URL  *").strong());
+        ui.label(egui::RichText::new("飞书 App ID  *").strong());
         ui.label(
-            egui::RichText::new(
-                "在飞书群中添加「自定义机器人」，将生成的 Webhook 地址粘贴至此。",
-            )
-            .small()
-            .color(egui::Color32::GRAY),
-        );
-        ui.add_space(4.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.webhook_url)
-                .hint_text("https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx")
-                .desired_width(input_width),
-        );
-        ui.add_space(16.0);
-
-        ui.label(egui::RichText::new("签名密钥 Sign Secret（可选）").strong());
-        ui.label(
-            egui::RichText::new("若机器人开启了签名校验，请填写；否则留空。")
+            egui::RichText::new("在飞书开放平台「凭证与基础信息」页面获取。")
                 .small()
                 .color(egui::Color32::GRAY),
         );
         ui.add_space(4.0);
         ui.add(
-            egui::TextEdit::singleline(&mut self.sign_secret)
-                .hint_text("留空则不启用签名校验")
+            egui::TextEdit::singleline(&mut self.app_id)
+                .hint_text("cli_xxxxxxxxxxxxxxxx")
+                .desired_width(input_width),
+        );
+        ui.add_space(16.0);
+
+        ui.label(egui::RichText::new("飞书 App Secret  *").strong());
+        ui.label(
+            egui::RichText::new("与 App ID 配对的密钥，请妥善保管。")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        ui.add_space(4.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.app_secret)
+                .hint_text("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
                 .password(true)
+                .desired_width(input_width),
+        );
+        ui.add_space(16.0);
+
+        ui.label(egui::RichText::new("Chat ID（可选）").strong());
+        ui.label(
+            egui::RichText::new("指定消息发送目标。留空则自动发送到机器人的第一个 P2P 单聊或群聊。")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        ui.add_space(4.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.chat_id)
+                .hint_text("oc_xxxxxxxx（留空自动发现）")
                 .desired_width(input_width),
         );
         ui.add_space(20.0);
@@ -553,7 +573,8 @@ impl SetupWizard {
             ui.add_space(8.0);
         }
 
-        let can_proceed = !self.webhook_url.trim().is_empty();
+        let can_proceed =
+            !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty();
 
         ui.horizontal(|ui| {
             if ui.button("← 上一步").clicked() {
@@ -563,10 +584,7 @@ impl SetupWizard {
             }
             ui.add_space(8.0);
             if ui
-                .add_enabled(
-                    can_proceed,
-                    egui::Button::new("保存并完成  →"),
-                )
+                .add_enabled(can_proceed, egui::Button::new("保存并完成  →"))
                 .clicked()
             {
                 match self.save_config() {
@@ -585,7 +603,7 @@ impl SetupWizard {
         if !can_proceed {
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("请填写 Webhook URL 后再继续")
+                egui::RichText::new("请填写 App ID 和 App Secret 后再继续")
                     .small()
                     .color(egui::Color32::from_rgb(220, 160, 0)),
             );
@@ -644,13 +662,17 @@ impl SetupWizard {
 
     // ── 保存配置到 .env ──
     fn save_config(&self) -> Result<(), String> {
-        let content = format!(
+        let mut content = format!(
             "# feishu-vscode-bridge 配置（由 setup-gui 生成）\n\
-             FEISHU_WEBHOOK_URL={}\n\
-             FEISHU_SIGN_SECRET={}\n",
-            self.webhook_url.trim(),
-            self.sign_secret.trim(),
+             FEISHU_APP_ID={}\n\
+             FEISHU_APP_SECRET={}\n",
+            self.app_id.trim(),
+            self.app_secret.trim(),
         );
+        let chat_id = self.chat_id.trim();
+        if !chat_id.is_empty() {
+            content.push_str(&format!("FEISHU_CHAT_ID={chat_id}\n"));
+        }
         std::fs::write(".env", content).map_err(|e| e.to_string())
     }
 }
