@@ -129,7 +129,6 @@ struct SetupWizard {
     vscode_status: Option<VscodeStatus>,
     app_id: String,
     app_secret: String,
-    chat_id: String,
     config_saved: bool,
     save_error: Option<String>,
     action_message: Option<String>,
@@ -142,7 +141,6 @@ impl Default for SetupWizard {
             vscode_status: None,
             app_id: String::new(),
             app_secret: String::new(),
-            chat_id: String::new(),
             config_saved: false,
             save_error: None,
             action_message: None,
@@ -551,20 +549,6 @@ impl SetupWizard {
                 .password(true)
                 .desired_width(input_width),
         );
-        ui.add_space(16.0);
-
-        ui.label(egui::RichText::new("Chat ID（可选）").strong());
-        ui.label(
-            egui::RichText::new("指定消息发送目标。留空则自动发送到机器人的第一个 P2P 单聊或群聊。")
-                .small()
-                .color(egui::Color32::GRAY),
-        );
-        ui.add_space(4.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.chat_id)
-                .hint_text("oc_xxxxxxxx（留空自动发现）")
-                .desired_width(input_width),
-        );
         ui.add_space(20.0);
 
         // 错误提示
@@ -635,7 +619,7 @@ impl SetupWizard {
 
         ui.add_space(14.0);
         ui.label("启动命令");
-        ui.code("cargo run --bin bridge-cli -- 执行全部");
+        ui.code("cargo run --bin bridge-cli -- listen");
         ui.add_space(14.0);
 
         ui.horizontal_wrapped(|ui| {
@@ -662,17 +646,13 @@ impl SetupWizard {
 
     // ── 保存配置到 .env ──
     fn save_config(&self) -> Result<(), String> {
-        let mut content = format!(
+        let content = format!(
             "# feishu-vscode-bridge 配置（由 setup-gui 生成）\n\
              FEISHU_APP_ID={}\n\
              FEISHU_APP_SECRET={}\n",
             self.app_id.trim(),
             self.app_secret.trim(),
         );
-        let chat_id = self.chat_id.trim();
-        if !chat_id.is_empty() {
-            content.push_str(&format!("FEISHU_CHAT_ID={chat_id}\n"));
-        }
         std::fs::write(".env", content).map_err(|e| e.to_string())
     }
 }
