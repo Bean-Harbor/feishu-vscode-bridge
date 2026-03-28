@@ -30,6 +30,7 @@
 - Completed end-to-end validation in Feishu for a non-default approval policy: with `BRIDGE_APPROVAL_REQUIRED=git_pull`, sending `git pull` produced a pending-approval card and clicking `批准` successfully triggered `card.action.trigger` and the follow-up card reply
 - Completed end-to-end validation in Feishu for the default `git push` approval flow: sending `git push` produced a pending-approval card, clicking `批准` completed the auto commit, and the resulting commit was pushed to `origin/main`
 - Changed empty-worktree `git push` handling so `nothing to commit` is treated as a successful no-op instead of a failed plan step
+- Completed end-to-end validation in Feishu for empty-worktree `git push`: after the fix was pushed and the repo was clean, sending `git push` and clicking `批准` completed successfully without creating a new commit or leaving a paused session behind
 - Confirmed local macOS `setup-gui` currently crashes at runtime, so `.env` was prepared manually for listener validation
 
 ### Files Added
@@ -64,6 +65,7 @@
 - Live Feishu validation: send `执行计划 git status; $ false; $ pwd`, then click card button `重新执行失败步骤`
 - Live Feishu validation: send `执行计划 git status; $ test -f /tmp/...flag; $ pwd`, let step 2 fail once, create the missing flag file, then click `重新执行失败步骤`
 - Live Feishu validation: send `git push`, then click card button `批准`, and verify that the generated `auto commit via feishu-bridge` commit reaches `origin/main`
+- Live Feishu validation: with a clean repo after commit `535cfb1`, send `git push`, click card button `批准`, and verify that no new commit is created, `origin/main` stays unchanged, and `.feishu-vscode-bridge-session.json` is cleared
 
 ### Live Debugging Notes
 
@@ -93,6 +95,11 @@
      - clicking `批准` delivered `card.action.trigger` and the bridge sent the follow-up card successfully
      - the bridge created commit `047bce9` with message `auto commit via feishu-bridge`
      - the generated commit reached `origin/main`, proving the default approval path completes commit plus push end to end
+- Empty-worktree `git push` validation also confirmed that:
+     - after the no-op handling fix was pushed in commit `535cfb1`, the repo was left clean and `origin/main` matched `HEAD`
+     - sending `git push` again with the default approval policy still entered the approval flow and delivered `card.action.trigger`
+     - after clicking `批准`, no new commit was created, `git log` stayed at `535cfb1`, and `.feishu-vscode-bridge-session.json` was removed
+     - this confirms the plan now completes as a successful no-op instead of pausing on a failed `git commit`
 
 ## 2026-03-27
 
