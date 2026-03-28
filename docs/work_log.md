@@ -31,7 +31,7 @@
 - Completed end-to-end validation in Feishu for the default `git push` approval flow: sending `git push` produced a pending-approval card, clicking `批准` completed the auto commit, and the resulting commit was pushed to `origin/main`
 - Changed empty-worktree `git push` handling so `nothing to commit` is treated as a successful no-op instead of a failed plan step
 - Completed end-to-end validation in Feishu for empty-worktree `git push`: after the fix was pushed and the repo was clean, sending `git push` and clicking `批准` completed successfully without creating a new commit or leaving a paused session behind
-- Confirmed local macOS `setup-gui` currently crashes at runtime, so `.env` was prepared manually for listener validation
+- Reworked macOS `setup-gui` startup to fall back to a terminal-guided flow so the binary remains usable even though the native `eframe/winit` window path crashes on this host
 
 ### Files Added
 
@@ -47,7 +47,9 @@
 - `src/vscode.rs` — fixed `open_file()` to pass `--goto` correctly
 - `src/vscode.rs` — added default workspace-path resolution for Git operations and made `git push` path-safe by executing Git subcommands directly
 - `src/vscode.rs` — treat empty-worktree `git push` as a successful no-op and added regression tests for `nothing to commit` detection
+- `src/bin/setup_gui.rs` — add a macOS terminal-guided fallback path and share `.env` writing logic between terminal and GUI flows
 - `README.md` — updated quick start, plan commands, and approval-flow test coverage
+- `Cargo.toml` — reduce `eframe` to a minimal feature set for the setup wizard build
 - `.gitignore` — ignore local persisted session state file
 
 ### Verification
@@ -66,6 +68,8 @@
 - Live Feishu validation: send `执行计划 git status; $ test -f /tmp/...flag; $ pwd`, let step 2 fail once, create the missing flag file, then click `重新执行失败步骤`
 - Live Feishu validation: send `git push`, then click card button `批准`, and verify that the generated `auto commit via feishu-bridge` commit reaches `origin/main`
 - Live Feishu validation: with a clean repo after commit `535cfb1`, send `git push`, click card button `批准`, and verify that no new commit is created, `origin/main` stays unchanged, and `.feishu-vscode-bridge-session.json` is cleared
+- `cargo check --bin setup-gui`
+- Local macOS validation: start `./target/debug/setup-gui` and confirm it enters terminal-guided setup mode instead of aborting during native window creation
 
 ### Live Debugging Notes
 

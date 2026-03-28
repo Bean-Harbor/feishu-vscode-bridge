@@ -8,12 +8,17 @@
 //!   3. 飞书配置    — 填写 Webhook URL 与签名密钥
 //!   4. 完成        — 配置已写入 .env
 
+#[cfg(not(target_os = "macos"))]
 use eframe::egui;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+#[cfg(not(target_os = "macos"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 // ──────────────────────────── 数据模型 ────────────────────────────
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
     Welcome,
@@ -28,7 +33,9 @@ enum VscodeStatus {
     NotFound,
 }
 
+#[cfg(not(target_os = "macos"))]
 const WINDOW_WIDTH: f32 = 720.0;
+#[cfg(not(target_os = "macos"))]
 const WINDOW_HEIGHT: f32 = 560.0;
 
 fn workspace_dir() -> Result<PathBuf, String> {
@@ -118,12 +125,14 @@ fn launch_vscode_for_workspace() -> Result<(), String> {
     Err("未能启动 VS Code，请确认已安装并允许从命令行打开。".to_string())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn short_path_label(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| path.display().to_string(), ToOwned::to_owned)
 }
 
+#[cfg(not(target_os = "macos"))]
 struct SetupWizard {
     step: Step,
     vscode_status: Option<VscodeStatus>,
@@ -134,6 +143,79 @@ struct SetupWizard {
     action_message: Option<String>,
 }
 
+fn save_env_file(app_id: &str, app_secret: &str) -> Result<(), String> {
+    let content = format!(
+        "# feishu-vscode-bridge 配置（由 setup-gui 生成）\n\
+         FEISHU_APP_ID={}\n\
+         FEISHU_APP_SECRET={}\n",
+        app_id.trim(),
+        app_secret.trim(),
+    );
+    std::fs::write(".env", content).map_err(|err| err.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout().flush().map_err(|err| err.to_string())?;
+
+    let mut buffer = String::new();
+    io::stdin()
+        .read_line(&mut buffer)
+        .map_err(|err| err.to_string())?;
+    Ok(buffer.trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_yes_no(prompt: &str) -> Result<bool, String> {
+    let answer = prompt_line(prompt)?;
+    Ok(matches!(answer.to_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(target_os = "macos")]
+fn run_terminal_setup() -> Result<(), String> {
+    println!("飞书 × VS Code Bridge 配置向导（macOS 终端模式）");
+    println!("当前 macOS 上图形向导存在底层窗口库兼容问题，已自动切换到终端引导模式。\n");
+
+    match detect_vscode() {
+        VscodeStatus::Detected(version) => {
+            println!("已检测到 VS Code：{version}");
+        }
+        VscodeStatus::NotFound => {
+            println!("未检测到 VS Code。请先安装后再继续：https://code.visualstudio.com/");
+            return Err("未检测到 VS Code".to_string());
+        }
+    }
+
+    if prompt_yes_no("是否现在用 VS Code 打开当前项目？(y/N): ")? {
+        launch_vscode_for_workspace()?;
+        println!("已尝试用 VS Code 打开当前项目。");
+    }
+
+    if prompt_yes_no("是否打开当前项目目录？(y/N): ")? {
+        open_workspace_directory()?;
+        println!("已打开当前项目目录。");
+    }
+
+    println!();
+    let app_id = prompt_line("请输入飞书 App ID: ")?;
+    if app_id.trim().is_empty() {
+        return Err("App ID 不能为空".to_string());
+    }
+
+    let app_secret = prompt_line("请输入飞书 App Secret: ")?;
+    if app_secret.trim().is_empty() {
+        return Err("App Secret 不能为空".to_string());
+    }
+
+    save_env_file(&app_id, &app_secret)?;
+
+    println!("\n配置已保存到项目根目录的 .env 文件。");
+    println!("下一步可运行：cargo run --bin bridge-cli -- listen");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 impl Default for SetupWizard {
     fn default() -> Self {
         Self {
@@ -207,6 +289,7 @@ fn detect_vscode() -> VscodeStatus {
 
 // ──────────────────────────── 中文字体加载 ────────────────────────────
 
+#[cfg(not(target_os = "macos"))]
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -254,6 +337,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
 // ──────────────────────────── eframe App ────────────────────────────
 
+#[cfg(not(target_os = "macos"))]
 impl eframe::App for SetupWizard {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -264,6 +348,7 @@ impl eframe::App for SetupWizard {
 
 // ──────────────────────────── 各步骤 UI ────────────────────────────
 
+#[cfg(not(target_os = "macos"))]
 impl SetupWizard {
     fn current_step_index(&self) -> usize {
         match self.step {
@@ -646,19 +731,21 @@ impl SetupWizard {
 
     // ── 保存配置到 .env ──
     fn save_config(&self) -> Result<(), String> {
-        let content = format!(
-            "# feishu-vscode-bridge 配置（由 setup-gui 生成）\n\
-             FEISHU_APP_ID={}\n\
-             FEISHU_APP_SECRET={}\n",
-            self.app_id.trim(),
-            self.app_secret.trim(),
-        );
-        std::fs::write(".env", content).map_err(|e| e.to_string())
+        save_env_file(&self.app_id, &self.app_secret)
     }
 }
 
 // ──────────────────────────── 入口 ────────────────────────────
 
+#[cfg(target_os = "macos")]
+fn main() -> eframe::Result<()> {
+    if let Err(err) = run_terminal_setup() {
+        eprintln!("配置失败：{err}");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

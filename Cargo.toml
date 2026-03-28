@@ -19,7 +19,7 @@ name = "setup-gui"
 path = "src/bin/setup_gui.rs"
 
 [dependencies]
-eframe = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "wgpu"] }
 open = "5"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
