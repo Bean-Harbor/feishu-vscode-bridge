@@ -28,6 +28,7 @@
 - Completed end-to-end validation in Feishu for `重新执行失败步骤`: callback delivery and follow-up card reply succeeded, and the persisted session correctly remained paused on the failing second step
 - Completed end-to-end validation in Feishu for the success-after-retry path: a failing second step was retried after fixing its runtime precondition, and the persisted session advanced to the third step
 - Completed end-to-end validation in Feishu for a non-default approval policy: with `BRIDGE_APPROVAL_REQUIRED=git_pull`, sending `git pull` produced a pending-approval card and clicking `批准` successfully triggered `card.action.trigger` and the follow-up card reply
+- Completed end-to-end validation in Feishu for the default `git push` approval flow: sending `git push` produced a pending-approval card, clicking `批准` completed the auto commit, and the resulting commit was pushed to `origin/main`
 - Confirmed local macOS `setup-gui` currently crashes at runtime, so `.env` was prepared manually for listener validation
 
 ### Files Added
@@ -59,6 +60,7 @@
 - Live Feishu validation: send `执行计划 git status; $ pwd`, then click card button `继续`
 - Live Feishu validation: send `执行计划 git status; $ false; $ pwd`, then click card button `重新执行失败步骤`
 - Live Feishu validation: send `执行计划 git status; $ test -f /tmp/...flag; $ pwd`, let step 2 fail once, create the missing flag file, then click `重新执行失败步骤`
+- Live Feishu validation: send `git push`, then click card button `批准`, and verify that the generated `auto commit via feishu-bridge` commit reaches `origin/main`
 
 ### Live Debugging Notes
 
@@ -83,7 +85,11 @@
      - `BRIDGE_APPROVAL_REQUIRED=git_pull` changed approval scope without code changes
      - a plain `git pull` message entered the approval flow in live Feishu
      - clicking `批准` delivered `card.action.trigger` and the bridge sent the follow-up card successfully
-- Prepared a minimal documentation-only change so the next default `git push` approval validation runs against a non-empty working tree and can exercise commit plus push end to end
+- Default `git push` approval validation also confirmed that:
+     - with default approval policy, a plain `git push` message entered the approval flow in live Feishu
+     - clicking `批准` delivered `card.action.trigger` and the bridge sent the follow-up card successfully
+     - the bridge created commit `047bce9` with message `auto commit via feishu-bridge`
+     - the generated commit reached `origin/main`, proving the default approval path completes commit plus push end to end
 
 ## 2026-03-27
 
