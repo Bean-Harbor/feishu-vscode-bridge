@@ -35,6 +35,7 @@
 - Reworked macOS `setup-gui` again to use native `osascript` dialog windows by default, while keeping the terminal flow as a fallback when native dialogs are unavailable
 - Completed the macOS native dialog flow with retry-friendly UX for missing VS Code, empty App ID/App Secret inputs, and `.env` save failures
 - Simplified the macOS native dialog flow so it only checks whether VS Code is installed, then proceeds directly to App ID / App Secret collection without prompting to open VS Code or the project directory
+- Synced the simplified macOS `setup-gui` flow to GitHub and cleaned up local repo noise by ignoring Finder-generated `.DS_Store` files so future syncs stay focused on real project changes
 
 ### Files Added
 
@@ -55,6 +56,7 @@
 - `README.md` — updated quick start, plan commands, and approval-flow test coverage
 - `Cargo.toml` — reduce `eframe` to a minimal feature set for the setup wizard build
 - `.gitignore` — ignore local persisted session state file
+- `.gitignore` — ignore macOS Finder `.DS_Store` files to avoid accidental OS metadata commits
 
 ### Verification
 
@@ -75,6 +77,7 @@
 - `cargo check --bin setup-gui`
 - Local macOS validation: start `./target/debug/setup-gui` and confirm it uses native macOS dialogs instead of the crashing `eframe/winit` window path
 - Local macOS validation: force terminal mode with `SETUP_GUI_FORCE_TERMINAL=1 cargo run --bin setup-gui` and confirm the fallback flow still completes successfully
+- GitHub sync validation: committed the simplified macOS setup flow and pushed it to `origin/main` as `fix: simplify macos setup-gui flow`
 
 ### Live Debugging Notes
 
