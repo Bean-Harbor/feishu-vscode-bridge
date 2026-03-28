@@ -155,6 +155,186 @@ fn save_env_file(app_id: &str, app_secret: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+const FORCE_TERMINAL_SETUP_ENV: &str = "SETUP_GUI_FORCE_TERMINAL";
+
+#[cfg(target_os = "macos")]
+fn escape_applescript(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn run_osascript(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|err| format!("无法启动 osascript：{err}"))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.contains("User canceled") {
+        Err("用户取消了配置向导".to_string())
+    } else {
+        Err(format!("无法运行 macOS 原生对话框：{stderr}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_choose(
+    title: &str,
+    message: &str,
+    buttons: &[&str],
+    default_button: &str,
+    cancel_button: Option<&str>,
+) -> Result<String, String> {
+    let button_list = buttons
+        .iter()
+        .map(|button| format!("\"{}\"", escape_applescript(button)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let cancel_clause = cancel_button.map_or_else(String::new, |button| {
+        format!(" cancel button \"{}\"", escape_applescript(button))
+    });
+
+    let script = format!(
+        "button returned of (display dialog \"{}\" with title \"{}\" buttons {{{}}} default button \"{}\"{} with icon note)",
+        escape_applescript(message),
+        escape_applescript(title),
+        button_list,
+        escape_applescript(default_button),
+        cancel_clause,
+    );
+
+    run_osascript(&script)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_show_info(title: &str, message: &str) -> Result<(), String> {
+    macos_choose(title, message, &["继续"], "继续", None).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_prompt(title: &str, message: &str, hidden: bool) -> Result<String, String> {
+    let hidden_clause = if hidden { " hidden answer true" } else { "" };
+    let script = format!(
+        "text returned of (display dialog \"{}\" with title \"{}\" default answer \"\" buttons {{\"取消\", \"保存\"}} default button \"保存\"{} )",
+        escape_applescript(message),
+        escape_applescript(title),
+        hidden_clause,
+    );
+    Ok(run_osascript(&script)?.trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_notify_cancelled(message: &str) -> Result<(), String> {
+    macos_show_info("已取消", message)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_prompt_required(title: &str, message: &str, field_name: &str, hidden: bool) -> Result<String, String> {
+    loop {
+        match macos_prompt(title, message, hidden) {
+            Ok(value) if !value.trim().is_empty() => return Ok(value),
+            Ok(_) => {
+                let choice = macos_choose(
+                    title,
+                    &format!("{} 不能为空。", field_name),
+                    &["取消", "重新输入"],
+                    "重新输入",
+                    Some("取消"),
+                )?;
+                if choice == "取消" {
+                    macos_notify_cancelled("本次没有保存任何飞书配置。")?;
+                    return Err("用户取消了配置向导".to_string());
+                }
+            }
+            Err(err) if err == "用户取消了配置向导" => {
+                macos_notify_cancelled("本次没有保存任何飞书配置。")?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_env_file_with_retry(app_id: &str, app_secret: &str) -> Result<(), String> {
+    loop {
+        match save_env_file(app_id, app_secret) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let choice = macos_choose(
+                    "保存失败",
+                    &format!("写入 .env 失败：{err}\n\n你可以重试，或先取消本次配置。"),
+                    &["取消", "重试"],
+                    "重试",
+                    Some("取消"),
+                )?;
+                if choice == "取消" {
+                    macos_notify_cancelled("配置未保存，你可以稍后重新运行 setup-gui。")?;
+                    return Err("用户取消了配置向导".to_string());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_native_setup() -> Result<(), String> {
+    macos_show_info(
+        "飞书 × VS Code Bridge",
+        "将使用 macOS 原生对话框完成 VS Code 检测和飞书配置。",
+    )?;
+
+    let detected_version = loop {
+        match detect_vscode() {
+            VscodeStatus::Detected(version) => break version,
+            VscodeStatus::NotFound => {
+                let choice = macos_choose(
+                    "未检测到 VS Code",
+                    "当前没有检测到 VS Code。你可以先打开官网下载页面，安装后再点重新检测。",
+                    &["取消", "打开下载页", "重新检测"],
+                    "重新检测",
+                    Some("取消"),
+                )?;
+
+                match choice.as_str() {
+                    "打开下载页" => {
+                        open::that("https://code.visualstudio.com/")
+                            .map_err(|err| err.to_string())?;
+                    }
+                    "重新检测" => {}
+                    "取消" => {
+                        macos_notify_cancelled("请先安装 VS Code，之后再重新运行 setup-gui。")?;
+                        return Err("用户取消了配置向导".to_string());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    };
+
+    macos_show_info("已检测到 VS Code", &format!("检测结果：{detected_version}"))?;
+
+    let app_id = macos_prompt_required("飞书配置", "请输入飞书 App ID：", "App ID", false)?;
+    let app_secret =
+        macos_prompt_required("飞书配置", "请输入飞书 App Secret：", "App Secret", true)?;
+
+    save_env_file_with_retry(&app_id, &app_secret)?;
+
+    macos_show_info(
+        "配置完成",
+        "配置已保存到项目根目录的 .env 文件。\n\n下一步可运行：cargo run --bin bridge-cli -- listen",
+    )?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn prompt_line(prompt: &str) -> Result<String, String> {
     print!("{prompt}");
     io::stdout().flush().map_err(|err| err.to_string())?;
@@ -175,7 +355,7 @@ fn prompt_yes_no(prompt: &str) -> Result<bool, String> {
 #[cfg(target_os = "macos")]
 fn run_terminal_setup() -> Result<(), String> {
     println!("飞书 × VS Code Bridge 配置向导（macOS 终端模式）");
-    println!("当前 macOS 上图形向导存在底层窗口库兼容问题，已自动切换到终端引导模式。\n");
+    println!("当前 macOS 原生对话框不可用，已回退到终端引导模式。\n");
 
     match detect_vscode() {
         VscodeStatus::Detected(version) => {
@@ -739,7 +919,20 @@ impl SetupWizard {
 
 #[cfg(target_os = "macos")]
 fn main() -> eframe::Result<()> {
-    if let Err(err) = run_terminal_setup() {
+    let result = if std::env::var_os(FORCE_TERMINAL_SETUP_ENV).is_some() {
+        run_terminal_setup()
+    } else {
+        match run_macos_native_setup() {
+            Ok(()) => Ok(()),
+            Err(err) if err.starts_with("无法启动 osascript") || err.starts_with("无法运行 macOS 原生对话框") => {
+                eprintln!("macOS 原生对话框不可用，切换到终端模式：{err}");
+                run_terminal_setup()
+            }
+            Err(err) => Err(err),
+        }
+    };
+
+    if let Err(err) = result {
         eprintln!("配置失败：{err}");
     }
     Ok(())

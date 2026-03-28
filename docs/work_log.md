@@ -32,6 +32,9 @@
 - Changed empty-worktree `git push` handling so `nothing to commit` is treated as a successful no-op instead of a failed plan step
 - Completed end-to-end validation in Feishu for empty-worktree `git push`: after the fix was pushed and the repo was clean, sending `git push` and clicking `批准` completed successfully without creating a new commit or leaving a paused session behind
 - Reworked macOS `setup-gui` startup to fall back to a terminal-guided flow so the binary remains usable even though the native `eframe/winit` window path crashes on this host
+- Reworked macOS `setup-gui` again to use native `osascript` dialog windows by default, while keeping the terminal flow as a fallback when native dialogs are unavailable
+- Completed the macOS native dialog flow with retry-friendly UX for missing VS Code, empty App ID/App Secret inputs, and `.env` save failures
+- Simplified the macOS native dialog flow so it only checks whether VS Code is installed, then proceeds directly to App ID / App Secret collection without prompting to open VS Code or the project directory
 
 ### Files Added
 
@@ -47,7 +50,8 @@
 - `src/vscode.rs` — fixed `open_file()` to pass `--goto` correctly
 - `src/vscode.rs` — added default workspace-path resolution for Git operations and made `git push` path-safe by executing Git subcommands directly
 - `src/vscode.rs` — treat empty-worktree `git push` as a successful no-op and added regression tests for `nothing to commit` detection
-- `src/bin/setup_gui.rs` — add a macOS terminal-guided fallback path and share `.env` writing logic between terminal and GUI flows
+- `src/bin/setup_gui.rs` — add retry/cancel flows for macOS native dialogs, keep terminal fallback, and share `.env` writing logic between all setup modes
+- `src/bin/setup_gui.rs` — simplify macOS native setup to only verify VS Code installation before collecting Feishu credentials
 - `README.md` — updated quick start, plan commands, and approval-flow test coverage
 - `Cargo.toml` — reduce `eframe` to a minimal feature set for the setup wizard build
 - `.gitignore` — ignore local persisted session state file
@@ -69,7 +73,8 @@
 - Live Feishu validation: send `git push`, then click card button `批准`, and verify that the generated `auto commit via feishu-bridge` commit reaches `origin/main`
 - Live Feishu validation: with a clean repo after commit `535cfb1`, send `git push`, click card button `批准`, and verify that no new commit is created, `origin/main` stays unchanged, and `.feishu-vscode-bridge-session.json` is cleared
 - `cargo check --bin setup-gui`
-- Local macOS validation: start `./target/debug/setup-gui` and confirm it enters terminal-guided setup mode instead of aborting during native window creation
+- Local macOS validation: start `./target/debug/setup-gui` and confirm it uses native macOS dialogs instead of the crashing `eframe/winit` window path
+- Local macOS validation: force terminal mode with `SETUP_GUI_FORCE_TERMINAL=1 cargo run --bin setup-gui` and confirm the fallback flow still completes successfully
 
 ### Live Debugging Notes
 

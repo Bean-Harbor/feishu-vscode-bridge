@@ -50,13 +50,12 @@ What it does:
 
 - Detects whether VS Code is installed before continuing
 - Guides the user to install VS Code if it is missing
-- Lets the user open the current project in VS Code or open the project directory
 - Collects Feishu webhook settings and writes them to `.env`
 
 Compatibility status:
 
 - Windows: locally compiled and launched
-- macOS: uses a terminal-guided fallback because the native `eframe/winit` window path crashes on this host during startup
+- macOS: uses native macOS dialog windows via `osascript`, including download-and-retry guidance for missing VS Code and terminal fallback when native dialogs are unavailable
 - Linux: code path implemented and checked in CI with `cargo check --bin setup-gui`
 
 ## Current Scope
@@ -126,7 +125,7 @@ Expected listener log:
 ✅ 卡片回复已发送 [...]: 卡片
 ```
 
-Note: on this macOS host, the native `eframe/winit` window path crashes at runtime, so `setup-gui` now falls back to a terminal-guided setup flow on macOS instead of aborting.
+Note: on this macOS host, the native `eframe/winit` window path crashes at runtime, so macOS `setup-gui` now uses native `osascript` dialog windows instead of the `eframe` window path. If `osascript` is unavailable, it falls back to terminal-guided setup instead of aborting.
 
 ## Approval Policy Configuration
 
