@@ -2,3 +2,4 @@
 target_*
 Cargo.lock
 .env
+.feishu-vscode-bridge-session.json

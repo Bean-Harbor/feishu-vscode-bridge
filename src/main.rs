@@ -1,19 +1,19 @@
 use std::sync::Mutex;
 
-use feishu_vscode_bridge::feishu::{FeishuClient, InboundMessage};
-use feishu_vscode_bridge::vscode;
-use feishu_vscode_bridge::{help_text, parse_intent, Intent, MessageDedup};
+use feishu_vscode_bridge::bridge::{BridgeApp, BridgeResponse, feishu_session_key, render_bridge_response, response_kind};
+use feishu_vscode_bridge::feishu::{FeishuClient, FeishuEvent, ReplyTarget};
+use feishu_vscode_bridge::MessageDedup;
 
 static DEDUP: Mutex<Option<MessageDedup>> = Mutex::new(None);
 
 fn main() {
-    let arg = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "help".to_string());
+    let arg = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let app = BridgeApp::default();
 
     match arg.as_str() {
         "listen" | "监听" => run_listen(),
-        _ => show_help(),
+        "" => show_help(),
+        _ => println!("{}", render_bridge_response(&app.dispatch(&arg, "cli"))),
     }
 }
 
@@ -34,84 +34,69 @@ fn run_listen() {
     }
     println!("✅ 飞书认证成功");
 
-    if let Err(e) = client.listen(handle_message) {
+    if let Err(e) = client.listen(handle_event) {
         eprintln!("❌ WebSocket 断开: {e}");
         std::process::exit(1);
     }
 }
 
-fn handle_message(client: &FeishuClient, msg: InboundMessage) {
-    // 去重
+fn handle_event(client: &FeishuClient, event: FeishuEvent) {
     if let Ok(mut guard) = DEDUP.lock() {
         if let Some(dedup) = guard.as_mut() {
-            if dedup.is_duplicate(&msg.message_id) {
+            if dedup.is_duplicate(event.dedup_id()) {
                 return;
             }
         }
     }
 
-    println!("📩 收到消息 [{}]: {}", msg.sender_id, msg.text);
+    match event {
+        FeishuEvent::Message(msg) => {
+            println!("📩 收到消息 [{}]: {}", msg.sender_id, msg.text);
 
-    let reply_text = dispatch(&msg.text);
+            let app = BridgeApp::default();
+            let session_key = feishu_session_key(
+                &msg.reply_target.receive_id_type,
+                &msg.reply_target.receive_id,
+            );
+            let reply = app.dispatch(&msg.text, &session_key);
 
-    if let Err(e) = client.reply(&msg, &reply_text) {
-        eprintln!("❌ 回复失败: {e}");
+            println!("↩️ 准备回复 [{}]: {}", msg.sender_id, response_kind(&reply));
+
+            if let Err(e) = send_bridge_response(client, &msg.reply_target, &reply) {
+                eprintln!("❌ 回复失败: {e}");
+            } else {
+                println!("✅ 回复已发送 [{}]: {}", msg.sender_id, response_kind(&reply));
+            }
+        }
+        FeishuEvent::CardAction(action) => {
+            println!("🖱️ 收到卡片点击 [{}]: {}", action.sender_id, action.action_command);
+
+            let app = BridgeApp::default();
+            let session_key = feishu_session_key(
+                &action.reply_target.receive_id_type,
+                &action.reply_target.receive_id,
+            );
+            let reply = app.dispatch(&action.action_command, &session_key);
+
+            println!("↩️ 准备卡片回复 [{}]: {}", action.sender_id, response_kind(&reply));
+
+            if let Err(e) = send_bridge_response(client, &action.reply_target, &reply) {
+                eprintln!("❌ 卡片回复失败: {e}");
+            } else {
+                println!("✅ 卡片回复已发送 [{}]: {}", action.sender_id, response_kind(&reply));
+            }
+        }
     }
 }
 
-fn dispatch(text: &str) -> String {
-    match parse_intent(text) {
-        // ── VS Code ──
-        Intent::OpenFile { path, line } => {
-            let r = vscode::open_file(&path, line);
-            r.to_reply(&format!("打开 {path}"))
-        }
-        Intent::OpenFolder { path } => {
-            let r = vscode::open_folder(&path);
-            r.to_reply(&format!("打开目录 {path}"))
-        }
-        Intent::InstallExtension { ext_id } => {
-            let r = vscode::install_extension(&ext_id);
-            r.to_reply(&format!("安装扩展 {ext_id}"))
-        }
-        Intent::UninstallExtension { ext_id } => {
-            let r = vscode::uninstall_extension(&ext_id);
-            r.to_reply(&format!("卸载扩展 {ext_id}"))
-        }
-        Intent::ListExtensions => {
-            let r = vscode::list_extensions();
-            r.to_reply("已安装扩展")
-        }
-        Intent::DiffFiles { file1, file2 } => {
-            let r = vscode::diff_files(&file1, &file2);
-            r.to_reply(&format!("diff {file1} {file2}"))
-        }
-
-        // ── Git ──
-        Intent::GitStatus { repo } => {
-            let r = vscode::git_status(repo.as_deref());
-            r.to_reply("Git 状态")
-        }
-        Intent::GitPull { repo } => {
-            let r = vscode::git_pull(repo.as_deref());
-            r.to_reply("Git Pull")
-        }
-        Intent::GitPushAll { repo, message } => {
-            let r = vscode::git_push_all(repo.as_deref(), &message);
-            r.to_reply("Git Push")
-        }
-
-        // ── Shell ──
-        Intent::RunShell { cmd } => {
-            let r = vscode::run_shell(&cmd);
-            r.to_reply(&format!("$ {cmd}"))
-        }
-
-        // ── 帮助 ──
-        Intent::Help => help_text().to_string(),
-        Intent::Unknown(raw) => {
-            format!("❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令")
-        }
+fn send_bridge_response(
+    client: &FeishuClient,
+    target: &ReplyTarget,
+    response: &BridgeResponse,
+) -> Result<(), String> {
+    match response {
+        BridgeResponse::Text(text) => client.send_text_to(&target.receive_id, &target.receive_id_type, text),
+        BridgeResponse::Card { fallback_text: _, card } => client.reply_card(target, card),
     }
 }
 
@@ -119,4 +104,6 @@ fn show_help() {
     println!("bridge-cli 用法:");
     println!("  bridge-cli listen   - 启动飞书监听模式（WebSocket 长连接）");
     println!("  bridge-cli 监听     - 同上");
+    println!("  bridge-cli \"执行计划 打开 Cargo.toml; git status\"   - 逐步执行计划");
+    println!("  bridge-cli \"执行全部 打开 Cargo.toml; git status\"   - 连续执行计划");
 }

@@ -4,11 +4,13 @@ use crate::executor::{run_cmd, CmdResult};
 
 /// 打开文件（可指定行号）
 pub fn open_file(path: &str, line: Option<u32>) -> CmdResult {
-    let target = match line {
-        Some(l) => format!("--goto {path}:{l}"),
-        None => path.to_string(),
-    };
-    run_cmd("code", &[&target], 10)
+    match line {
+        Some(line) => {
+            let target = format!("{path}:{line}");
+            run_cmd("code", &["--goto", &target], 10)
+        }
+        None => run_cmd("code", &[path], 10),
+    }
 }
 
 /// 安装扩展
