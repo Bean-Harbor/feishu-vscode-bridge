@@ -467,6 +467,7 @@ pub fn help_text() -> &'static str {
   git status [仓库路径]    — 查看仓库状态
   git pull [仓库路径]      — 拉取代码
   git push [提交信息]      — 提交并推送
+    未显式传仓库路径时       — 优先使用 BRIDGE_WORKSPACE_PATH
 
 ▸ Shell
   run <命令>               — 执行 shell 命令

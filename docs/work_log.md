@@ -16,6 +16,7 @@
 - Added interactive Feishu plan cards with `继续` and `执行全部` buttons
 - Added approval cards with `批准` and `拒绝` buttons for gated steps
 - Added approval policy parsing for `default` / `none` / `all` and per-command-type overrides
+- Added `BRIDGE_WORKSPACE_PATH` so Git commands can target a configured default workspace when no repo path is passed explicitly
 - Extracted bridge runtime logic from `main.rs` into a reusable `bridge.rs` module for testable session and approval orchestration
 - Added integration tests for approval card flows with a fake executor so tests do not run real `git pull` or shell commands
 - Ignored the local `.feishu-vscode-bridge-session.json` runtime state file so transient approval/session data is not synced to GitHub
@@ -41,6 +42,7 @@
 - `src/main.rs` — reduced to CLI/listener entrypoint and Feishu response dispatch
 - `src/feishu.rs` — added card callback parsing, multiline/post message parsing, and `chat_id` normalization for card replies
 - `src/vscode.rs` — fixed `open_file()` to pass `--goto` correctly
+- `src/vscode.rs` — added default workspace-path resolution for Git operations and made `git push` path-safe by executing Git subcommands directly
 - `README.md` — updated quick start, plan commands, and approval-flow test coverage
 - `.gitignore` — ignore local persisted session state file
 
@@ -51,6 +53,7 @@
 - `cargo run --bin bridge-cli -- "继续"`
 - `cargo run --bin bridge-cli -- '$ pwd'` then `cargo run --bin bridge-cli -- "批准"`
 - `BRIDGE_APPROVAL_REQUIRED=git_pull cargo run --bin bridge-cli -- "git pull"`
+- `BRIDGE_WORKSPACE_PATH=/Users/Bean/Documents/trae_projects/feishu-vscode-bridge cargo test`
 - `cargo test --test approval_card_flow`
 - Live Feishu validation: set `BRIDGE_APPROVAL_REQUIRED=git_pull`, send `git pull`, then click card button `批准`
 - Live Feishu validation: send `执行计划 git status; $ pwd`, then click card button `继续`

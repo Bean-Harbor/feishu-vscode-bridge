@@ -64,6 +64,7 @@ Compatibility status:
 - Core command and plan execution engine (Rust)
 - `继续` / `执行全部` plan intent support with local persisted session state
 - Configurable approval gates for selected command types before execution
+- Configurable default workspace path for Git operations
 - Minimal CLI demo executor
 - Native desktop setup GUI for initial configuration
 
@@ -165,6 +166,37 @@ BRIDGE_APPROVAL_REQUIRED=none
 ```
 
 If `.env` is used, add the variable there and restart `bridge-cli listen`.
+
+## Workspace Path Configuration
+
+Git commands can use a default workspace path when the incoming command does not explicitly pass a repository path.
+
+Configure it with:
+
+```bash
+BRIDGE_WORKSPACE_PATH=/absolute/path/to/your/repo
+```
+
+Behavior:
+
+- `git status`, `git pull`, and `git push` will use `BRIDGE_WORKSPACE_PATH` when no repo path is included in the message
+- If the message includes an explicit repo path, that path takes precedence over `BRIDGE_WORKSPACE_PATH`
+- This is useful when the Feishu listener runs outside the target repository, or when you want all Git operations pinned to one workspace
+
+Examples:
+
+```bash
+# .env
+BRIDGE_WORKSPACE_PATH=/Users/Bean/Documents/trae_projects/feishu-vscode-bridge
+```
+
+```text
+git status
+git pull
+git push
+```
+
+These commands will operate on `BRIDGE_WORKSPACE_PATH` by default.
 
 ## Automated Approval Flow Tests
 
