@@ -83,6 +83,7 @@
      - `BRIDGE_APPROVAL_REQUIRED=git_pull` changed approval scope without code changes
      - a plain `git pull` message entered the approval flow in live Feishu
      - clicking `批准` delivered `card.action.trigger` and the bridge sent the follow-up card successfully
+- Prepared a minimal documentation-only change so the next default `git push` approval validation runs against a non-empty working tree and can exercise commit plus push end to end
 
 ## 2026-03-27
 
