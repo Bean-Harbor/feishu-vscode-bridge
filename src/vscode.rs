@@ -86,6 +86,15 @@ pub fn git_push_all(repo_path: Option<&str>, message: &str) -> CmdResult {
 
     let commit = run_git(resolved_repo_path.as_deref(), &["commit", "-m", message], 30);
     if !commit.success {
+        if is_nothing_to_commit(&commit) {
+            return CmdResult {
+                success: true,
+                stdout: "[git commit]\nnothing to commit, working tree clean\n\n[git push]\n无需推送：当前工作区没有可提交的变更".to_string(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: add.duration_ms + commit.duration_ms,
+            };
+        }
         return with_step_label("git commit", commit);
     }
 
@@ -195,6 +204,13 @@ fn prefix_output(step: &str, output: &str) -> String {
     }
 }
 
+fn is_nothing_to_commit(result: &CmdResult) -> bool {
+    let combined = format!("{}\n{}", result.stdout, result.stderr).to_lowercase();
+    combined.contains("nothing to commit")
+        || combined.contains("working tree clean")
+        || combined.contains("nothing added to commit")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +258,31 @@ mod tests {
         unsafe {
             std::env::remove_var(WORKSPACE_PATH_ENV);
         }
+    }
+
+    #[test]
+    fn detect_nothing_to_commit_from_stdout() {
+        let result = CmdResult {
+            success: false,
+            stdout: "On branch main\nnothing to commit, working tree clean\n".to_string(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration_ms: 10,
+        };
+
+        assert!(is_nothing_to_commit(&result));
+    }
+
+    #[test]
+    fn ignore_unrelated_git_failures() {
+        let result = CmdResult {
+            success: false,
+            stdout: String::new(),
+            stderr: "fatal: not a git repository".to_string(),
+            exit_code: Some(128),
+            duration_ms: 10,
+        };
+
+        assert!(!is_nothing_to_commit(&result));
     }
 }

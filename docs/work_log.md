@@ -29,6 +29,7 @@
 - Completed end-to-end validation in Feishu for the success-after-retry path: a failing second step was retried after fixing its runtime precondition, and the persisted session advanced to the third step
 - Completed end-to-end validation in Feishu for a non-default approval policy: with `BRIDGE_APPROVAL_REQUIRED=git_pull`, sending `git pull` produced a pending-approval card and clicking `批准` successfully triggered `card.action.trigger` and the follow-up card reply
 - Completed end-to-end validation in Feishu for the default `git push` approval flow: sending `git push` produced a pending-approval card, clicking `批准` completed the auto commit, and the resulting commit was pushed to `origin/main`
+- Changed empty-worktree `git push` handling so `nothing to commit` is treated as a successful no-op instead of a failed plan step
 - Confirmed local macOS `setup-gui` currently crashes at runtime, so `.env` was prepared manually for listener validation
 
 ### Files Added
@@ -44,6 +45,7 @@
 - `src/feishu.rs` — added card callback parsing, multiline/post message parsing, and `chat_id` normalization for card replies
 - `src/vscode.rs` — fixed `open_file()` to pass `--goto` correctly
 - `src/vscode.rs` — added default workspace-path resolution for Git operations and made `git push` path-safe by executing Git subcommands directly
+- `src/vscode.rs` — treat empty-worktree `git push` as a successful no-op and added regression tests for `nothing to commit` detection
 - `README.md` — updated quick start, plan commands, and approval-flow test coverage
 - `.gitignore` — ignore local persisted session state file
 
@@ -56,6 +58,7 @@
 - `BRIDGE_APPROVAL_REQUIRED=git_pull cargo run --bin bridge-cli -- "git pull"`
 - `BRIDGE_WORKSPACE_PATH=/Users/Bean/Documents/trae_projects/feishu-vscode-bridge cargo test`
 - `cargo test --test approval_card_flow`
+- `cargo test`
 - Live Feishu validation: set `BRIDGE_APPROVAL_REQUIRED=git_pull`, send `git pull`, then click card button `批准`
 - Live Feishu validation: send `执行计划 git status; $ pwd`, then click card button `继续`
 - Live Feishu validation: send `执行计划 git status; $ false; $ pwd`, then click card button `重新执行失败步骤`
