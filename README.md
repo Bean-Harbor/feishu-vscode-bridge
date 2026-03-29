@@ -80,6 +80,8 @@ One-page quick ref: see `docs/feishu_quick_ref.md` for a condensed cheat sheet s
 
 Ultra-short group notice: see `docs/feishu_group_notice.md` for a minimal pinned-message version.
 
+Live regression checklist: see `docs/feishu_live_regression_checklist.md` for a repeatable real-Feishu validation pass before or after shipping bridge changes.
+
 - `执行计划 <命令1>; <命令2>`: execute exactly one step, then pause
 - `继续`: execute the next pending step, or retry the failed step
 - `继续刚才的任务`: resume the current plan, or summarize the last persisted task when no active plan remains
