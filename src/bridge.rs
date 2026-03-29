@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,6 +20,22 @@ pub enum BridgeResponse {
         fallback_text: String,
         card: serde_json::Value,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEntry {
+    pub timestamp_ms: u128,
+    pub source: String,
+    pub session_key: String,
+    pub chat_id: String,
+    pub chat_type: Option<String>,
+    pub sender_id: String,
+    pub event_id: String,
+    pub command: String,
+    pub response_kind: String,
+    pub response_preview: String,
+    pub success: bool,
+    pub error: Option<String>,
 }
 
 pub struct BridgeApp {
@@ -871,6 +890,19 @@ fn default_session_store_path() -> Option<PathBuf> {
         .map(|dir| dir.join(".feishu-vscode-bridge-session.json"))
 }
 
+fn default_audit_log_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("BRIDGE_AUDIT_LOG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.join(".feishu-vscode-bridge-audit.jsonl"))
+}
+
 pub fn render_bridge_response(response: &BridgeResponse) -> &str {
     match response {
         BridgeResponse::Text(text) => text,
@@ -885,8 +917,59 @@ pub fn response_kind(response: &BridgeResponse) -> &'static str {
     }
 }
 
-pub fn feishu_session_key(receive_id_type: &str, receive_id: &str) -> String {
-    format!("feishu:{receive_id_type}:{receive_id}")
+pub fn feishu_session_key(chat_id: &str, sender_id: &str) -> String {
+    format!("feishu:chat:{chat_id}:sender:{sender_id}")
+}
+
+pub fn new_audit_entry(
+    source: &str,
+    session_key: &str,
+    chat_id: &str,
+    chat_type: Option<&str>,
+    sender_id: &str,
+    event_id: &str,
+    command: &str,
+    response: &BridgeResponse,
+    error: Option<&str>,
+) -> AuditEntry {
+    AuditEntry {
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+        source: source.to_string(),
+        session_key: session_key.to_string(),
+        chat_id: chat_id.to_string(),
+        chat_type: chat_type.map(str::to_string),
+        sender_id: sender_id.to_string(),
+        event_id: event_id.to_string(),
+        command: command.to_string(),
+        response_kind: response_kind(response).to_string(),
+        response_preview: truncate_session_text(render_bridge_response(response), 300),
+        success: error.is_none(),
+        error: error.map(str::to_string),
+    }
+}
+
+pub fn append_audit_entry(entry: &AuditEntry) -> Result<(), String> {
+    let Some(path) = default_audit_log_path() else {
+        return Err("无法定位审计日志路径".to_string());
+    };
+
+    append_audit_entry_to_path(&path, entry)
+}
+
+fn append_audit_entry_to_path(path: &Path, entry: &AuditEntry) -> Result<(), String> {
+    let line = serde_json::to_string(entry)
+        .map_err(|err| format!("序列化审计日志失败: {err}"))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("打开审计日志失败: {err}"))?;
+
+    writeln!(file, "{line}").map_err(|err| format!("写入审计日志失败: {err}"))
 }
 
 fn format_plan_reply(
@@ -2217,5 +2300,42 @@ mod tests {
 
         let _ = fs::remove_file(session_path);
         let _ = fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn feishu_session_key_isolates_senders_in_same_chat() {
+        let alice = feishu_session_key("oc_chat_demo", "ou_alice");
+        let bob = feishu_session_key("oc_chat_demo", "ou_bob");
+
+        assert_ne!(alice, bob);
+        assert_eq!(alice, "feishu:chat:oc_chat_demo:sender:ou_alice");
+    }
+
+    #[test]
+    fn append_audit_entry_writes_jsonl_record() {
+        let audit_path = unique_temp_path("audit-log");
+        let entry = AuditEntry {
+            timestamp_ms: 123,
+            source: "message".to_string(),
+            session_key: "feishu:chat:oc_chat_demo:sender:ou_alice".to_string(),
+            chat_id: "oc_chat_demo".to_string(),
+            chat_type: Some("group".to_string()),
+            sender_id: "ou_alice".to_string(),
+            event_id: "om_123".to_string(),
+            command: "查看 diff".to_string(),
+            response_kind: "文本".to_string(),
+            response_preview: "ok".to_string(),
+            success: true,
+            error: None,
+        };
+
+        append_audit_entry_to_path(&audit_path, &entry).unwrap();
+
+        let content = fs::read_to_string(&audit_path).unwrap();
+        assert!(content.contains("\"source\":\"message\""));
+        assert!(content.contains("\"chat_type\":\"group\""));
+        assert!(content.contains("\"command\":\"查看 diff\""));
+
+        let _ = fs::remove_file(audit_path);
     }
 }

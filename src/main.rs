@@ -1,6 +1,9 @@
 use std::sync::Mutex;
 
-use feishu_vscode_bridge::bridge::{BridgeApp, BridgeResponse, feishu_session_key, render_bridge_response, response_kind};
+use feishu_vscode_bridge::bridge::{
+    BridgeApp, BridgeResponse, append_audit_entry, feishu_session_key, new_audit_entry,
+    render_bridge_response, response_kind,
+};
 use feishu_vscode_bridge::feishu::{FeishuClient, FeishuEvent, ReplyTarget};
 use feishu_vscode_bridge::MessageDedup;
 
@@ -54,36 +57,64 @@ fn handle_event(client: &FeishuClient, event: FeishuEvent) {
             println!("📩 收到消息 [{}]: {}", msg.sender_id, msg.text);
 
             let app = BridgeApp::default();
-            let session_key = feishu_session_key(
-                &msg.reply_target.receive_id_type,
-                &msg.reply_target.receive_id,
-            );
+            let session_key = feishu_session_key(&msg.chat_id, &msg.sender_id);
             let reply = app.dispatch(&msg.text, &session_key);
 
             println!("↩️ 准备回复 [{}]: {}", msg.sender_id, response_kind(&reply));
 
-            if let Err(e) = send_bridge_response(client, &msg.reply_target, &reply) {
+            let send_result = send_bridge_response(client, &msg.reply_target, &reply);
+
+            if let Err(e) = &send_result {
                 eprintln!("❌ 回复失败: {e}");
             } else {
                 println!("✅ 回复已发送 [{}]: {}", msg.sender_id, response_kind(&reply));
+            }
+
+            let audit = new_audit_entry(
+                "message",
+                &session_key,
+                &msg.chat_id,
+                Some(&msg.chat_type),
+                &msg.sender_id,
+                &msg.message_id,
+                &msg.text,
+                &reply,
+                send_result.as_ref().err().map(|err| err.as_str()),
+            );
+            if let Err(err) = append_audit_entry(&audit) {
+                eprintln!("❌ 审计写入失败: {err}");
             }
         }
         FeishuEvent::CardAction(action) => {
             println!("🖱️ 收到卡片点击 [{}]: {}", action.sender_id, action.action_command);
 
             let app = BridgeApp::default();
-            let session_key = feishu_session_key(
-                &action.reply_target.receive_id_type,
-                &action.reply_target.receive_id,
-            );
+            let session_key = feishu_session_key(&action.reply_target.receive_id, &action.sender_id);
             let reply = app.dispatch(&action.action_command, &session_key);
 
             println!("↩️ 准备卡片回复 [{}]: {}", action.sender_id, response_kind(&reply));
 
-            if let Err(e) = send_bridge_response(client, &action.reply_target, &reply) {
+            let send_result = send_bridge_response(client, &action.reply_target, &reply);
+
+            if let Err(e) = &send_result {
                 eprintln!("❌ 卡片回复失败: {e}");
             } else {
                 println!("✅ 卡片回复已发送 [{}]: {}", action.sender_id, response_kind(&reply));
+            }
+
+            let audit = new_audit_entry(
+                "card_action",
+                &session_key,
+                &action.reply_target.receive_id,
+                None,
+                &action.sender_id,
+                &action.event_id,
+                &action.action_command,
+                &reply,
+                send_result.as_ref().err().map(|err| err.as_str()),
+            );
+            if let Err(err) = append_audit_entry(&audit) {
+                eprintln!("❌ 审计写入失败: {err}");
             }
         }
     }

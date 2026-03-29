@@ -36,6 +36,7 @@
 - Implemented `P2.1.2` by adding context-first failure/result summaries, key-error extraction, and next-step suggestions on top of the shared follow-up reply skeleton
 - Implemented `P2.1.3` by turning `继续刚才的任务` into a continuity replay that surfaces current task focus, recent step, file focus, diff context, and next-step guidance from persisted session state
 - Completed `P2.1.4` by validating real Feishu failure and diff follow-up chains after refreshing credentials, and fixed a live `post` message parsing gap for the payload shape Feishu actually sent from the chat client
+- Started `P2.2` with two transport/governance hardening changes: Feishu sessions are now isolated by `chat_id + sender_id` to avoid group-chat context collisions, and the listener now writes a JSONL audit trail for inbound messages, card callbacks, and reply outcomes
 
 ### Files Added
 
@@ -81,12 +82,15 @@
 - `src/bridge.rs` — introduced a shared follow-up reply skeleton so text responses for failure/result/diff/file recall now use a consistent structure
 - `src/bridge.rs` — added failure/result summary helpers so follow-up replies now surface key lines and suggested next actions before raw output
 - `src/bridge.rs` — upgraded stored-session summaries into a continuity replay so `继续刚才的任务` now returns a task-oriented snapshot instead of a flat status list
+- `src/bridge.rs` — added sender-scoped Feishu session keys plus JSONL audit-log helpers for transport and governance hardening in `P2.2`
 - `tests/approval_card_flow.rs` — updated persisted-session assertions to match the new continuity replay text structure
 - `src/feishu.rs` — expanded `post` message parsing to accept the flat content shape observed in real Feishu chat payloads and added regression coverage for that payload form
+- `src/main.rs` — switched live Feishu handling to sender-scoped session keys and appended audit records for both message and card-action replies
+- `README.md` — documented group-chat session isolation and the new `.feishu-vscode-bridge-audit.jsonl` audit trail
 
 ### Next Candidates
 
-- Start P2.2 from `docs/copilot_bridge_porting_plan.md`: continue with transport, attachment, and audit enhancements after the real Feishu validation pass
+- Continue P2.2 from `docs/copilot_bridge_porting_plan.md`: next likely slice is attachment / multimodal input handling now that session isolation and reply audit logging are in place
 
 ### Verification
 
@@ -108,6 +112,7 @@
 - Live Feishu validation: sent `执行全部 读取 src/lib.rs 1-20; $ false`, received a pause card, clicked `刚才为什么失败`, and confirmed the bridge returned the stored failure follow-up over the real Feishu callback path
 - Live Feishu validation: sent `查看 diff` and then `把刚才的 diff 发我`, and confirmed both the direct diff reply and the persisted diff replay worked over the real Feishu chat flow
 - `cargo test parse_` after fixing `src/feishu.rs` so flat `post` payloads from real Feishu clients are parsed into bridge text commands correctly
+- `cargo test` after adding sender-scoped Feishu session keys and JSONL audit logging
 
 ## 2026-03-28
 

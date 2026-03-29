@@ -63,10 +63,12 @@ Compatibility status:
 - Core command parsing, plan execution, and bridge runtime engine (Rust)
 - Direct commands plus multi-step plans with `继续`, `继续刚才的任务`, and `执行全部`
 - Local persisted session state for both plans and one-off commands, including task summary, latest result, recent files, latest diff, and reversible patch context
+- Feishu session isolation keyed by chat plus sender, so concurrent users in the same group chat do not overwrite each other's persisted context
 - Conversational follow-up actions such as `刚才为什么失败`, `把上一步结果发我`, `继续改刚才那个文件`, `把刚才的 diff 发我`, `把刚才改动的文件列表发我`, and `撤回刚才的补丁`
 - Interactive Feishu cards for pause / failure / approval states, with primary actions and follow-up actions grouped separately
 - Configurable approval gates for selected command types before execution, including approval handling for patch application
 - Configurable default workspace path for Git operations
+- JSONL audit logging for Feishu inbound messages and card callbacks, including session key, sender, command, reply kind, and send outcome
 - Workspace read/search/test/change tools: `读取`, `列出`, `搜索`, `运行测试`, `查看 diff`, `应用补丁`
 - Patch rollback support via reverse apply of the latest remembered patch
 - Minimal CLI demo executor
@@ -128,8 +130,10 @@ Session notes:
 
 - CLI 会话保存在当前目录下的 `.feishu-vscode-bridge-session.json`
 - 飞书计划按 chat 隔离，不同会话不会共用同一个待执行计划
+- 飞书计划现在按 `chat_id + sender_id` 隔离，群聊里不同发送者不会共享同一份上下文
 - 会话会持久化 `current_task`、`pending_steps`、`last_result`、`last_action`
 - 会话还会持久化最近一步的原始结果、最近一次明确操作到的主文件、最近文件列表、最近一次 diff / patch 内容，以及最近一次可撤回的补丁
+- 飞书监听还会默认追加写入 `.feishu-vscode-bridge-audit.jsonl`，用于审计消息、卡片回调和回复结果；可通过 `BRIDGE_AUDIT_LOG_PATH` 覆盖路径
 - `apply_patch` 会从 unified diff 头里推断一个最近文件列表，所以多文件补丁后也能继续追问文件上下文
 - 这些上下文现在不仅在计划执行里持久化，直接命令执行后也会落盘，所以后续追问不再依赖必须先走 `执行计划`
 - 即使计划已完成或被拒绝，后续发送 `继续刚才的任务` 仍可看到上次任务摘要
