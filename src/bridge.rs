@@ -32,8 +32,11 @@ pub struct AuditEntry {
     pub sender_id: String,
     pub event_id: String,
     pub command: String,
+    pub action_name: Option<String>,
     pub response_kind: String,
     pub response_preview: String,
+    pub result_status: Option<String>,
+    pub result_summary: Option<String>,
     pub success: bool,
     pub error: Option<String>,
 }
@@ -137,9 +140,9 @@ impl BridgeApp {
 
         match intent {
             Intent::RunPlan { steps, mode } => self.start_plan(session_key, trimmed_text, steps, mode),
-            Intent::ContinuePlan => self.resume_plan(session_key, false),
-            Intent::RetryFailedStep => self.resume_plan(session_key, false),
-            Intent::ExecuteAll => self.resume_plan(session_key, true),
+            Intent::ContinuePlan => self.resume_plan(session_key, false, "继续"),
+            Intent::RetryFailedStep => self.resume_plan(session_key, false, "重新执行失败步骤"),
+            Intent::ExecuteAll => self.resume_plan(session_key, true, "执行全部"),
             Intent::ApprovePending => self.approve_plan(session_key),
             Intent::RejectPending => self.reject_plan(session_key),
             Intent::ExplainLastFailure => self.explain_last_failure(session_key),
@@ -195,7 +198,7 @@ impl BridgeApp {
         reply
     }
 
-    fn resume_plan(&self, session_key: &str, run_all: bool) -> BridgeResponse {
+    fn resume_plan(&self, session_key: &str, run_all: bool, action_name: &str) -> BridgeResponse {
         let Some(mut stored) = self.load_persisted_session(session_key) else {
             return BridgeResponse::Text("⚠️ 当前没有待继续的计划。\n\n发送「执行计划 <命令1>; <命令2>」创建逐步计划，或发送「执行全部 <命令1>; <命令2>」连续执行。".to_string());
         };
@@ -216,11 +219,12 @@ impl BridgeApp {
         stored = self.build_stored_session(
             if progress.completed { None } else { Some(session.clone()) },
             stored.current_task.as_deref().unwrap_or("继续当前计划"),
-            if run_all { "执行全部" } else { "继续" },
+            action_name,
             &progress,
         );
         let reply = format_plan_reply(&progress, run_all, &self.approval_policy, &stored);
         let _ = self.persist_session(session_key, &stored);
+        append_plan_action_audit(session_key, action_name, &reply, &stored, Some(&progress));
 
         reply
     }
@@ -249,6 +253,7 @@ impl BridgeApp {
         );
         let reply = format_plan_reply(&progress, false, &self.approval_policy, &stored);
         let _ = self.persist_session(session_key, &stored);
+        append_plan_action_audit(session_key, "批准", &reply, &stored, Some(&progress));
 
         reply
     }
@@ -276,7 +281,9 @@ impl BridgeApp {
         });
         stored.last_step = None;
         let _ = self.persist_session(session_key, &stored);
-        BridgeResponse::Text("🛑 已拒绝当前待审批步骤，当前计划已取消。".to_string())
+        let reply = BridgeResponse::Text("🛑 已拒绝当前待审批步骤，当前计划已取消。".to_string());
+        append_plan_action_audit(session_key, "拒绝", &reply, &stored, None);
+        reply
     }
 
     fn explain_last_failure(&self, session_key: &str) -> BridgeResponse {
@@ -944,11 +951,70 @@ pub fn new_audit_entry(
         sender_id: sender_id.to_string(),
         event_id: event_id.to_string(),
         command: command.to_string(),
+        action_name: None,
         response_kind: response_kind(response).to_string(),
         response_preview: truncate_session_text(render_bridge_response(response), 300),
+        result_status: None,
+        result_summary: None,
         success: error.is_none(),
         error: error.map(str::to_string),
     }
+}
+
+fn new_plan_action_audit_entry(
+    session_key: &str,
+    action_name: &str,
+    response: &BridgeResponse,
+    stored: &StoredSession,
+    progress: Option<&PlanProgress>,
+) -> Option<AuditEntry> {
+    let (chat_id, sender_id) = parse_feishu_session_key(session_key)?;
+    let result = stored.last_result.as_ref();
+
+    Some(AuditEntry {
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+        source: "plan_action".to_string(),
+        session_key: session_key.to_string(),
+        chat_id,
+        chat_type: None,
+        sender_id,
+        event_id: format!("plan_action:{action_name}"),
+        command: action_name.to_string(),
+        action_name: Some(action_name.to_string()),
+        response_kind: response_kind(response).to_string(),
+        response_preview: truncate_session_text(render_bridge_response(response), 300),
+        result_status: result.map(|item| item.status.clone()),
+        result_summary: result.map(|item| item.summary.clone()).or_else(|| {
+            progress.map(|item| stored_result_from_progress(item).summary)
+        }),
+        success: result.map(|item| item.success).unwrap_or(true),
+        error: None,
+    })
+}
+
+fn append_plan_action_audit(
+    session_key: &str,
+    action_name: &str,
+    response: &BridgeResponse,
+    stored: &StoredSession,
+    progress: Option<&PlanProgress>,
+) {
+    let Some(entry) = new_plan_action_audit_entry(session_key, action_name, response, stored, progress) else {
+        return;
+    };
+
+    if let Err(err) = append_audit_entry(&entry) {
+        eprintln!("❌ 审计写入失败: {err}");
+    }
+}
+
+fn parse_feishu_session_key(session_key: &str) -> Option<(String, String)> {
+    let rest = session_key.strip_prefix("feishu:chat:")?;
+    let (chat_id, sender_id) = rest.split_once(":sender:")?;
+    Some((chat_id.to_string(), sender_id.to_string()))
 }
 
 pub fn append_audit_entry(entry: &AuditEntry) -> Result<(), String> {
@@ -2312,6 +2378,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_feishu_session_key_extracts_chat_and_sender() {
+        let parsed = parse_feishu_session_key("feishu:chat:oc_chat_demo:sender:ou_alice").unwrap();
+
+        assert_eq!(parsed.0, "oc_chat_demo");
+        assert_eq!(parsed.1, "ou_alice");
+    }
+
+    #[test]
+    fn new_plan_action_audit_entry_captures_result_status() {
+        let stored = StoredSession {
+            last_result: Some(StoredResult {
+                status: "已取消".to_string(),
+                summary: "当前待审批任务已被拒绝并取消。".to_string(),
+                success: false,
+            }),
+            ..StoredSession::default()
+        };
+
+        let entry = new_plan_action_audit_entry(
+            "feishu:chat:oc_chat_demo:sender:ou_alice",
+            "拒绝",
+            &BridgeResponse::Text("🛑 已拒绝当前待审批步骤，当前计划已取消。".to_string()),
+            &stored,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(entry.source, "plan_action");
+        assert_eq!(entry.command, "拒绝");
+        assert_eq!(entry.action_name.as_deref(), Some("拒绝"));
+        assert_eq!(entry.result_status.as_deref(), Some("已取消"));
+        assert_eq!(entry.result_summary.as_deref(), Some("当前待审批任务已被拒绝并取消。"));
+        assert!(!entry.success);
+    }
+
+    #[test]
     fn append_audit_entry_writes_jsonl_record() {
         let audit_path = unique_temp_path("audit-log");
         let entry = AuditEntry {
@@ -2323,8 +2425,11 @@ mod tests {
             sender_id: "ou_alice".to_string(),
             event_id: "om_123".to_string(),
             command: "查看 diff".to_string(),
+            action_name: None,
             response_kind: "文本".to_string(),
             response_preview: "ok".to_string(),
+            result_status: None,
+            result_summary: None,
             success: true,
             error: None,
         };

@@ -40,6 +40,7 @@
 - Implemented `P2.2.2` guardrails for attachment and multimodal input: non-text Feishu messages now trigger an explicit downgrade reply instead of being silently ignored
 - Rich-text `post` payloads now reject embedded image/file/media/audio blocks unless the message is pure text/link/@ content
 - Added parser regression coverage for image, file, and mixed rich-text payloads so future Feishu transport changes do not silently break the fallback path
+- Implemented `P2.2.3` bridge-layer action auditing so `继续` / `执行全部` / `重新执行失败步骤` / `批准` / `拒绝` now append a second JSONL record with the resulting status and summary
 
 ### Files Added
 
@@ -91,12 +92,13 @@
 - `src/feishu.rs` — expanded `post` message parsing to accept the flat content shape observed in real Feishu chat payloads and added regression coverage for that payload form
 - `src/main.rs` — switched live Feishu handling to sender-scoped session keys and appended audit records for both message and card-action replies
 - `src/main.rs` — now replies directly with downgrade guidance when the inbound Feishu message is non-text or mixed multimodal content
+- `src/bridge.rs` — now appends bridge-layer action audit entries for continue / execute-all / retry / approve / reject flows, including resulting status metadata
 - `README.md` — documented group-chat session isolation and the new `.feishu-vscode-bridge-audit.jsonl` audit trail
 - `README.md` — documented the current attachment / multimodal input boundary and the required text-based downgrade path
 
 ### Next Candidates
 
-- Continue P2.2 from `docs/copilot_bridge_porting_plan.md`: next likely slice is `P2.2.3` approval-trace hardening now that session isolation, reply audit logging, and attachment-input constraints are in place
+- Continue P2.2 from `docs/copilot_bridge_porting_plan.md`: next likely slice is a live Feishu regression focused on approval / retry / reject audit completeness now that `P2.2.3` bridge-layer action logging is in place
 
 ### Verification
 
@@ -120,6 +122,7 @@
 - `cargo test parse_` after fixing `src/feishu.rs` so flat `post` payloads from real Feishu clients are parsed into bridge text commands correctly
 - `cargo test` after adding sender-scoped Feishu session keys and JSONL audit logging
 - `cargo test` after adding explicit fallback handling for image/file/mixed-rich-text Feishu payloads
+- `cargo test` after adding bridge-layer action audit entries for continue / execute-all / retry / approve / reject flows
 
 ## 2026-03-28
 
