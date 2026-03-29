@@ -7,7 +7,7 @@ use std::path::Component;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::executor::{run_cmd, CmdResult};
+use crate::executor::{run_cmd, run_cmd_in_dir, CmdResult};
 
 pub const WORKSPACE_PATH_ENV: &str = "BRIDGE_WORKSPACE_PATH";
 pub const TEST_COMMAND_ENV: &str = "BRIDGE_TEST_COMMAND";
@@ -351,13 +351,18 @@ pub fn reverse_patch(patch: &str) -> CmdResult {
 
 /// 执行任意 shell 命令（用户通过飞书发送时需要谨慎）
 pub fn run_shell(cmd: &str) -> CmdResult {
+    let workspace = match workspace_root() {
+        Ok(path) => path,
+        Err(err) => return error_cmd_result(err),
+    };
+
     #[cfg(target_os = "windows")]
     {
-        run_cmd("cmd", &["/C", cmd], 30)
+        run_cmd_in_dir("cmd", &["/C", cmd], 30, Some(&workspace))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        run_cmd("sh", &["-c", cmd], 30)
+        run_cmd_in_dir("sh", &["-c", cmd], 30, Some(&workspace))
     }
 }
 
@@ -937,6 +942,34 @@ mod tests {
         let result = read_file(file.to_string_lossy().as_ref(), Some(10), Some(1));
         assert!(!result.success);
         assert!(result.stderr.contains("行号范围无效"));
+    }
+
+    #[test]
+    fn run_shell_uses_workspace_env_as_cwd() {
+        let _guard = env_lock().lock().unwrap();
+        let workspace = unique_temp_dir("run-shell-cwd");
+        fs::create_dir_all(&workspace).unwrap();
+
+        unsafe {
+            std::env::set_var(WORKSPACE_PATH_ENV, &workspace);
+        }
+
+        #[cfg(target_os = "windows")]
+        let result = run_shell("cd");
+
+        #[cfg(not(target_os = "windows"))]
+        let result = run_shell("pwd");
+
+        assert!(result.success, "{}", result.to_reply("run_shell"));
+        let reported = fs::canonicalize(result.stdout.trim()).unwrap();
+        let expected = fs::canonicalize(&workspace).unwrap();
+        assert_eq!(reported, expected);
+
+        unsafe {
+            std::env::remove_var(WORKSPACE_PATH_ENV);
+        }
+
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]

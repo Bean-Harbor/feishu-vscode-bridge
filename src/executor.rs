@@ -1,5 +1,6 @@
 //! 真实 shell 命令执行器
 
+use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
@@ -42,15 +43,36 @@ impl CmdResult {
 
 /// 执行一条 shell 命令，捕获 stdout / stderr
 pub fn run_cmd(program: &str, args: &[&str], timeout_secs: u64) -> CmdResult {
+    run_cmd_in_dir(program, args, timeout_secs, Option::<&Path>::None)
+}
+
+pub fn run_cmd_in_dir<P>(program: &str, args: &[&str], timeout_secs: u64, cwd: Option<P>) -> CmdResult
+where
+    P: AsRef<Path>,
+{
     let start = Instant::now();
 
+    let cwd = cwd.map(|path| path.as_ref().to_path_buf());
+
     #[cfg(target_os = "windows")]
-    let result = Command::new("cmd")
-        .args(["/C", &format!("{} {}", program, args.join(" "))])
-        .output();
+    let result = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", &format!("{} {}", program, args.join(" "))]);
+        if let Some(path) = cwd.as_ref() {
+            command.current_dir(path);
+        }
+        command.output()
+    };
 
     #[cfg(not(target_os = "windows"))]
-    let result = Command::new(program).args(args).output();
+    let result = {
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Some(path) = cwd.as_ref() {
+            command.current_dir(path);
+        }
+        command.output()
+    };
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let _ = timeout_secs; // 超时机制可后续补充
