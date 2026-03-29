@@ -35,6 +35,7 @@
 - Implemented `P2.1.1` by unifying failure explanation, result replay, diff replay, file continuation, and recent-file replies under a shared follow-up response skeleton
 - Implemented `P2.1.2` by adding context-first failure/result summaries, key-error extraction, and next-step suggestions on top of the shared follow-up reply skeleton
 - Implemented `P2.1.3` by turning `继续刚才的任务` into a continuity replay that surfaces current task focus, recent step, file focus, diff context, and next-step guidance from persisted session state
+- Completed `P2.1.4` by validating real Feishu failure and diff follow-up chains after refreshing credentials, and fixed a live `post` message parsing gap for the payload shape Feishu actually sent from the chat client
 
 ### Files Added
 
@@ -81,11 +82,11 @@
 - `src/bridge.rs` — added failure/result summary helpers so follow-up replies now surface key lines and suggested next actions before raw output
 - `src/bridge.rs` — upgraded stored-session summaries into a continuity replay so `继续刚才的任务` now returns a task-oriented snapshot instead of a flat status list
 - `tests/approval_card_flow.rs` — updated persisted-session assertions to match the new continuity replay text structure
+- `src/feishu.rs` — expanded `post` message parsing to accept the flat content shape observed in real Feishu chat payloads and added regression coverage for that payload form
 
 ### Next Candidates
 
-- Start P2.1.4 from `docs/copilot_bridge_porting_plan.md`: validate the improved follow-up continuity in real Feishu flows
-- After real Feishu validation is recorded, continue with P2.2 for transport, attachment, and audit enhancements
+- Start P2.2 from `docs/copilot_bridge_porting_plan.md`: continue with transport, attachment, and audit enhancements after the real Feishu validation pass
 
 ### Verification
 
@@ -101,6 +102,12 @@
 - `cargo test` after unifying follow-up text replies under a shared response skeleton for failure/result/diff/file recall
 - `cargo test` after adding key-error extraction and next-step guidance to failure/result follow-up replies
 - `cargo test` after upgrading `继续刚才的任务` to return a richer continuity replay and updating approval-flow persistence assertions
+- Attempted `P2.1.4` live Feishu validation on this host with `./target/debug/bridge-cli listen`, but the run stopped before WebSocket setup because Feishu token auth returned `code=10014: app secret invalid`
+- Confirmed `.env` contains `FEISHU_APP_ID` and `FEISHU_APP_SECRET` keys, so the current blocker is credential validity rather than missing local configuration; real Feishu validation remains pending until the secret is refreshed
+- Refreshed the local `FEISHU_APP_SECRET`, reran `./target/debug/bridge-cli listen`, and confirmed the bridge now reaches `✅ 飞书认证成功` plus `✅ WebSocket 已连接，等待飞书消息...`
+- Live Feishu validation: sent `执行全部 读取 src/lib.rs 1-20; $ false`, received a pause card, clicked `刚才为什么失败`, and confirmed the bridge returned the stored failure follow-up over the real Feishu callback path
+- Live Feishu validation: sent `查看 diff` and then `把刚才的 diff 发我`, and confirmed both the direct diff reply and the persisted diff replay worked over the real Feishu chat flow
+- `cargo test parse_` after fixing `src/feishu.rs` so flat `post` payloads from real Feishu clients are parsed into bridge text commands correctly
 
 ## 2026-03-28
 

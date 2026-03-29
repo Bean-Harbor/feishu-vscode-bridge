@@ -511,11 +511,16 @@ fn extract_message_text(content: &Value) -> Option<String> {
         }
     }
 
-    let post = content.get("post")?;
-    let locale_content = ["zh_cn", "en_us"]
-        .into_iter()
-        .find_map(|locale| post.get(locale))
-        .or_else(|| post.as_object().and_then(|obj| obj.values().next()))?;
+    let locale_content = if let Some(post) = content.get("post") {
+        ["zh_cn", "en_us"]
+            .into_iter()
+            .find_map(|locale| post.get(locale))
+            .or_else(|| post.as_object().and_then(|obj| obj.values().next()))?
+    } else if content.get("content").is_some() {
+        content
+    } else {
+        return None;
+    };
 
     let paragraphs = locale_content.get("content")?.as_array()?;
     let mut lines = Vec::new();
@@ -643,6 +648,32 @@ mod tests {
                         _ => panic!("expected message event"),
                 }
         }
+
+                #[test]
+                fn parse_flat_post_message_payload() {
+                    let payload = r#"{
+                        "schema": "2.0",
+                        "header": { "event_id": "evt_4", "event_type": "im.message.receive_v1" },
+                        "event": {
+                        "sender": { "sender_id": { "open_id": "ou_123" } },
+                        "message": {
+                            "chat_id": "oc_123",
+                            "chat_type": "p2p",
+                            "message_id": "om_126",
+                            "message_type": "post",
+                            "content": "{\"title\":\"\",\"content\":[[{\"tag\":\"text\",\"text\":\"1. \"},{\"tag\":\"text\",\"text\":\"执行全部 读取 src/\"},{\"tag\":\"a\",\"href\":\"lib.rs\",\"text\":\"lib.rs\"},{\"tag\":\"text\",\"text\":\" 1-20; $ false\"}]]}"
+                        }
+                        }
+                    }"#;
+
+                    let event = FeishuClient::parse_event_payload(payload).unwrap();
+                    match event {
+                        FeishuEvent::Message(message) => {
+                            assert_eq!(message.text, "1. 执行全部 读取 src/lib.rs 1-20; $ false");
+                        }
+                        _ => panic!("expected message event"),
+                    }
+                }
 
     #[test]
     fn parse_card_action_payload() {
