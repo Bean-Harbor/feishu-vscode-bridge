@@ -41,6 +41,10 @@
 - Rich-text `post` payloads now reject embedded image/file/media/audio blocks unless the message is pure text/link/@ content
 - Added parser regression coverage for image, file, and mixed rich-text payloads so future Feishu transport changes do not silently break the fallback path
 - Implemented `P2.2.3` bridge-layer action auditing so `继续` / `执行全部` / `重新执行失败步骤` / `批准` / `拒绝` now append a second JSONL record with the resulting status and summary
+- Fixed approved shell-step execution so `run_shell` now respects the resolved workspace root instead of inheriting the listener process cwd
+- Added regression coverage for workspace-aware shell execution and stabilized the assertion on macOS by comparing canonicalized paths
+- Completed live Feishu re-validation for `执行计划 git status; $ pwd` -> `继续` -> `批准`, confirming approved `$ pwd` now runs inside `/Users/Bean/Documents/trae_projects/feishu-vscode-bridge`
+- Synced the workspace-cwd fix to GitHub as commit `7b8d777` (`Fix shell commands to respect workspace cwd`)
 
 ### Files Added
 
@@ -93,12 +97,15 @@
 - `src/main.rs` — switched live Feishu handling to sender-scoped session keys and appended audit records for both message and card-action replies
 - `src/main.rs` — now replies directly with downgrade guidance when the inbound Feishu message is non-text or mixed multimodal content
 - `src/bridge.rs` — now appends bridge-layer action audit entries for continue / execute-all / retry / approve / reject flows, including resulting status metadata
+- `src/executor.rs` — added a cwd-aware command runner so shell execution can explicitly target the resolved workspace directory
+- `src/vscode.rs` — routed `run_shell` through the workspace-aware executor and added a regression test for `BRIDGE_WORKSPACE_PATH` cwd behavior
 - `README.md` — documented group-chat session isolation and the new `.feishu-vscode-bridge-audit.jsonl` audit trail
 - `README.md` — documented the current attachment / multimodal input boundary and the required text-based downgrade path
 
 ### Next Candidates
 
-- Continue P2.2 from `docs/copilot_bridge_porting_plan.md`: next likely slice is a live Feishu regression focused on approval / retry / reject audit completeness now that `P2.2.3` bridge-layer action logging is in place
+- Continue P2.2 from `docs/copilot_bridge_porting_plan.md`: run a real Feishu regression for `重新执行失败步骤` after the workspace-cwd fix, and verify the retry path plus paired audit entries remain correct end to end
+- Start P2.3 higher-order code tools, with symbol-level navigation and reference lookup as the highest-value gap versus Copilot Chat today
 
 ### Verification
 
@@ -123,6 +130,9 @@
 - `cargo test` after adding sender-scoped Feishu session keys and JSONL audit logging
 - `cargo test` after adding explicit fallback handling for image/file/mixed-rich-text Feishu payloads
 - `cargo test` after adding bridge-layer action audit entries for continue / execute-all / retry / approve / reject flows
+- `cargo test run_shell_uses_workspace_env_as_cwd`
+- `cargo test`
+- Live Feishu validation: send `执行计划 git status; $ pwd`, then `继续`, then `批准`, and verify the final `$ pwd` output is `/Users/Bean/Documents/trae_projects/feishu-vscode-bridge`
 
 ## 2026-03-28
 
