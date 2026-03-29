@@ -54,11 +54,19 @@ fn handle_event(client: &FeishuClient, event: FeishuEvent) {
 
     match event {
         FeishuEvent::Message(msg) => {
-            println!("📩 收到消息 [{}]: {}", msg.sender_id, msg.text);
+            println!(
+                "📩 收到消息 [{}][{}]: {}",
+                msg.sender_id, msg.message_type, msg.text
+            );
 
-            let app = BridgeApp::default();
             let session_key = feishu_session_key(&msg.chat_id, &msg.sender_id);
-            let reply = app.dispatch(&msg.text, &session_key);
+            let reply = if let Some(reason) = msg.unsupported_reason.as_ref() {
+                println!("⚠️ 检测到非纯文本输入 [{}]: {}", msg.sender_id, msg.message_type);
+                BridgeResponse::Text(reason.clone())
+            } else {
+                let app = BridgeApp::default();
+                app.dispatch(&msg.text, &session_key)
+            };
 
             println!("↩️ 准备回复 [{}]: {}", msg.sender_id, response_kind(&reply));
 

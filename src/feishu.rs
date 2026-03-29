@@ -66,8 +66,10 @@ pub struct InboundMessage {
     pub chat_id: String,
     pub chat_type: String,
     pub sender_id: String,
+    pub message_type: String,
     pub text: String,
     pub message_id: String,
+    pub unsupported_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +424,11 @@ impl FeishuClient {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let message_type = message
+            .get("message_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("text")
+            .to_string();
 
         let sender = event.get("sender")?.get("sender_id")?;
         let sender_id = sender
@@ -433,11 +440,16 @@ impl FeishuClient {
 
         let content_str = message.get("content")?.as_str()?;
         let content: serde_json::Value = serde_json::from_str(content_str).ok()?;
-        let text = extract_message_text(&content)?;
-
-        if text.is_empty() {
-            return None;
-        }
+        let parsed = extract_message_body(&message_type, &content)?;
+        let (text, unsupported_reason) = match parsed {
+            ParsedMessageBody::Text(text) => {
+                if text.is_empty() {
+                    return None;
+                }
+                (text, None)
+            }
+            ParsedMessageBody::Unsupported { label, reason } => (label, Some(reason)),
+        };
 
         Some(InboundMessage {
             reply_target: ReplyTarget {
@@ -447,8 +459,10 @@ impl FeishuClient {
             chat_id,
             chat_type,
             sender_id,
+            message_type,
             text,
             message_id,
+            unsupported_reason,
         })
     }
 
@@ -503,11 +517,39 @@ impl FeishuClient {
     }
 }
 
-fn extract_message_text(content: &Value) -> Option<String> {
+enum ParsedMessageBody {
+    Text(String),
+    Unsupported { label: String, reason: String },
+}
+
+fn extract_message_body(message_type: &str, content: &Value) -> Option<ParsedMessageBody> {
+    if content.get("post").is_some() || content.get("content").is_some() {
+        return extract_post_message_body(content);
+    }
+
+    match message_type {
+        "" | "text" => {
+            let text = content.get("text").and_then(|v| v.as_str())?;
+            let text = sanitize_message_text(text);
+            if text.is_empty() {
+                None
+            } else {
+                Some(ParsedMessageBody::Text(text))
+            }
+        }
+        "post" => extract_post_message_body(content),
+        other => Some(ParsedMessageBody::Unsupported {
+            label: summarize_unsupported_message(other, content),
+            reason: unsupported_message_reply(other, content),
+        }),
+    }
+}
+
+fn extract_post_message_body(content: &Value) -> Option<ParsedMessageBody> {
     if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
         let text = sanitize_message_text(text);
         if !text.is_empty() {
-            return Some(text);
+            return Some(ParsedMessageBody::Text(text));
         }
     }
 
@@ -524,6 +566,7 @@ fn extract_message_text(content: &Value) -> Option<String> {
 
     let paragraphs = locale_content.get("content")?.as_array()?;
     let mut lines = Vec::new();
+    let mut unsupported_tags = Vec::new();
 
     for paragraph in paragraphs {
         let Some(items) = paragraph.as_array() else {
@@ -535,7 +578,12 @@ fn extract_message_text(content: &Value) -> Option<String> {
             let tag = item.get("tag").and_then(|v| v.as_str()).unwrap_or("");
             let text = match tag {
                 "text" | "a" | "at" => item.get("text").and_then(|v| v.as_str()),
-                _ => None,
+                _ => {
+                    if let Some(label) = unsupported_post_tag_label(tag) {
+                        unsupported_tags.push(label.to_string());
+                    }
+                    None
+                }
             };
 
             if let Some(text) = text {
@@ -549,10 +597,66 @@ fn extract_message_text(content: &Value) -> Option<String> {
         }
     }
 
-    if lines.is_empty() {
+    unsupported_tags.sort();
+    unsupported_tags.dedup();
+
+    if !unsupported_tags.is_empty() {
+        Some(ParsedMessageBody::Unsupported {
+            label: format!("飞书富文本消息（含{}）", unsupported_tags.join("/")),
+            reason: format!(
+                "⚠️ 当前这条飞书富文本消息里包含{}，桥接器现在只自动处理纯文本命令。\n\n请改用以下任一方式重发：\n1. 直接把命令、日志片段、补丁内容贴成文本\n2. 如果是文件或图片，请先发文件名、关键路径、报错文本和你要我执行的动作\n3. 如果要基于截图排查，请把截图里的关键信息转成文字\n\n当前保守策略是不自动解析这类非纯文本内容，以避免误读。",
+                unsupported_tags.join("/")
+            ),
+        })
+    } else if lines.is_empty() {
         None
     } else {
-        Some(lines.join("\n"))
+        Some(ParsedMessageBody::Text(lines.join("\n")))
+    }
+}
+
+fn summarize_unsupported_message(message_type: &str, content: &Value) -> String {
+    match message_type {
+        "image" => "飞书图片消息".to_string(),
+        "file" => {
+            if let Some(name) = content.get("file_name").and_then(|v| v.as_str()) {
+                format!("飞书附件消息: {name}")
+            } else {
+                "飞书附件消息".to_string()
+            }
+        }
+        "audio" => "飞书语音消息".to_string(),
+        "media" => "飞书媒体消息".to_string(),
+        other => format!("飞书消息类型: {other}"),
+    }
+}
+
+fn unsupported_message_reply(message_type: &str, content: &Value) -> String {
+    let kind = unsupported_message_kind(message_type);
+    let summary = summarize_unsupported_message(message_type, content);
+
+    format!(
+        "⚠️ 当前收到的是{kind}，桥接器现在只自动处理纯文本命令。\n\n请改用以下任一方式重发：\n1. 直接粘贴命令、日志片段或补丁文本\n2. 如果是文件，请先发文件名、关键路径和希望我执行的动作\n3. 如果是截图或语音，请把关键信息转成文字\n\n当前消息: {summary}"
+    )
+}
+
+fn unsupported_message_kind(message_type: &str) -> &'static str {
+    match message_type {
+        "image" => "图片消息",
+        "file" => "附件消息",
+        "audio" => "语音消息",
+        "media" => "媒体消息",
+        _ => "非纯文本消息",
+    }
+}
+
+fn unsupported_post_tag_label(tag: &str) -> Option<&'static str> {
+    match tag {
+        "img" => Some("图片"),
+        "file" => Some("附件"),
+        "media" => Some("媒体"),
+        "audio" => Some("语音"),
+        _ => None,
     }
 }
 
@@ -593,6 +697,8 @@ mod tests {
         match event {
             FeishuEvent::Message(message) => {
                 assert_eq!(message.text, "继续");
+                assert_eq!(message.message_type, "text");
+                assert!(message.unsupported_reason.is_none());
                 assert_eq!(message.reply_target.receive_id_type, "chat_id");
             }
             _ => panic!("expected message event"),
@@ -670,10 +776,104 @@ mod tests {
                     match event {
                         FeishuEvent::Message(message) => {
                             assert_eq!(message.text, "1. 执行全部 读取 src/lib.rs 1-20; $ false");
+                                                        assert!(message.unsupported_reason.is_none());
                         }
                         _ => panic!("expected message event"),
                     }
                 }
+
+        #[test]
+        fn parse_image_message_payload_as_unsupported() {
+                let payload = r#"{
+                    "schema": "2.0",
+                    "header": { "event_id": "evt_5", "event_type": "im.message.receive_v1" },
+                    "event": {
+                        "sender": { "sender_id": { "open_id": "ou_123" } },
+                        "message": {
+                            "chat_id": "oc_123",
+                            "chat_type": "p2p",
+                            "message_id": "om_127",
+                            "message_type": "image",
+                            "content": "{\"image_key\":\"img_xxx\"}"
+                        }
+                    }
+                }"#;
+
+                let event = FeishuClient::parse_event_payload(payload).unwrap();
+                match event {
+                        FeishuEvent::Message(message) => {
+                                assert_eq!(message.text, "飞书图片消息");
+                                assert!(message
+                                        .unsupported_reason
+                                        .as_deref()
+                                        .unwrap()
+                                        .contains("只自动处理纯文本命令"));
+                        }
+                        _ => panic!("expected message event"),
+                }
+        }
+
+        #[test]
+        fn parse_file_message_payload_as_unsupported() {
+                let payload = r#"{
+                    "schema": "2.0",
+                    "header": { "event_id": "evt_6", "event_type": "im.message.receive_v1" },
+                    "event": {
+                        "sender": { "sender_id": { "open_id": "ou_123" } },
+                        "message": {
+                            "chat_id": "oc_123",
+                            "chat_type": "p2p",
+                            "message_id": "om_128",
+                            "message_type": "file",
+                            "content": "{\"file_key\":\"file_xxx\",\"file_name\":\"error.log\"}"
+                        }
+                    }
+                }"#;
+
+                let event = FeishuClient::parse_event_payload(payload).unwrap();
+                match event {
+                        FeishuEvent::Message(message) => {
+                                assert_eq!(message.text, "飞书附件消息: error.log");
+                                assert!(message
+                                        .unsupported_reason
+                                        .as_deref()
+                                        .unwrap()
+                                        .contains("文件名、关键路径"));
+                        }
+                        _ => panic!("expected message event"),
+                }
+        }
+
+        #[test]
+        fn parse_post_message_with_image_tag_as_unsupported() {
+                let payload = r#"{
+                    "schema": "2.0",
+                    "header": { "event_id": "evt_7", "event_type": "im.message.receive_v1" },
+                    "event": {
+                        "sender": { "sender_id": { "open_id": "ou_123" } },
+                        "message": {
+                            "chat_id": "oc_123",
+                            "chat_type": "p2p",
+                            "message_id": "om_129",
+                            "message_type": "post",
+                            "content": "{\"post\":{\"zh_cn\":{\"content\":[[{\"tag\":\"text\",\"text\":\"帮我看这个报错\"},{\"tag\":\"img\",\"image_key\":\"img_xxx\"}]]}}}"
+                        }
+                    }
+                }"#;
+
+                let event = FeishuClient::parse_event_payload(payload).unwrap();
+                match event {
+                        FeishuEvent::Message(message) => {
+                                assert_eq!(message.text, "飞书富文本消息（含图片）");
+                                assert!(message
+                                        .unsupported_reason
+                                        .as_deref()
+                                        .unwrap()
+                                        .contains("不自动解析这类非纯文本内容"));
+                        }
+                        _ => panic!("expected message event"),
+                }
+        }
 
     #[test]
     fn parse_card_action_payload() {
