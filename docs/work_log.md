@@ -32,6 +32,8 @@
 - Added an ultra-short Feishu group-notice version for pinned messages and chat headers
 - Removed HarborNAS / HarborOS-oriented wording from repository positioning so this repo stays documented as a standalone Feishu <-> VS Code bridge
 - Refined the porting plan from a broad `P2` into concrete `P2.1.x` steps so later sessions resume from a specific next action instead of a vague phase
+- Implemented `P2.1.1` by unifying failure explanation, result replay, diff replay, file continuation, and recent-file replies under a shared follow-up response skeleton
+- Implemented `P2.1.2` by adding context-first failure/result summaries, key-error extraction, and next-step suggestions on top of the shared follow-up reply skeleton
 
 ### Files Added
 
@@ -74,11 +76,13 @@
 - `README.md` — aligned `Current Scope` with the actually implemented session continuity, follow-up, approval, and card capabilities
 - `.github/copilot-instructions.md` — tightened repo scope guidance to avoid steering work back toward device-control or external-platform expansion
 - `docs/copilot_bridge_porting_plan.md` — split `P2.1` into a concrete implementation sequence for reply structure, failure/result summarization, continuity, and real Feishu validation
+- `src/bridge.rs` — introduced a shared follow-up reply skeleton so text responses for failure/result/diff/file recall now use a consistent structure
+- `src/bridge.rs` — added failure/result summary helpers so follow-up replies now surface key lines and suggested next actions before raw output
 
 ### Next Candidates
 
-- Start P2.1.1 from `docs/copilot_bridge_porting_plan.md`: unify the reply structure for failure explanation, result recall, diff replay, and file follow-up replies
-- After the common reply skeleton is stable, continue with P2.1.2 and P2.1.3 for stronger summaries and stronger task continuity
+- Start P2.1.3 from `docs/copilot_bridge_porting_plan.md`: strengthen task continuity on top of the richer follow-up summaries
+- After continuity is stable, continue with P2.1.4 for real Feishu validation, then move into P2.2
 
 ### Verification
 
@@ -91,6 +95,8 @@
 - `cargo test` after adding patch-path inference plus env-var test locking, confirming `ApplyPatch` file tracking and full-suite stability
 - `cargo test` after adding multi-file patch context, last-diff recall, and follow-up card actions
 - `cargo test` after adding direct-command persistence, recent-file recall, grouped card actions, and reversible patch support
+- `cargo test` after unifying follow-up text replies under a shared response skeleton for failure/result/diff/file recall
+- `cargo test` after adding key-error extraction and next-step guidance to failure/result follow-up replies
 
 ## 2026-03-28
 

@@ -291,23 +291,20 @@ impl BridgeApp {
         };
 
         let result = vscode::read_file(path, None, None);
-        let mut reply = vec![format!("📄 继续处理刚才的文件: {}", path)];
+        let mut blocks = vec![format!("📄 继续处理刚才的文件: {}", path)];
 
-        if let Some(task) = stored.current_task.as_deref().filter(|task| !task.is_empty()) {
-            reply.push(format!("🎯 当前任务: {}", task));
-        }
         if let Some(last_step) = stored.last_step.as_ref() {
-            reply.push(format!("🧾 最近一步: {}", last_step.description));
+            blocks.push(format!("🧾 最近一步: {}", last_step.description));
         }
         if stored.recent_file_paths.len() > 1 {
-            reply.push(format!(
+            blocks.push(format!(
                 "🗂 其他最近文件: {}",
                 stored.recent_file_paths[1..].join("、")
             ));
         }
 
-        reply.push(result.to_reply(&format!("读取文件 {path}")));
-        BridgeResponse::Text(reply.join("\n\n"))
+        blocks.push(result.to_reply(&format!("读取文件 {path}")));
+        BridgeResponse::Text(format_follow_up_reply("继续文件上下文", &stored, blocks))
     }
 
     fn show_last_diff(&self, session_key: &str) -> BridgeResponse {
@@ -614,6 +611,61 @@ fn truncate_session_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn summarize_reply_snippet(reply: &str, max_lines: usize, max_chars: usize) -> Option<String> {
+    let lines = reply
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(max_lines)
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut summary = lines.join(" / ");
+    if summary.chars().count() > max_chars {
+        summary = summary.chars().take(max_chars).collect::<String>();
+        summary.push_str("...");
+    }
+
+    Some(summary)
+}
+
+fn failure_next_step_hint(stored: &StoredSession) -> String {
+    if let Some(step) = stored.pending_steps.first() {
+        return format!("建议先处理失败点，再继续后面的步骤，例如先回到「{}」。", step);
+    }
+
+    if let Some(path) = stored
+        .recent_file_paths
+        .first()
+        .map(String::as_str)
+        .or(stored.last_file_path.as_deref())
+    {
+        return format!("建议先检查相关文件 {}，确认后再决定重试还是继续追问。", path);
+    }
+
+    "建议先看原始结果里的退出码或报错正文，再决定是重试、改文件还是调整命令。".to_string()
+}
+
+fn result_next_step_hint(stored: &StoredSession) -> String {
+    if let Some(path) = stored
+        .recent_file_paths
+        .first()
+        .map(String::as_str)
+        .or(stored.last_file_path.as_deref())
+    {
+        return format!("如果要继续这个上下文，可以直接继续处理 {}，或再追问最近 diff。", path);
+    }
+
+    if let Some(step) = stored.pending_steps.first() {
+        return format!("如果要继续推进任务，下一步可以先执行「{}」。", step);
+    }
+
+    "如果这就是你要的结果，可以继续追问 diff、文件上下文，或直接发下一条开发指令。".to_string()
+}
+
 fn format_stored_session_summary(stored: &StoredSession) -> String {
     let task = stored
         .current_task
@@ -658,34 +710,34 @@ fn format_last_failure_reply(stored: &StoredSession) -> String {
     };
 
     if last_result.success {
-        return format!(
-            "✅ 上一次任务没有失败。\n🎯 当前任务: {}\n📌 最近结果: {}",
-            stored
-                .current_task
-                .as_deref()
-                .filter(|task| !task.is_empty())
-                .unwrap_or("(未记录任务描述)"),
-            last_result.summary
+        return format_follow_up_reply(
+            "失败原因回放",
+            stored,
+            vec![
+                "✅ 上一次任务没有失败。".to_string(),
+                format!("📌 最近结果: {}", last_result.summary),
+            ],
         );
     }
 
-    let mut lines = vec![format!("❌ 上次失败状态: {}", last_result.status)];
-    lines.push(format!(
-        "🎯 当前任务: {}",
-        stored
-            .current_task
-            .as_deref()
-            .filter(|task| !task.is_empty())
-            .unwrap_or("(未记录任务描述)")
-    ));
-    lines.push(format!("📌 失败摘要: {}", last_result.summary));
+    let mut blocks = vec![
+        format!("❌ 上次失败状态: {}", last_result.status),
+        format!("📌 失败摘要: {}", last_result.summary),
+    ];
 
     if let Some(last_step) = stored.last_step.as_ref() {
-        lines.push(format!("🧾 失败步骤: {}", last_step.description));
-        lines.push(format!("📤 原始结果:\n{}", last_step.reply));
+        blocks.push(format!("📍 卡住的位置: {}", last_step.description));
+        if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 3, 220) {
+            blocks.push(format!("🔎 关键报错: {}", snippet));
+        }
+        blocks.push(format!("🧾 失败步骤: {}", last_step.description));
+        blocks.push(format!("➡️ 下一步建议: {}", failure_next_step_hint(stored)));
+        blocks.push(format!("📤 原始结果:\n{}", last_step.reply));
+    } else {
+        blocks.push(format!("➡️ 下一步建议: {}", failure_next_step_hint(stored)));
     }
 
-    lines.join("\n\n")
+    format_follow_up_reply("失败原因回放", stored, blocks)
 }
 
 fn format_last_result_reply(stored: &StoredSession) -> String {
@@ -693,26 +745,29 @@ fn format_last_result_reply(stored: &StoredSession) -> String {
         return format_stored_session_summary(stored);
     };
 
-    let mut lines = vec![format!(
+    let mut blocks = vec![format!(
         "🧾 上一步结果: {}",
         if last_step.success { "成功" } else { "失败" }
     )];
-    lines.push(format!("🎯 当前任务: {}", stored
-        .current_task
-        .as_deref()
-        .filter(|task| !task.is_empty())
-        .unwrap_or("(未记录任务描述)")));
-    lines.push(format!("📌 上一步: {}", last_step.description));
-    lines.push(format!("📤 原始结果:\n{}", last_step.reply));
+    blocks.push(format!(
+        "📎 导语: 上一步已经{}，这里先给你摘要，再附上原始结果。",
+        if last_step.success { "完成" } else { "返回失败结果" }
+    ));
+    blocks.push(format!("📌 上一步: {}", last_step.description));
+    if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 3, 220) {
+        blocks.push(format!("🔎 结果摘要: {}", snippet));
+    }
+    blocks.push(format!("➡️ 下一步建议: {}", result_next_step_hint(stored)));
+    blocks.push(format!("📤 原始结果:\n{}", last_step.reply));
 
     if let Some(path) = stored.last_file_path.as_deref() {
-        lines.push(format!("📄 相关文件: {}", path));
+        blocks.push(format!("📄 相关文件: {}", path));
     }
     if stored.recent_file_paths.len() > 1 {
-        lines.push(format!("🗂 最近文件列表: {}", stored.recent_file_paths.join("、")));
+        blocks.push(format!("🗂 最近文件列表: {}", stored.recent_file_paths.join("、")));
     }
 
-    lines.join("\n\n")
+    format_follow_up_reply("上一步结果回放", stored, blocks)
 }
 
 fn format_last_diff_reply(stored: &StoredSession) -> String {
@@ -720,21 +775,13 @@ fn format_last_diff_reply(stored: &StoredSession) -> String {
         return "⚠️ 最近一次任务里没有记录到 diff 或补丁内容。可以先发送「查看 diff」或「应用补丁 ...」。".to_string();
     };
 
-    let mut lines = vec![format!("🧩 最近一次 diff: {}", last_diff.description)];
-    lines.push(format!(
-        "🎯 当前任务: {}",
-        stored
-            .current_task
-            .as_deref()
-            .filter(|task| !task.is_empty())
-            .unwrap_or("(未记录任务描述)")
-    ));
+    let mut blocks = vec![format!("🧩 最近一次 diff: {}", last_diff.description)];
     if !stored.recent_file_paths.is_empty() {
-        lines.push(format!("📄 相关文件: {}", stored.recent_file_paths.join("、")));
+        blocks.push(format!("📄 相关文件: {}", stored.recent_file_paths.join("、")));
     }
-    lines.push(format!("📤 diff 内容:\n{}", last_diff.content));
+    blocks.push(format!("📤 diff 内容:\n{}", last_diff.content));
 
-    lines.join("\n\n")
+    format_follow_up_reply("最近 diff 回放", stored, blocks)
 }
 
 fn format_recent_files_reply(stored: &StoredSession) -> String {
@@ -742,16 +789,8 @@ fn format_recent_files_reply(stored: &StoredSession) -> String {
         return "⚠️ 最近一次任务里没有记录到文件列表。可以先发送「读取 <文件>」、「查看 diff」或「应用补丁 ...」。".to_string();
     }
 
-    let mut lines = vec![format!("📚 最近改动文件列表（{}）", stored.recent_file_paths.len())];
-    lines.push(format!(
-        "🎯 当前任务: {}",
-        stored
-            .current_task
-            .as_deref()
-            .filter(|task| !task.is_empty())
-            .unwrap_or("(未记录任务描述)")
-    ));
-    lines.extend(
+    let mut blocks = vec![format!("📚 最近改动文件列表（{}）", stored.recent_file_paths.len())];
+    blocks.extend(
         stored
             .recent_file_paths
             .iter()
@@ -759,7 +798,35 @@ fn format_recent_files_reply(stored: &StoredSession) -> String {
             .map(|(index, path)| format!("{}. {}", index + 1, path)),
     );
 
-    lines.join("\n\n")
+    format_follow_up_reply("最近文件回放", stored, blocks)
+}
+
+fn format_follow_up_reply(title: &str, stored: &StoredSession, detail_blocks: Vec<String>) -> String {
+    let mut blocks = vec![format!("🧭 {}", title)];
+    blocks.push(format!(
+        "🎯 当前任务: {}",
+        stored
+            .current_task
+            .as_deref()
+            .filter(|task| !task.is_empty())
+            .unwrap_or("(未记录任务描述)")
+    ));
+
+    if let Some(last_result) = stored.last_result.as_ref() {
+        blocks.push(format!("📌 最近状态: {}", last_result.status));
+    }
+
+    if let Some(last_action) = stored.last_action.as_deref().filter(|action| !action.is_empty()) {
+        blocks.push(format!("🧾 上次动作: {}", last_action));
+    }
+
+    blocks.extend(
+        detail_blocks
+            .into_iter()
+            .filter(|block| !block.trim().is_empty()),
+    );
+
+    blocks.join("\n\n")
 }
 
 fn default_session_store_path() -> Option<PathBuf> {
@@ -1706,7 +1773,12 @@ mod tests {
 
         match app.dispatch("刚才为什么失败", session_key) {
             BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 失败原因回放"));
+                assert!(text.contains("🎯 当前任务: 执行计划 $ false; $ pwd"));
                 assert!(text.contains("上次失败状态: 失败暂停"));
+                assert!(text.contains("卡住的位置: 执行命令 false"));
+                assert!(text.contains("关键报错:"));
+                assert!(text.contains("下一步建议:"));
                 assert!(text.contains("执行命令 false"));
                 assert!(text.contains("$ false"));
             }
@@ -1746,7 +1818,12 @@ mod tests {
 
         match app.dispatch("把上一步结果发我", session_key) {
             BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 上一步结果回放"));
+                assert!(text.contains("📌 最近状态: 已完成"));
                 assert!(text.contains("上一步结果: 成功"));
+                assert!(text.contains("导语: 上一步已经完成"));
+                assert!(text.contains("结果摘要:"));
+                assert!(text.contains("下一步建议:"));
                 assert!(text.contains("读取文件 src/lib.rs:1-20"));
                 assert!(text.contains("相关文件: src/lib.rs"));
             }
@@ -1789,6 +1866,7 @@ mod tests {
 
         match app.dispatch("继续改刚才那个文件", session_key) {
             BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 继续文件上下文"));
                 assert!(text.contains("继续处理刚才的文件"));
                 assert!(text.contains(file_path.to_string_lossy().as_ref()));
                 assert!(text.contains("alpha"));
@@ -1897,6 +1975,7 @@ mod tests {
 
         match app.dispatch("把刚才的 diff 发我", session_key) {
             BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 最近 diff 回放"));
                 assert!(text.contains("最近一次 diff"));
                 assert!(text.contains("src/demo.rs"));
                 assert!(text.contains("diff --git a/src/demo.rs b/src/demo.rs"));
@@ -1994,6 +2073,7 @@ mod tests {
 
         match app.dispatch("把刚才改动的文件列表发我", session_key) {
             BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 最近文件回放"));
                 assert!(text.contains("最近改动文件列表"));
                 assert!(text.contains("1. src/a.rs"));
                 assert!(text.contains("2. src/b.rs"));
