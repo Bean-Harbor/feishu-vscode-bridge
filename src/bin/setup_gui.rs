@@ -5,7 +5,7 @@
 //! 流程：
 //!   1. 欢迎页      — 介绍向导功能
 //!   2. VS Code 检测 — 自动检测安装状态；未安装时引导下载
-//!   3. 飞书配置    — 填写 Webhook URL 与签名密钥
+//!   3. 飞书配置    — 填写 App ID 与 App Secret
 //!   4. 完成        — 配置已写入 .env
 
 #[cfg(not(target_os = "macos"))]
@@ -38,93 +38,6 @@ const WINDOW_WIDTH: f32 = 720.0;
 #[cfg(not(target_os = "macos"))]
 const WINDOW_HEIGHT: f32 = 560.0;
 
-fn workspace_dir() -> Result<PathBuf, String> {
-    std::env::current_dir().map_err(|err| err.to_string())
-}
-
-fn open_workspace_directory() -> Result<(), String> {
-    let workspace = workspace_dir()?;
-    open::that(workspace).map_err(|err| err.to_string())?;
-    Ok(())
-}
-
-fn launch_vscode_for_workspace() -> Result<(), String> {
-    let workspace = workspace_dir()?;
-
-    if let Ok(status) = Command::new("code")
-        .arg(".")
-        .current_dir(&workspace)
-        .status()
-    {
-        if status.success() {
-            return Ok(());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut candidates = Vec::new();
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            candidates.push(PathBuf::from(format!(
-                "{local}\\Programs\\Microsoft VS Code\\Code.exe"
-            )));
-        }
-        candidates.push(PathBuf::from(
-            r"C:\Program Files\Microsoft VS Code\Code.exe",
-        ));
-        candidates.push(PathBuf::from(
-            r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
-        ));
-
-        for path in candidates {
-            if path.exists() {
-                let status = Command::new(path)
-                    .arg(".")
-                    .current_dir(&workspace)
-                    .status()
-                    .map_err(|err| err.to_string())?;
-                if status.success() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("open")
-            .args(["-a", "Visual Studio Code", "."])
-            .current_dir(&workspace)
-            .status()
-            .map_err(|err| err.to_string())?;
-        if status.success() {
-            return Ok(());
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        for binary in [
-            "code",
-            "/usr/bin/code",
-            "/usr/local/bin/code",
-            "/snap/bin/code",
-        ] {
-            let result = Command::new(binary)
-                .arg(".")
-                .current_dir(&workspace)
-                .status();
-            if let Ok(status) = result {
-                if status.success() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    Err("未能启动 VS Code，请确认已安装并允许从命令行打开。".to_string())
-}
-
 #[cfg(not(target_os = "macos"))]
 fn short_path_label(path: &Path) -> String {
     path.file_name()
@@ -144,14 +57,66 @@ struct SetupWizard {
 }
 
 fn save_env_file(app_id: &str, app_secret: &str) -> Result<(), String> {
-    let content = format!(
-        "# feishu-vscode-bridge 配置（由 setup-gui 生成）\n\
-         FEISHU_APP_ID={}\n\
-         FEISHU_APP_SECRET={}\n",
-        app_id.trim(),
-        app_secret.trim(),
-    );
+    let existing = std::fs::read_to_string(".env").unwrap_or_default();
+    let content = merge_env_content(&existing, app_id.trim(), app_secret.trim());
     std::fs::write(".env", content).map_err(|err| err.to_string())
+}
+
+fn merge_env_content(existing: &str, app_id: &str, app_secret: &str) -> String {
+    let mut lines = Vec::new();
+    let mut saw_app_id = false;
+    let mut saw_app_secret = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            lines.push(line.to_string());
+            continue;
+        }
+
+        let Some((key, _value)) = trimmed.split_once('=') else {
+            lines.push(line.to_string());
+            continue;
+        };
+
+        match key.trim() {
+            "FEISHU_APP_ID" => {
+                if !saw_app_id {
+                    lines.push(format!("FEISHU_APP_ID={app_id}"));
+                    saw_app_id = true;
+                }
+            }
+            "FEISHU_APP_SECRET" => {
+                if !saw_app_secret {
+                    lines.push(format!("FEISHU_APP_SECRET={app_secret}"));
+                    saw_app_secret = true;
+                }
+            }
+            _ => lines.push(line.to_string()),
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("# feishu-vscode-bridge 配置（由 setup-gui 生成）".to_string());
+    }
+
+    if !saw_app_id || !saw_app_secret {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+            lines.push(String::new());
+        }
+        if !saw_app_id {
+            lines.push(format!("FEISHU_APP_ID={app_id}"));
+        }
+        if !saw_app_secret {
+            lines.push(format!("FEISHU_APP_SECRET={app_secret}"));
+        }
+    }
+
+    let mut content = lines.join("\n");
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content
 }
 
 #[cfg(target_os = "macos")]
@@ -347,12 +312,6 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn prompt_yes_no(prompt: &str) -> Result<bool, String> {
-    let answer = prompt_line(prompt)?;
-    Ok(matches!(answer.to_lowercase().as_str(), "y" | "yes"))
-}
-
-#[cfg(target_os = "macos")]
 fn run_terminal_setup() -> Result<(), String> {
     println!("飞书 × VS Code Bridge 配置向导（macOS 终端模式）");
     println!("当前 macOS 原生对话框不可用，已回退到终端引导模式。\n");
@@ -365,16 +324,6 @@ fn run_terminal_setup() -> Result<(), String> {
             println!("未检测到 VS Code。请先安装后再继续：https://code.visualstudio.com/");
             return Err("未检测到 VS Code".to_string());
         }
-    }
-
-    if prompt_yes_no("是否现在用 VS Code 打开当前项目？(y/N): ")? {
-        launch_vscode_for_workspace()?;
-        println!("已尝试用 VS Code 打开当前项目。");
-    }
-
-    if prompt_yes_no("是否打开当前项目目录？(y/N): ")? {
-        open_workspace_directory()?;
-        println!("已打开当前项目目录。");
     }
 
     println!();
@@ -637,8 +586,8 @@ impl SetupWizard {
                 ui.label(egui::RichText::new("本次会完成").strong());
                 ui.add_space(8.0);
                 ui.label("1. 检测本机是否已安装 VS Code");
-                ui.label("2. 若已安装，可直接打开当前项目目录或用 VS Code 打开项目");
-                ui.label("3. 填写飞书机器人 Webhook 与签名密钥");
+                ui.label("2. 若已安装，继续填写飞书应用凭证");
+                ui.label("3. 填写飞书 App ID 与 App Secret");
                 ui.label("4. 自动生成项目根目录下的 .env 配置文件");
             });
 
@@ -684,24 +633,15 @@ impl SetupWizard {
                 egui::Frame::group(ui.style())
                     .inner_margin(egui::Margin::same(14.0))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("你现在可以直接执行").strong());
+                        ui.label(egui::RichText::new("检测通过后即可继续配置").strong());
                         ui.add_space(8.0);
-                        ui.label(format!("• 用 VS Code 打开 {workspace_name}"));
-                        ui.label("• 打开当前工作目录，检查生成的配置文件");
-                        ui.label("• 继续下一步，填写飞书机器人配置");
+                        ui.label(format!("• 当前项目：{workspace_name}"));
+                        ui.label("• 继续下一步，填写飞书 App ID 与 App Secret");
+                        ui.label("• 保存后仅更新 .env 中的飞书相关配置项");
                     });
 
                 ui.add_space(14.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("用 VS Code 打开当前项目").clicked() {
-                        self.set_action_result(
-                            launch_vscode_for_workspace(),
-                            "已尝试用 VS Code 打开当前项目。",
-                        );
-                    }
-                    if ui.button("打开项目目录").clicked() {
-                        self.set_action_result(open_workspace_directory(), "已打开当前项目目录。");
-                    }
                     if ui.button("重新检测").clicked() {
                         self.action_message = None;
                         self.vscode_status = Some(detect_vscode());
@@ -956,4 +896,46 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(SetupWizard::default()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_env_content;
+
+    #[test]
+    fn merge_env_content_preserves_unrelated_entries() {
+        let existing = "FOO=bar\nBAR=baz\n";
+
+        let merged = merge_env_content(existing, "cli_new", "secret_new");
+
+        assert!(merged.contains("FOO=bar\nBAR=baz\n"));
+        assert!(merged.contains("FEISHU_APP_ID=cli_new\n"));
+        assert!(merged.contains("FEISHU_APP_SECRET=secret_new\n"));
+    }
+
+    #[test]
+    fn merge_env_content_replaces_existing_feishu_entries() {
+        let existing = "# keep\nFEISHU_APP_ID=old_id\nFEISHU_APP_SECRET=old_secret\nOTHER=value\n";
+
+        let merged = merge_env_content(existing, "cli_new", "secret_new");
+
+        assert!(merged.contains("# keep\n"));
+        assert!(merged.contains("OTHER=value\n"));
+        assert!(merged.contains("FEISHU_APP_ID=cli_new\n"));
+        assert!(merged.contains("FEISHU_APP_SECRET=secret_new\n"));
+        assert!(!merged.contains("old_id"));
+        assert!(!merged.contains("old_secret"));
+    }
+
+    #[test]
+    fn merge_env_content_deduplicates_feishu_entries() {
+        let existing = "FEISHU_APP_ID=old_id\nFEISHU_APP_ID=duplicate\nFEISHU_APP_SECRET=old_secret\nFEISHU_APP_SECRET=duplicate\n";
+
+        let merged = merge_env_content(existing, "cli_new", "secret_new");
+
+        assert_eq!(merged.matches("FEISHU_APP_ID=").count(), 1);
+        assert_eq!(merged.matches("FEISHU_APP_SECRET=").count(), 1);
+        assert!(merged.contains("FEISHU_APP_ID=cli_new\n"));
+        assert!(merged.contains("FEISHU_APP_SECRET=secret_new\n"));
+    }
 }

@@ -35,6 +35,7 @@
 - Reworked macOS `setup-gui` again to use native `osascript` dialog windows by default, while keeping the terminal flow as a fallback when native dialogs are unavailable
 - Completed the macOS native dialog flow with retry-friendly UX for missing VS Code, empty App ID/App Secret inputs, and `.env` save failures
 - Simplified the macOS native dialog flow so it only checks whether VS Code is installed, then proceeds directly to App ID / App Secret collection without prompting to open VS Code or the project directory
+- Changed `setup-gui` `.env` updates to preserve unrelated existing variables while replacing only `FEISHU_APP_ID` and `FEISHU_APP_SECRET`
 - Synced the simplified macOS `setup-gui` flow to GitHub and cleaned up local repo noise by ignoring Finder-generated `.DS_Store` files so future syncs stay focused on real project changes
 
 ### Files Added
@@ -53,6 +54,7 @@
 - `src/vscode.rs` — treat empty-worktree `git push` as a successful no-op and added regression tests for `nothing to commit` detection
 - `src/bin/setup_gui.rs` — add retry/cancel flows for macOS native dialogs, keep terminal fallback, and share `.env` writing logic between all setup modes
 - `src/bin/setup_gui.rs` — simplify macOS native setup to only verify VS Code installation before collecting Feishu credentials
+- `src/bin/setup_gui.rs` — preserve unrelated `.env` entries when updating Feishu credentials and remove now-unused open-project actions from the setup flow
 - `README.md` — updated quick start, plan commands, and approval-flow test coverage
 - `Cargo.toml` — reduce `eframe` to a minimal feature set for the setup wizard build
 - `.gitignore` — ignore local persisted session state file
@@ -75,6 +77,7 @@
 - Live Feishu validation: send `git push`, then click card button `批准`, and verify that the generated `auto commit via feishu-bridge` commit reaches `origin/main`
 - Live Feishu validation: with a clean repo after commit `535cfb1`, send `git push`, click card button `批准`, and verify that no new commit is created, `origin/main` stays unchanged, and `.feishu-vscode-bridge-session.json` is cleared
 - `cargo check --bin setup-gui`
+- `cargo test --bin setup-gui`
 - Local macOS validation: start `./target/debug/setup-gui` and confirm it uses native macOS dialogs instead of the crashing `eframe/winit` window path
 - Local macOS validation: force terminal mode with `SETUP_GUI_FORCE_TERMINAL=1 cargo run --bin setup-gui` and confirm the fallback flow still completes successfully
 - GitHub sync validation: committed the simplified macOS setup flow and pushed it to `origin/main` as `fix: simplify macos setup-gui flow`

@@ -50,7 +50,8 @@ What it does:
 
 - Detects whether VS Code is installed before continuing
 - Guides the user to install VS Code if it is missing
-- Collects Feishu webhook settings and writes them to `.env`
+- Collects Feishu App ID and App Secret and writes them to `.env`
+- Preserves unrelated existing `.env` entries when updating Feishu settings
 
 Compatibility status:
 
@@ -227,7 +228,7 @@ FEISHU_APP_SECRET=your_app_secret
 EOF
 ```
 
-If `setup-gui` works on your machine, you can use it to generate the file. On the macOS machine used during validation, `setup-gui` crashed at runtime, so `.env` was prepared manually.
+You can use `setup-gui` to generate or update the file. Existing non-Feishu environment variables in `.env` are preserved when the wizard updates `FEISHU_APP_ID` and `FEISHU_APP_SECRET`.
 
 ### 2. Start the Listener
 
