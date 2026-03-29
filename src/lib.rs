@@ -5,6 +5,7 @@ pub struct ApprovalPolicy {
     pub require_shell: bool,
     pub require_git_push: bool,
     pub require_git_pull: bool,
+    pub require_apply_patch: bool,
     pub require_extension_install: bool,
     pub require_extension_uninstall: bool,
 }
@@ -15,6 +16,7 @@ impl Default for ApprovalPolicy {
             require_shell: true,
             require_git_push: true,
             require_git_pull: false,
+            require_apply_patch: true,
             require_extension_install: false,
             require_extension_uninstall: false,
         }
@@ -42,6 +44,7 @@ impl ApprovalPolicy {
                 require_shell: false,
                 require_git_push: false,
                 require_git_pull: false,
+                require_apply_patch: false,
                 require_extension_install: false,
                 require_extension_uninstall: false,
             };
@@ -56,6 +59,7 @@ impl ApprovalPolicy {
                 require_shell: true,
                 require_git_push: true,
                 require_git_pull: true,
+                require_apply_patch: true,
                 require_extension_install: true,
                 require_extension_uninstall: true,
             }
@@ -72,6 +76,11 @@ impl ApprovalPolicy {
                 }
                 token if token.eq_ignore_ascii_case("git_pull") || token.eq_ignore_ascii_case("pull") => {
                     policy.require_git_pull = true;
+                }
+                token if token.eq_ignore_ascii_case("apply_patch")
+                    || token.eq_ignore_ascii_case("patch") =>
+                {
+                    policy.require_apply_patch = true;
                 }
                 token if token.eq_ignore_ascii_case("install_extension")
                     || token.eq_ignore_ascii_case("extension_install")
@@ -103,6 +112,7 @@ impl ApprovalPolicy {
             Intent::UninstallExtension { .. } => self.require_extension_uninstall,
             Intent::GitPull { .. } => self.require_git_pull,
             Intent::GitPushAll { .. } => self.require_git_push,
+            Intent::ApplyPatch { .. } => self.require_apply_patch,
             Intent::RunShell { .. } => self.require_shell,
             _ => false,
         }
@@ -119,6 +129,9 @@ impl ApprovalPolicy {
         }
         if self.require_git_pull {
             items.push("git_pull");
+        }
+        if self.require_apply_patch {
+            items.push("apply_patch");
         }
         if self.require_extension_install {
             items.push("install_extension");
@@ -149,6 +162,12 @@ pub enum Intent {
     ExecuteAll,
     ApprovePending,
     RejectPending,
+    ExplainLastFailure,
+    ShowLastResult,
+    ContinueLastFile,
+    ShowLastDiff,
+    ShowRecentFiles,
+    UndoLastPatch,
 
     // VS Code 操作
     OpenFile { path: String, line: Option<u32> },
@@ -157,6 +176,20 @@ pub enum Intent {
     UninstallExtension { ext_id: String },
     ListExtensions,
     DiffFiles { file1: String, file2: String },
+    ReadFile {
+        path: String,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    },
+    ListDirectory { path: Option<String> },
+    SearchText {
+        query: String,
+        path: Option<String>,
+        is_regex: bool,
+    },
+    RunTests { command: Option<String> },
+    GitDiff { path: Option<String> },
+    ApplyPatch { patch: String },
 
     // Git 操作
     GitStatus { repo: Option<String> },
@@ -190,7 +223,16 @@ pub fn parse_intent(text: &str) -> Intent {
         return Intent::RejectPending;
     }
 
-    if matches!(lower.as_str(), "继续" | "continue") {
+    if matches!(
+        lower.as_str(),
+        "继续"
+            | "continue"
+            | "继续刚才的任务"
+            | "继续刚才任务"
+            | "继续上次任务"
+            | "继续刚才的计划"
+            | "continue last task"
+    ) {
         return Intent::ContinuePlan;
     }
 
@@ -199,6 +241,88 @@ pub fn parse_intent(text: &str) -> Intent {
         "重新执行失败步骤" | "重试失败步骤" | "retry failed step" | "retry failed"
     ) {
         return Intent::RetryFailedStep;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "刚才为什么失败"
+            | "上次为什么失败"
+            | "刚才为何失败"
+            | "为什么失败了"
+            | "失败原因"
+            | "why did that fail"
+            | "why did it fail"
+    ) {
+        return Intent::ExplainLastFailure;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "把上一步结果发我"
+            | "上一步结果"
+            | "上一步的结果"
+            | "发我上一步结果"
+            | "看看上一步"
+            | "看上一步"
+            | "show last result"
+            | "last result"
+    ) {
+        return Intent::ShowLastResult;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "把刚才的 diff 发我"
+            | "把刚才的diff发我"
+            | "刚才的 diff"
+            | "刚才的diff"
+            | "上一个 diff"
+            | "上一个diff"
+            | "看看 diff"
+            | "看 diff"
+            | "show last diff"
+            | "show diff"
+    ) {
+        return Intent::ShowLastDiff;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "把刚才改动的文件列表发我"
+            | "把刚才修改的文件列表发我"
+            | "刚才改了哪些文件"
+            | "最近改动文件"
+            | "看看文件列表"
+            | "看文件列表"
+            | "show recent files"
+            | "show changed files"
+    ) {
+        return Intent::ShowRecentFiles;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "继续改刚才那个文件"
+            | "继续改上一个文件"
+            | "继续处理刚才那个文件"
+            | "继续这个文件"
+            | "打开刚才那个文件"
+            | "continue editing that file"
+    ) {
+        return Intent::ContinueLastFile;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "撤回刚才的补丁"
+            | "把刚才的补丁撤回"
+            | "撤销刚才的补丁"
+            | "撤回补丁"
+            | "撤销补丁"
+            | "undo last patch"
+            | "revert last patch"
+    ) {
+        return Intent::UndoLastPatch;
     }
 
     if lower == "执行全部" {
@@ -256,6 +380,86 @@ fn parse_single_intent(text: &str, lower: &str) -> Intent {
         return Intent::Help;
     }
 
+    // ── 列出扩展 ──
+    if matches!(lower, "扩展列表" | "列出扩展" | "插件列表" | "list extensions" | "list ext") {
+        return Intent::ListExtensions;
+    }
+
+    // ── 读取文件 ──
+    if let Some(rest) = strip_prefix_any(&lower, &["读取文件 ", "读取 ", "read file ", "read "]) {
+        let rest = text[text.len() - rest.len()..].trim();
+        let (path, start_line, end_line) = parse_read_target(rest);
+        if !path.is_empty() {
+            return Intent::ReadFile {
+                path,
+                start_line,
+                end_line,
+            };
+        }
+    }
+
+    // ── 列目录 ──
+    if matches!(lower, "列出目录" | "列目录" | "ls" | "list dir" | "list directory") {
+        return Intent::ListDirectory { path: None };
+    }
+    if let Some(rest) = strip_prefix_any(&lower, &["列出目录 ", "列目录 ", "list dir ", "list directory ", "ls "]) {
+        let rest = text[text.len() - rest.len()..].trim();
+        return Intent::ListDirectory {
+            path: Some(rest.to_string()),
+        };
+    }
+    if let Some(rest) = lower.strip_prefix("列出 ") {
+        if !rest.starts_with("扩展") {
+            let rest = text[text.len() - rest.len()..].trim();
+            return Intent::ListDirectory {
+                path: Some(rest.to_string()),
+            };
+        }
+    }
+
+    // ── 搜索 ──
+    if let Some(intent) = parse_search_intent(text, lower) {
+        return intent;
+    }
+
+    // ── Git diff ──
+    if matches!(lower, "查看 diff" | "查看git diff" | "git diff" | "查看差异" | "查看变更") {
+        return Intent::GitDiff { path: None };
+    }
+    if let Some(rest) = strip_prefix_any(&lower, &["查看 diff ", "查看git diff ", "git diff ", "查看差异 ", "查看变更 "]) {
+        let rest = text[text.len() - rest.len()..].trim();
+        return Intent::GitDiff {
+            path: (!rest.is_empty()).then(|| rest.to_string()),
+        };
+    }
+
+    // ── 应用补丁 ──
+    if lower == "应用补丁" || lower == "apply patch" {
+        return Intent::ApplyPatch {
+            patch: String::new(),
+        };
+    }
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &["应用补丁\n", "应用补丁 ", "apply patch\n", "apply patch ", "按以下补丁修改\n", "按以下补丁修改 "],
+    ) {
+        let patch = text[text.len() - rest.len()..]
+            .trim_start_matches(|c| matches!(c, ' ' | '\n' | '\r' | '\t'))
+            .to_string();
+        return Intent::ApplyPatch { patch };
+    }
+
+    // ── 运行测试 ──
+    if matches!(lower, "运行测试" | "跑测试" | "测试" | "run tests" | "run test") {
+        return Intent::RunTests { command: None };
+    }
+    if let Some(rest) = strip_prefix_any(&lower, &["运行测试 ", "跑测试 ", "测试 ", "run tests ", "run test "]) {
+        let rest = text[text.len() - rest.len()..].trim();
+        return Intent::RunTests {
+            command: (!rest.is_empty()).then(|| rest.to_string()),
+        };
+    }
+
     // ── VS Code 打开文件夹 ──
     if let Some(rest) = strip_prefix_any(&lower, &["打开文件夹 ", "打开目录 ", "open folder "]) {
         let rest = text[text.len() - rest.len()..].trim();
@@ -300,11 +504,6 @@ fn parse_single_intent(text: &str, lower: &str) -> Intent {
         return Intent::UninstallExtension {
             ext_id: rest.to_string(),
         };
-    }
-
-    // ── 列出扩展 ──
-    if matches!(lower, "扩展列表" | "列出扩展" | "插件列表" | "list extensions" | "list ext") {
-        return Intent::ListExtensions;
     }
 
     // ── Diff ──
@@ -372,12 +571,24 @@ impl Intent {
     pub fn is_runnable(&self) -> bool {
         matches!(
             self,
-            Intent::OpenFile { .. }
+            Intent::ExplainLastFailure
+                | Intent::ShowLastResult
+                | Intent::ContinueLastFile
+                | Intent::ShowLastDiff
+                | Intent::ShowRecentFiles
+                | Intent::UndoLastPatch
+                | Intent::OpenFile { .. }
                 | Intent::OpenFolder { .. }
                 | Intent::InstallExtension { .. }
                 | Intent::UninstallExtension { .. }
                 | Intent::ListExtensions
                 | Intent::DiffFiles { .. }
+                    | Intent::ReadFile { .. }
+                    | Intent::ListDirectory { .. }
+                    | Intent::SearchText { .. }
+                | Intent::RunTests { .. }
+                    | Intent::GitDiff { .. }
+                    | Intent::ApplyPatch { .. }
                 | Intent::GitStatus { .. }
                 | Intent::GitPull { .. }
                 | Intent::GitPushAll { .. }
@@ -405,6 +616,103 @@ fn parse_file_with_line(s: &str) -> Option<(String, u32)> {
         return None;
     }
     Some((path.to_string(), line))
+}
+
+fn parse_read_target(s: &str) -> (String, Option<usize>, Option<usize>) {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None, None);
+    }
+
+    if let Some((path, range)) = trimmed.rsplit_once(' ') {
+        if let Some((start_line, end_line)) = parse_line_range(range.trim()) {
+            return (path.trim().to_string(), Some(start_line), Some(end_line));
+        }
+    }
+
+    if let Some(colon) = trimmed.rfind(':') {
+        let path = trimmed[..colon].trim();
+        let range = trimmed[colon + 1..].trim();
+        if !path.is_empty() {
+            if let Some((start_line, end_line)) = parse_line_range(range) {
+                return (path.to_string(), Some(start_line), Some(end_line));
+            }
+        }
+    }
+
+    (trimmed.to_string(), None, None)
+}
+
+fn parse_line_range(s: &str) -> Option<(usize, usize)> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((start, end)) = trimmed.split_once('-') {
+        let start_line: usize = start.trim().parse().ok()?;
+        let end_line: usize = end.trim().parse().ok()?;
+        if start_line == 0 || end_line == 0 || end_line < start_line {
+            return None;
+        }
+        return Some((start_line, end_line));
+    }
+
+    let line: usize = trimmed.parse().ok()?;
+    if line == 0 {
+        return None;
+    }
+
+    Some((line, line))
+}
+
+fn parse_search_intent(text: &str, lower: &str) -> Option<Intent> {
+    let (rest, is_regex) = if let Some(rest) = strip_prefix_any(&lower, &["搜索正则 ", "search regex "]) {
+        (rest, true)
+    } else if let Some(rest) = strip_prefix_any(&lower, &["搜索文本 ", "search text "]) {
+        (rest, false)
+    } else if let Some(rest) = strip_prefix_any(&lower, &["搜索 ", "search "]) {
+        (rest, false)
+    } else {
+        return None;
+    };
+
+    let rest = text[text.len() - rest.len()..].trim();
+    let (query, path) = split_search_scope(rest);
+    if query.is_empty() {
+        return None;
+    }
+
+    Some(Intent::SearchText {
+        query,
+        path,
+        is_regex,
+    })
+}
+
+fn split_search_scope(s: &str) -> (String, Option<String>) {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    if let Some(index) = trimmed.rfind(" 在 ") {
+        let query = trimmed[..index].trim();
+        let path = trimmed[index + " 在 ".len()..].trim();
+        if !query.is_empty() && !path.is_empty() {
+            return (query.to_string(), Some(path.to_string()));
+        }
+    }
+
+    if let Some(index) = trimmed.rfind(" in ") {
+        let query = trimmed[..index].trim();
+        let path = trimmed[index + " in ".len()..].trim();
+        if !query.is_empty() && !path.is_empty() {
+            return (query.to_string(), Some(path.to_string()));
+        }
+    }
+
+    (trimmed.to_string(), None)
 }
 
 // ── 消息去重 ──
@@ -446,13 +754,20 @@ pub fn help_text() -> &'static str {
     "\
 📋 飞书 × VS Code Bridge 指令
 
-▸ 计划执行
-    执行计划 <命令1>; <命令2>   — 逐步执行计划，每次执行一步
-    执行全部 <命令1>; <命令2>   — 连续执行剩余步骤，失败自动暂停
-    继续                        — 执行当前计划的下一步或重试失败步骤
-    重新执行失败步骤            — 仅重试当前失败步骤
-    批准                        — 执行当前待审批步骤
-    拒绝                        — 取消当前待审批计划
+▸ 计划
+    执行计划 <命令1>; <命令2>   — 一步一步执行
+    执行全部 <命令1>; <命令2>   — 连续执行到结束或失败
+    继续                        — 做下一步
+    重新执行失败步骤            — 只重试失败那一步
+    批准 / 拒绝                 — 处理待审批步骤
+
+▸ 追问
+    刚才为什么失败              — 看失败原因
+    把上一步结果发我            — 看上一步输出
+    继续改刚才那个文件          — 回到刚才那个文件
+    把刚才的 diff 发我          — 看刚才的 diff / patch
+    把刚才改动的文件列表发我    — 看刚才改了哪些文件
+    撤回刚才的补丁              — 撤销刚才那次补丁
 
 ▸ VS Code
   打开 <文件路径>          — 用 VS Code 打开文件
@@ -463,7 +778,17 @@ pub fn help_text() -> &'static str {
   扩展列表                 — 列出已安装扩展
   diff <文件1> <文件2>     — 对比两个文件
 
+▸ 工作区
+    读取 <文件> [1-120]      — 读取文件，可附带行号范围
+    列出 <路径>              — 列出目录内容
+    搜索 <关键字> [在 路径]  — 文本搜索
+    搜索正则 <模式> [在 路径] — 正则搜索
+    运行测试 [命令]          — 执行默认测试命令或指定测试命令
+        应用补丁 <unified diff>  — 将补丁应用到当前工作区
+
 ▸ Git
+    查看 diff [路径]         — 查看当前工作区未提交变更
+    git diff [路径]          — 同上
   git status [仓库路径]    — 查看仓库状态
   git pull [仓库路径]      — 拉取代码
   git push [提交信息]      — 提交并推送
@@ -542,6 +867,96 @@ mod tests {
     }
 
     #[test]
+    fn parse_read_file_with_range() {
+        assert_eq!(
+            parse_intent("读取 src/lib.rs 1-20"),
+            Intent::ReadFile {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(1),
+                end_line: Some(20),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_list_directory_short_form() {
+        assert_eq!(
+            parse_intent("列出 src"),
+            Intent::ListDirectory {
+                path: Some("src".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_search_text_with_scope() {
+        assert_eq!(
+            parse_intent("搜索 parse_intent 在 src"),
+            Intent::SearchText {
+                query: "parse_intent".to_string(),
+                path: Some("src".to_string()),
+                is_regex: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_search_regex() {
+        assert_eq!(
+            parse_intent("搜索正则 parse_.*"),
+            Intent::SearchText {
+                query: "parse_.*".to_string(),
+                path: None,
+                is_regex: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_run_tests_default() {
+        assert_eq!(
+            parse_intent("运行测试"),
+            Intent::RunTests { command: None }
+        );
+    }
+
+    #[test]
+    fn parse_run_tests_custom_command() {
+        assert_eq!(
+            parse_intent("运行测试 cargo test --lib"),
+            Intent::RunTests {
+                command: Some("cargo test --lib".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_git_diff_default() {
+        assert_eq!(parse_intent("查看 diff"), Intent::GitDiff { path: None });
+        assert_eq!(parse_intent("git diff"), Intent::GitDiff { path: None });
+    }
+
+    #[test]
+    fn parse_git_diff_with_path() {
+        assert_eq!(
+            parse_intent("查看 diff src/lib.rs"),
+            Intent::GitDiff {
+                path: Some("src/lib.rs".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_apply_patch_multiline() {
+        assert_eq!(
+            parse_intent("应用补丁\n--- a/test.txt\n+++ b/test.txt"),
+            Intent::ApplyPatch {
+                patch: "--- a/test.txt\n+++ b/test.txt".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_help() {
         assert_eq!(parse_intent("帮助"), Intent::Help);
         assert_eq!(parse_intent("help"), Intent::Help);
@@ -589,6 +1004,7 @@ mod tests {
     #[test]
     fn parse_continue_command() {
         assert_eq!(parse_intent("继续"), Intent::ContinuePlan);
+        assert_eq!(parse_intent("继续刚才的任务"), Intent::ContinuePlan);
         assert_eq!(parse_intent("执行全部"), Intent::ExecuteAll);
     }
 
@@ -601,12 +1017,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_follow_up_commands() {
+        assert_eq!(parse_intent("刚才为什么失败"), Intent::ExplainLastFailure);
+        assert_eq!(parse_intent("为什么失败了"), Intent::ExplainLastFailure);
+        assert_eq!(parse_intent("把上一步结果发我"), Intent::ShowLastResult);
+        assert_eq!(parse_intent("看上一步"), Intent::ShowLastResult);
+        assert_eq!(parse_intent("继续改刚才那个文件"), Intent::ContinueLastFile);
+        assert_eq!(parse_intent("继续这个文件"), Intent::ContinueLastFile);
+        assert_eq!(parse_intent("把刚才的 diff 发我"), Intent::ShowLastDiff);
+        assert_eq!(parse_intent("看 diff"), Intent::ShowLastDiff);
+        assert_eq!(parse_intent("把刚才改动的文件列表发我"), Intent::ShowRecentFiles);
+        assert_eq!(parse_intent("看文件列表"), Intent::ShowRecentFiles);
+        assert_eq!(parse_intent("撤回刚才的补丁"), Intent::UndoLastPatch);
+        assert_eq!(parse_intent("撤回补丁"), Intent::UndoLastPatch);
+    }
+
+    #[test]
     fn approval_policy_parses_default() {
         let policy = ApprovalPolicy::from_spec("default");
 
         assert!(policy.require_shell);
         assert!(policy.require_git_push);
         assert!(!policy.require_git_pull);
+        assert!(policy.require_apply_patch);
     }
 
     #[test]
@@ -623,6 +1056,7 @@ mod tests {
         assert!(!policy.require_shell);
         assert!(!policy.require_git_push);
         assert!(policy.require_git_pull);
+        assert!(!policy.require_apply_patch);
         assert!(policy.require_extension_install);
         assert!(!policy.require_extension_uninstall);
     }
@@ -635,9 +1069,21 @@ mod tests {
             cmd: "pwd".to_string(),
         }));
         assert!(policy.requires_approval(&Intent::GitPull { repo: None }));
+        assert!(!policy.requires_approval(&Intent::ApplyPatch {
+            patch: "x".to_string(),
+        }));
         assert!(!policy.requires_approval(&Intent::GitPushAll {
             repo: None,
             message: "msg".to_string(),
+        }));
+    }
+
+    #[test]
+    fn approval_policy_checks_apply_patch() {
+        let policy = ApprovalPolicy::from_spec("apply_patch");
+
+        assert!(policy.requires_approval(&Intent::ApplyPatch {
+            patch: "x".to_string(),
         }));
     }
 

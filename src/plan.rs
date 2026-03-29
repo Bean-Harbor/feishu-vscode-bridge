@@ -68,6 +68,18 @@ impl PlanSession {
         self.pending_approval.is_some()
     }
 
+    pub fn pending_steps(&self) -> &[Intent] {
+        if self.next_step >= self.steps.len() {
+            &[]
+        } else {
+            &self.steps[self.next_step..]
+        }
+    }
+
+    pub fn current_step(&self) -> Option<&Intent> {
+        self.steps.get(self.next_step)
+    }
+
     pub fn execute_next<F>(&mut self, mut executor: F) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,

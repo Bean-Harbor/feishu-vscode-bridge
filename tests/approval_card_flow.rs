@@ -50,7 +50,7 @@ fn session_store_path(dir: &Path) -> PathBuf {
 
 #[test]
 fn execute_all_approval_flow_completes_after_approve() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp_dir = unique_temp_dir("approve");
     let session_path = session_store_path(&temp_dir);
     let app = BridgeApp::with_executor(
@@ -64,8 +64,8 @@ fn execute_all_approval_flow_completes_after_approve() {
     match start {
         BridgeResponse::Card { fallback_text, card } => {
             assert!(fallback_text.contains("待审批步骤"));
-            assert!(card.to_string().contains("批准"));
-            assert!(card.to_string().contains("拒绝"));
+            assert!(card.to_string().contains("确认继续"));
+            assert!(card.to_string().contains("取消这步"));
         }
         BridgeResponse::Text(text) => panic!("expected approval card, got text: {text}"),
     }
@@ -75,20 +75,30 @@ fn execute_all_approval_flow_completes_after_approve() {
     match approved {
         BridgeResponse::Card { fallback_text, card } => {
             assert!(fallback_text.contains("计划执行完成"));
-            assert_eq!(card["header"]["title"]["content"], "计划已完成");
+            assert_eq!(card["header"]["title"]["content"], "已完成");
             assert!(card.to_string().contains("fake git pull ok"));
             assert!(card.to_string().contains("查看当前仓库状态"));
         }
         BridgeResponse::Text(text) => panic!("expected completion card, got text: {text}"),
     }
-    assert!(!session_path.exists());
+
+    assert!(session_path.exists());
+    let continued = app.dispatch("继续刚才的任务", session_key);
+    match continued {
+        BridgeResponse::Text(text) => {
+            assert!(text.contains("上次任务状态: 已完成"));
+            assert!(text.contains("执行全部 git pull; git status"));
+            assert!(text.contains("上次动作: 批准"));
+        }
+        BridgeResponse::Card { .. } => panic!("expected text summary after completed task"),
+    }
 
     fs::remove_dir_all(temp_dir).unwrap();
 }
 
 #[test]
 fn approval_reject_clears_pending_session() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp_dir = unique_temp_dir("reject");
     let session_path = session_store_path(&temp_dir);
     let app = BridgeApp::with_executor(
@@ -102,7 +112,7 @@ fn approval_reject_clears_pending_session() {
     match start {
         BridgeResponse::Card { fallback_text, card } => {
             assert!(fallback_text.contains("待审批步骤"));
-            assert!(card.to_string().contains("批准"));
+            assert!(card.to_string().contains("确认继续"));
         }
         BridgeResponse::Text(text) => panic!("expected approval card, got text: {text}"),
     }
@@ -115,7 +125,17 @@ fn approval_reject_clears_pending_session() {
         }
         BridgeResponse::Card { .. } => panic!("expected text reply after rejection"),
     }
-    assert!(!session_path.exists());
+
+    assert!(session_path.exists());
+    let continued = app.dispatch("继续", session_key);
+    match continued {
+        BridgeResponse::Text(text) => {
+            assert!(text.contains("上次任务状态: 已取消"));
+            assert!(text.contains("执行计划 git pull; git status"));
+            assert!(text.contains("上次动作: 拒绝"));
+        }
+        BridgeResponse::Card { .. } => panic!("expected text summary after rejected task"),
+    }
 
     fs::remove_dir_all(temp_dir).unwrap();
 }

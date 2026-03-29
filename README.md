@@ -2,13 +2,13 @@
 
 A standalone open-source Rust project for bridging Feishu commands to local VS Code development actions.
 
-This repository extracts the Feishu <-> VS Code bridge flow from HarborNAS work and focuses on:
+This repository focuses on:
 
 - Shipping a standalone Feishu <-> VS Code Copilot bridge that users can try independently
-- Enabling remote Copilot-assisted development from Feishu without requiring HarborOS
+- Enabling remote Copilot-assisted development from Feishu
 - Keeping scope centered on chat-to-editor workflow reliability, setup, and publishability
 
-It is not intended to expand back into HarborOS device or local-agent control inside this repository unless that direction is explicitly revisited later.
+It is not intended to expand into unrelated device-control or local-agent-control scope inside this repository unless that direction is explicitly revisited later.
 
 - Intent parsing for chat commands
 - Plan execution with step-by-step mode
@@ -17,9 +17,8 @@ It is not intended to expand back into HarborOS device or local-agent control in
 
 ## Product Positioning
 
-- Origin: split out from HarborOS-related work
 - Current goal: publish a standalone bridge so users can experience Feishu remote connection to VS Code Copilot first
-- Current non-goal: adding HarborOS control capabilities into this repository
+- Current non-goal: adding unrelated device-control capabilities into this repository
 
 
 ## Quick Start
@@ -61,17 +60,36 @@ Compatibility status:
 
 ## Current Scope
 
-- Core command and plan execution engine (Rust)
-- `继续` / `执行全部` plan intent support with local persisted session state
-- Configurable approval gates for selected command types before execution
+- Core command parsing, plan execution, and bridge runtime engine (Rust)
+- Direct commands plus multi-step plans with `继续`, `继续刚才的任务`, and `执行全部`
+- Local persisted session state for both plans and one-off commands, including task summary, latest result, recent files, latest diff, and reversible patch context
+- Conversational follow-up actions such as `刚才为什么失败`, `把上一步结果发我`, `继续改刚才那个文件`, `把刚才的 diff 发我`, `把刚才改动的文件列表发我`, and `撤回刚才的补丁`
+- Interactive Feishu cards for pause / failure / approval states, with primary actions and follow-up actions grouped separately
+- Configurable approval gates for selected command types before execution, including approval handling for patch application
 - Configurable default workspace path for Git operations
+- Workspace read/search/test/change tools: `读取`, `列出`, `搜索`, `运行测试`, `查看 diff`, `应用补丁`
+- Patch rollback support via reverse apply of the latest remembered patch
 - Minimal CLI demo executor
 - Native desktop setup GUI for initial configuration
 
 ## Plan Commands
 
+Practical Feishu chat examples: see `docs/feishu_chat_templates.md` for copy-paste conversation templates.
+
+One-page quick ref: see `docs/feishu_quick_ref.md` for a condensed cheat sheet suitable for a pinned Feishu doc or group notice.
+
+Ultra-short group notice: see `docs/feishu_group_notice.md` for a minimal pinned-message version.
+
 - `执行计划 <命令1>; <命令2>`: execute exactly one step, then pause
 - `继续`: execute the next pending step, or retry the failed step
+- `继续刚才的任务`: resume the current plan, or summarize the last persisted task when no active plan remains
+- `刚才为什么失败`: explain the latest failure using the stored step result
+- `把上一步结果发我`: return the latest stored step result verbatim
+- `继续改刚才那个文件`: reopen context by reading the most recently touched file, including files inferred from `apply_patch` diff headers
+- `把刚才的 diff 发我`: return the latest stored diff or patch content
+- `把刚才改动的文件列表发我`: return the latest remembered file list from a direct command or plan step
+- `撤回刚才的补丁`: reverse-apply the latest remembered patch
+- Short chat aliases also work for Feishu follow-ups, for example: `为什么失败了`, `看上一步`, `继续这个文件`, `看 diff`, `看文件列表`, `撤回补丁`
 - `重新执行失败步骤`: retry only the currently failed step
 - `批准`: execute the current approval-gated step
 - `拒绝`: cancel the current approval-gated plan
@@ -85,10 +103,35 @@ Example:
 执行全部
 ```
 
+Workspace examples:
+
+```text
+读取 src/lib.rs 1-120
+列出 src
+搜索 parse_intent 在 src
+运行测试
+运行测试 cargo test --lib
+查看 diff
+查看 diff src/lib.rs
+应用补丁
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+```
+
 Session notes:
 
 - CLI 会话保存在当前目录下的 `.feishu-vscode-bridge-session.json`
 - 飞书计划按 chat 隔离，不同会话不会共用同一个待执行计划
+- 会话会持久化 `current_task`、`pending_steps`、`last_result`、`last_action`
+- 会话还会持久化最近一步的原始结果、最近一次明确操作到的主文件、最近文件列表、最近一次 diff / patch 内容，以及最近一次可撤回的补丁
+- `apply_patch` 会从 unified diff 头里推断一个最近文件列表，所以多文件补丁后也能继续追问文件上下文
+- 这些上下文现在不仅在计划执行里持久化，直接命令执行后也会落盘，所以后续追问不再依赖必须先走 `执行计划`
+- 即使计划已完成或被拒绝，后续发送 `继续刚才的任务` 仍可看到上次任务摘要
+- 在失败暂停或直接执行完成后，可直接发送 `刚才为什么失败`、`把上一步结果发我`、`继续改刚才那个文件`、`把刚才的 diff 发我`、`把刚才改动的文件列表发我`、`撤回刚才的补丁`
 
 ## Feishu Card Actions
 
@@ -96,9 +139,11 @@ Session notes:
 - 普通暂停卡片提供 `继续` 和 `执行全部` 两个按钮
 - 失败暂停卡片提供 `重新执行失败步骤` 和 `执行全部` 两个按钮
 - 待审批卡片提供 `批准` 和 `拒绝` 两个按钮
+- 当会话里已有上下文时，卡片会把主操作和追问操作分成两组，并用更短的对话文案展示按钮，例如 `看上一步`、`继续这个文件`、`看 diff`、`看文件列表`、`撤回补丁`
 - 按钮点击后会直接触发同名命令，不需要手动再发文本
-- 卡片会显示当前状态、已完成步数、当前步骤、剩余步骤，以及失败步骤或完成状态
+- 卡片会显示当前状态、当前任务、最近结果、最近文件、已完成步数、当前步骤、剩余步骤，以及失败步骤或完成状态
 - 默认审批策略会拦截 `run` / `$` shell 命令和 `git push`
+- 默认审批策略也会拦截 `应用补丁`
 - 可通过 `BRIDGE_APPROVAL_REQUIRED` 配置审批范围
 - 已在真实飞书环境验证：`执行计划 git status; $ pwd` -> 点击 `继续` 可成功触发 `card.action.trigger` 并正常回卡片回复
 - 已在真实飞书环境验证：`执行计划 git status; $ false; $ pwd` -> 点击 `重新执行失败步骤` 可成功触发 `card.action.trigger` 并正常回卡片回复；因失败步骤仍为 `false`，计划会继续停在第 2 步
@@ -138,12 +183,13 @@ BRIDGE_APPROVAL_REQUIRED=shell,git_push
 
 Supported values:
 
-- `default`: same as `shell,git_push`
+- `default`: same as `shell,git_push,apply_patch`
 - `none`: disable approval gating entirely
 - `all`: require approval for all supported gated command types
 - `shell`: gate `run ...` and `$ ...`
 - `git_push`: gate `git push`
 - `git_pull`: gate `git pull`
+- `apply_patch`: gate `应用补丁`
 - `install_extension`: gate extension install
 - `uninstall_extension`: gate extension uninstall
 - `extensions`: gate both install and uninstall extension actions
@@ -157,6 +203,9 @@ BRIDGE_APPROVAL_REQUIRED=default
 
 # only gate git write operations
 BRIDGE_APPROVAL_REQUIRED=git_push
+
+# gate patch application while leaving shell disabled
+BRIDGE_APPROVAL_REQUIRED=apply_patch
 
 # gate shell and all git actions
 BRIDGE_APPROVAL_REQUIRED=shell,git
@@ -197,6 +246,30 @@ git push
 ```
 
 These commands will operate on `BRIDGE_WORKSPACE_PATH` by default.
+
+## Test Command Configuration
+
+`运行测试` supports either a default workspace test command or an explicit command sent from Feishu.
+
+Configure the default command with:
+
+```bash
+BRIDGE_TEST_COMMAND="cargo test"
+```
+
+Behavior:
+
+- `运行测试` will use `BRIDGE_TEST_COMMAND` when set
+- If `BRIDGE_TEST_COMMAND` is not set, it defaults to `cargo test`
+- `运行测试 cargo test --lib` or another explicit command overrides the default for that single request
+
+Examples:
+
+```text
+运行测试
+运行测试 cargo test --lib
+运行测试 cargo test --test approval_card_flow
+```
 
 ## Automated Approval Flow Tests
 
@@ -389,7 +462,7 @@ This file is created in the current working directory of the `bridge-cli listen`
 
 ## Why This Repo
 
-The original implementation lived in a larger HarborNAS workspace with nested repositories. This project isolates the bridge capability for open-source adoption and easier contribution.
+This project isolates the Feishu <-> VS Code bridge capability for standalone adoption and easier contribution.
 
 ## License
 
