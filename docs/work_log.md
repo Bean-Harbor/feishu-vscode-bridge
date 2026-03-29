@@ -45,6 +45,7 @@
 - Added regression coverage for workspace-aware shell execution and stabilized the assertion on macOS by comparing canonicalized paths
 - Completed live Feishu re-validation for `执行计划 git status; $ pwd` -> `继续` -> `批准`, confirming approved `$ pwd` now runs inside `/Users/Bean/Documents/trae_projects/feishu-vscode-bridge`
 - Synced the workspace-cwd fix to GitHub as commit `7b8d777` (`Fix shell commands to respect workspace cwd`)
+- Ignored the local `.feishu-vscode-bridge-audit.jsonl` runtime audit artifact so future Git syncs stay focused on source and docs changes
 
 ### Files Added
 
@@ -101,6 +102,7 @@
 - `src/vscode.rs` — routed `run_shell` through the workspace-aware executor and added a regression test for `BRIDGE_WORKSPACE_PATH` cwd behavior
 - `README.md` — documented group-chat session isolation and the new `.feishu-vscode-bridge-audit.jsonl` audit trail
 - `README.md` — documented the current attachment / multimodal input boundary and the required text-based downgrade path
+- `.gitignore` — now ignores the local `.feishu-vscode-bridge-audit.jsonl` runtime audit file to keep Git status clean between live Feishu validation runs
 
 ### Next Candidates
 

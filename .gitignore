@@ -3,4 +3,5 @@ target_*
 Cargo.lock
 .env
 .feishu-vscode-bridge-session.json
+.feishu-vscode-bridge-audit.jsonl
 .DS_Store
