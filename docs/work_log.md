@@ -34,6 +34,7 @@
 - Refined the porting plan from a broad `P2` into concrete `P2.1.x` steps so later sessions resume from a specific next action instead of a vague phase
 - Implemented `P2.1.1` by unifying failure explanation, result replay, diff replay, file continuation, and recent-file replies under a shared follow-up response skeleton
 - Implemented `P2.1.2` by adding context-first failure/result summaries, key-error extraction, and next-step suggestions on top of the shared follow-up reply skeleton
+- Implemented `P2.1.3` by turning `继续刚才的任务` into a continuity replay that surfaces current task focus, recent step, file focus, diff context, and next-step guidance from persisted session state
 
 ### Files Added
 
@@ -78,11 +79,13 @@
 - `docs/copilot_bridge_porting_plan.md` — split `P2.1` into a concrete implementation sequence for reply structure, failure/result summarization, continuity, and real Feishu validation
 - `src/bridge.rs` — introduced a shared follow-up reply skeleton so text responses for failure/result/diff/file recall now use a consistent structure
 - `src/bridge.rs` — added failure/result summary helpers so follow-up replies now surface key lines and suggested next actions before raw output
+- `src/bridge.rs` — upgraded stored-session summaries into a continuity replay so `继续刚才的任务` now returns a task-oriented snapshot instead of a flat status list
+- `tests/approval_card_flow.rs` — updated persisted-session assertions to match the new continuity replay text structure
 
 ### Next Candidates
 
-- Start P2.1.3 from `docs/copilot_bridge_porting_plan.md`: strengthen task continuity on top of the richer follow-up summaries
-- After continuity is stable, continue with P2.1.4 for real Feishu validation, then move into P2.2
+- Start P2.1.4 from `docs/copilot_bridge_porting_plan.md`: validate the improved follow-up continuity in real Feishu flows
+- After real Feishu validation is recorded, continue with P2.2 for transport, attachment, and audit enhancements
 
 ### Verification
 
@@ -97,6 +100,7 @@
 - `cargo test` after adding direct-command persistence, recent-file recall, grouped card actions, and reversible patch support
 - `cargo test` after unifying follow-up text replies under a shared response skeleton for failure/result/diff/file recall
 - `cargo test` after adding key-error extraction and next-step guidance to failure/result follow-up replies
+- `cargo test` after upgrading `继续刚才的任务` to return a richer continuity replay and updating approval-flow persistence assertions
 
 ## 2026-03-28
 

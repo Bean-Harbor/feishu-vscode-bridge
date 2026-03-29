@@ -86,9 +86,10 @@ fn execute_all_approval_flow_completes_after_approve() {
     let continued = app.dispatch("继续刚才的任务", session_key);
     match continued {
         BridgeResponse::Text(text) => {
-            assert!(text.contains("上次任务状态: 已完成"));
-            assert!(text.contains("执行全部 git pull; git status"));
-            assert!(text.contains("上次动作: 批准"));
+            assert!(text.contains("🧭 任务连续性回放"));
+            assert!(text.contains("🎯 当前任务: 执行全部 git pull; git status"));
+            assert!(text.contains("📌 最近状态: 已完成"));
+            assert!(text.contains("🧾 上次动作: 批准"));
         }
         BridgeResponse::Card { .. } => panic!("expected text summary after completed task"),
     }
@@ -130,9 +131,10 @@ fn approval_reject_clears_pending_session() {
     let continued = app.dispatch("继续", session_key);
     match continued {
         BridgeResponse::Text(text) => {
-            assert!(text.contains("上次任务状态: 已取消"));
-            assert!(text.contains("执行计划 git pull; git status"));
-            assert!(text.contains("上次动作: 拒绝"));
+            assert!(text.contains("🧭 任务连续性回放"));
+            assert!(text.contains("🎯 当前任务: 执行计划 git pull; git status"));
+            assert!(text.contains("📌 最近状态: 已取消"));
+            assert!(text.contains("🧾 上次动作: 拒绝"));
         }
         BridgeResponse::Card { .. } => panic!("expected text summary after rejected task"),
     }

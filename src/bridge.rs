@@ -666,42 +666,78 @@ fn result_next_step_hint(stored: &StoredSession) -> String {
     "如果这就是你要的结果，可以继续追问 diff、文件上下文，或直接发下一条开发指令。".to_string()
 }
 
-fn format_stored_session_summary(stored: &StoredSession) -> String {
-    let task = stored
-        .current_task
-        .as_deref()
-        .filter(|task| !task.is_empty())
-        .unwrap_or("(未记录任务描述)");
-    let last_action = stored
-        .last_action
-        .as_deref()
-        .unwrap_or("(未记录)");
-
-    match stored.last_result.as_ref() {
-        Some(result) => {
-            let mut lines = vec![format!("ℹ️ 上次任务状态: {}", result.status)];
-            lines.push(format!("🎯 当前任务: {}", task));
-            lines.push(format!("🧾 上次动作: {}", last_action));
-            lines.push(format!("📌 最近结果: {}", result.summary));
-
-            if !stored.recent_file_paths.is_empty() {
-                lines.push(format!("📄 最近文件: {}", stored.recent_file_paths.join("、")));
-            }
-
-            if !stored.pending_steps.is_empty() {
-                lines.push("📦 剩余步骤: ".to_string());
-                lines.extend(
-                    stored
-                        .pending_steps
-                        .iter()
-                        .map(|step| format!("- {}", step)),
-                );
-            }
-
-            lines.join("\n")
-        }
-        None => "⚠️ 当前没有待继续的计划。".to_string(),
+fn continuation_next_step_hint(stored: &StoredSession) -> String {
+    if let Some(step) = stored.pending_steps.first() {
+        return format!("当前最直接的下一步是「{}」。", step);
     }
+
+    if let Some(path) = stored
+        .recent_file_paths
+        .first()
+        .map(String::as_str)
+        .or(stored.last_file_path.as_deref())
+    {
+        if stored.last_diff.is_some() {
+            return format!("可以先回到 {}，结合最近 diff 继续判断是否还要改动。", path);
+        }
+
+        return format!("可以先回到 {}，继续围绕这个文件追问或修改。", path);
+    }
+
+    if stored.last_step.is_some() {
+        return "可以先追问上一步结果，再决定是否继续执行新命令。".to_string();
+    }
+
+    "可以直接发下一条开发指令，或先追问最近结果和文件上下文。".to_string()
+}
+
+fn format_stored_session_summary(stored: &StoredSession) -> String {
+    let Some(result) = stored.last_result.as_ref() else {
+        return "⚠️ 当前没有待继续的计划。".to_string();
+    };
+
+    let mut blocks = vec![format!("📌 任务结果: {}", result.summary)];
+
+    if let Some(last_step) = stored.last_step.as_ref() {
+        blocks.push(format!("🧾 最近一步: {}", last_step.description));
+        if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 2, 180) {
+            blocks.push(format!("🔎 最近结果摘要: {}", snippet));
+        }
+    }
+
+    if let Some(path) = stored
+        .recent_file_paths
+        .first()
+        .map(String::as_str)
+        .or(stored.last_file_path.as_deref())
+    {
+        blocks.push(format!("📄 当前聚焦文件: {}", path));
+    }
+
+    if stored.recent_file_paths.len() > 1 {
+        blocks.push(format!("🗂 最近文件队列: {}", stored.recent_file_paths.join("、")));
+    }
+
+    if let Some(last_diff) = stored.last_diff.as_ref() {
+        blocks.push(format!("🧩 最近 diff: {}", last_diff.description));
+        if let Some(snippet) = summarize_reply_snippet(&last_diff.content, 3, 220) {
+            blocks.push(format!("🔎 diff 摘要: {}", snippet));
+        }
+    }
+
+    if let Some(next_step) = stored.pending_steps.first() {
+        blocks.push(format!("⏭ 下一步: {}", next_step));
+        if stored.pending_steps.len() > 1 {
+            blocks.push(format!(
+                "📦 后续步骤: {}",
+                stored.pending_steps.iter().skip(1).take(3).cloned().collect::<Vec<_>>().join("；")
+            ));
+        }
+    }
+
+    blocks.push(format!("➡️ 下一步建议: {}", continuation_next_step_hint(stored)));
+
+    format_follow_up_reply("任务连续性回放", stored, blocks)
 }
 
 fn format_last_failure_reply(stored: &StoredSession) -> String {
@@ -1876,6 +1912,69 @@ mod tests {
 
         let _ = fs::remove_file(session_path);
         let _ = fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn continue_plan_without_pending_plan_returns_continuity_summary() {
+        let session_path = unique_temp_path("continue-summary");
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+        let session_key = "cli";
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("应用补丁后继续检查 bridge 回复".to_string()),
+            pending_steps: vec!["运行测试命令 cargo test".to_string(), "查看当前工作区 diff".to_string()],
+            last_result: Some(StoredResult {
+                status: "待继续".to_string(),
+                summary: "下一步是第 2 / 3 步。".to_string(),
+                success: true,
+            }),
+            last_action: Some("继续".to_string()),
+            last_step: Some(StoredStep {
+                description: "应用补丁到当前工作区".to_string(),
+                reply: "✅ 应用补丁  (3ms)\n已更新 src/bridge.rs".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/bridge.rs".to_string()),
+            recent_file_paths: vec!["src/bridge.rs".to_string(), "docs/work_log.md".to_string()],
+            last_diff: Some(StoredDiff {
+                description: "查看当前工作区 diff".to_string(),
+                content: "diff --git a/src/bridge.rs b/src/bridge.rs\n@@ -1 +1 @@\n-old\n+new".to_string(),
+            }),
+            last_patch: None,
+        };
+
+        app.persist_session(session_key, &stored).unwrap();
+
+        match app.dispatch("继续刚才的任务", session_key) {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 任务连续性回放"));
+                assert!(text.contains("🎯 当前任务: 应用补丁后继续检查 bridge 回复"));
+                assert!(text.contains("📌 最近状态: 待继续"));
+                assert!(text.contains("🧾 最近一步: 应用补丁到当前工作区"));
+                assert!(text.contains("📄 当前聚焦文件: src/bridge.rs"));
+                assert!(text.contains("🧩 最近 diff: 查看当前工作区 diff"));
+                assert!(text.contains("⏭ 下一步: 运行测试命令 cargo test"));
+                assert!(text.contains("➡️ 下一步建议:"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text continuity summary"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn continue_plan_without_session_returns_warning() {
+        let session_path = unique_temp_path("continue-missing");
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+
+        match app.dispatch("继续刚才的任务", "cli") {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("当前没有待继续的计划"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected warning text"),
+        }
+
+        let _ = fs::remove_file(session_path);
     }
 
     #[test]
