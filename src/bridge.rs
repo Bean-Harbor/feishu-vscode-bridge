@@ -398,6 +398,18 @@ impl BridgeApp {
         task_text: &str,
         intent: Intent,
     ) -> BridgeResponse {
+        if let Intent::AskAgent { prompt } = &intent {
+            let result = vscode::ask_agent(session_key, prompt);
+            let outcome = ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply("问 Copilot"),
+            };
+            let progress = progress_from_direct_execution(intent, outcome.clone());
+            let stored = self.build_stored_session(None, task_text, "直接执行", &progress);
+            let _ = self.persist_session(session_key, &stored);
+            return BridgeResponse::Text(outcome.reply);
+        }
+
         let outcome = (self.executor)(&intent);
         let reply = outcome.reply.clone();
         let progress = progress_from_direct_execution(intent, outcome);
@@ -1529,6 +1541,22 @@ fn describe_intent(intent: &Intent) -> String {
             None => "查看当前工作区 diff".to_string(),
         },
         Intent::ApplyPatch { .. } => "应用补丁到当前工作区".to_string(),
+        Intent::SearchSymbol { query, path } => match path {
+            Some(path) => format!("搜索符号 {query} 于 {path}"),
+            None => format!("搜索符号 {query}"),
+        },
+        Intent::FindReferences { query, path } => match path {
+            Some(path) => format!("查找引用 {query} 于 {path}"),
+            None => format!("查找引用 {query}"),
+        },
+        Intent::FindImplementations { query, path } => match path {
+            Some(path) => format!("查找实现 {query} 于 {path}"),
+            None => format!("查找实现 {query}"),
+        },
+        Intent::RunSpecificTest { filter } => format!("运行指定测试 {filter}"),
+        Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
+        Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
+        Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
         Intent::GitStatus { repo } => match repo {
             Some(repo) => format!("查看仓库状态 {repo}"),
             None => "查看当前仓库状态".to_string(),
@@ -1541,6 +1569,14 @@ fn describe_intent(intent: &Intent) -> String {
             Some(repo) => format!("提交并推送 {repo}: {message}"),
             None => format!("提交并推送当前仓库: {message}"),
         },
+        Intent::GitLog { count, path } => {
+            let n = count.map_or("".to_string(), |n| format!(" {n}"));
+            match path {
+                Some(path) => format!("查看提交历史{n} {path}"),
+                None => format!("查看提交历史{n}"),
+            }
+        }
+        Intent::GitBlame { path } => format!("查看文件追溯 {path}"),
         Intent::RunShell { cmd } => format!("执行命令 {cmd}"),
         Intent::RunPlan { .. } => "执行计划".to_string(),
         Intent::ContinuePlan => "继续计划".to_string(),
@@ -1758,6 +1794,62 @@ fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
                 reply: result.to_reply("Git Push"),
             }
         }
+        Intent::GitLog { count, path } => {
+            let result = vscode::git_log(*count, path.as_deref());
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply("Git Log"),
+            }
+        }
+        Intent::GitBlame { path } => {
+            let result = vscode::git_blame(path);
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply(&format!("Git Blame {path}")),
+            }
+        }
+        Intent::SearchSymbol { query, path } => {
+            let result = vscode::search_symbol(query, path.as_deref());
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply("搜索符号"),
+            }
+        }
+        Intent::FindReferences { query, path } => {
+            let result = vscode::find_references(query, path.as_deref());
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply("查找引用"),
+            }
+        }
+        Intent::FindImplementations { query, path } => {
+            let result = vscode::find_implementations(query, path.as_deref());
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply("查找实现"),
+            }
+        }
+        Intent::RunSpecificTest { filter } => {
+            let result = vscode::run_specific_test(filter);
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply(&format!("运行测试 {filter}")),
+            }
+        }
+        Intent::RunTestFile { path } => {
+            let result = vscode::run_test_file(path);
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply(&format!("运行测试文件 {path}")),
+            }
+        }
+        Intent::WriteFile { path, content } => {
+            let result = vscode::write_file(path, content);
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply(&format!("写入 {path}")),
+            }
+        }
         Intent::RunShell { cmd } => {
             let result = vscode::run_shell(cmd);
             ExecutionOutcome {
@@ -1765,6 +1857,10 @@ fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
                 reply: result.to_reply(&format!("$ {cmd}")),
             }
         }
+        Intent::AskAgent { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 问 Copilot 目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
         Intent::Help => ExecutionOutcome {
             success: true,
             reply: help_text().to_string(),

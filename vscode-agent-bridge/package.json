@@ -1,0 +1,60 @@
+{
+  "name": "feishu-vscode-agent-bridge",
+  "displayName": "Feishu VS Code Agent Bridge",
+  "description": "Companion VS Code extension for the Feishu remote agent bridge.",
+  "version": "0.0.1",
+  "publisher": "bean-harbor",
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "feishuVscodeBridge.showAgentBridgeStatus",
+        "title": "Feishu Bridge: Show Agent Bridge Status"
+      },
+      {
+        "command": "feishuVscodeBridge.resetAgentBridgeSessions",
+        "title": "Feishu Bridge: Reset Agent Bridge Sessions"
+      }
+    ],
+    "configuration": {
+      "title": "Feishu VS Code Agent Bridge",
+      "properties": {
+        "feishuVscodeBridge.agentBridge.port": {
+          "type": "number",
+          "default": 8765,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Local HTTP port exposed by the VS Code companion extension for bridge requests."
+        },
+        "feishuVscodeBridge.agentBridge.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the local agent bridge server when the extension activates."
+        },
+        "feishuVscodeBridge.agentBridge.vendor": {
+          "type": "string",
+          "default": "copilot",
+          "description": "Preferred language model vendor when selecting a chat model."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.30",
+    "@types/vscode": "^1.99.0",
+    "typescript": "^5.8.3"
+  }
+}

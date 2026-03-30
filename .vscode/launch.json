@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Feishu Agent Bridge Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "runtimeExecutable": "${execPath}",
+      "env": {
+        "BRIDGE_AGENT_BOOTSTRAP_WORKSPACE": "${workspaceFolder}"
+      },
+      "args": [
+        "${workspaceFolder}",
+        "--extensionDevelopmentPath=${workspaceFolder}/vscode-agent-bridge"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/vscode-agent-bridge/out/**/*.js"
+      ],
+      "preLaunchTask": "build-feishu-agent-bridge-extension"
+    }
+  ]
+}

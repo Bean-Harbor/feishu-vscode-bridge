@@ -5,3 +5,5 @@ Cargo.lock
 .feishu-vscode-bridge-session.json
 .feishu-vscode-bridge-audit.jsonl
 .DS_Store
+vscode-agent-bridge/node_modules/
+vscode-agent-bridge/out/

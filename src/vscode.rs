@@ -1,5 +1,8 @@
 //! VS Code CLI 操作：打开文件、安装/列出扩展、运行 shell 等
 
+use regex::Regex;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,10 +10,22 @@ use std::path::Component;
 use std::process::Command;
 use std::time::Instant;
 
-use crate::executor::{run_cmd, run_cmd_in_dir, CmdResult};
+use crate::executor::{run_cmd, CmdResult};
 
 pub const WORKSPACE_PATH_ENV: &str = "BRIDGE_WORKSPACE_PATH";
 pub const TEST_COMMAND_ENV: &str = "BRIDGE_TEST_COMMAND";
+pub const AGENT_BRIDGE_URL_ENV: &str = "BRIDGE_AGENT_BRIDGE_URL";
+pub const AGENT_BRIDGE_PORT_ENV: &str = "BRIDGE_AGENT_BRIDGE_PORT";
+const DEFAULT_AGENT_BRIDGE_PORT: u16 = 8765;
+
+#[derive(Deserialize)]
+struct AgentAskResponse {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    reply: String,
+    summary: Option<String>,
+    context: Option<String>,
+}
 
 /// 打开文件（可指定行号）
 pub fn open_file(path: &str, line: Option<u32>) -> CmdResult {
@@ -46,6 +61,40 @@ pub fn open_folder(path: &str) -> CmdResult {
 /// 用 VS Code 执行 diff
 pub fn diff_files(file1: &str, file2: &str) -> CmdResult {
     run_cmd("code", &["--diff", file1, file2], 10)
+}
+
+pub fn ask_agent(session_id: &str, prompt: &str) -> CmdResult {
+    let start = Instant::now();
+    let result = (|| -> Result<String, String> {
+        let trimmed_prompt = prompt.trim();
+        if trimmed_prompt.is_empty() {
+            return Err("提问内容不能为空。".to_string());
+        }
+
+        let endpoint = format!("{}/v1/chat/ask", agent_bridge_base_url()?);
+        let response = ureq::post(&endpoint)
+            .set("Content-Type", "application/json")
+            .send_json(ureq::json!({
+                "sessionId": session_id,
+                "prompt": trimmed_prompt,
+            }))
+            .map_err(|err| format_agent_bridge_error(err, &endpoint))?;
+
+        let payload: AgentAskResponse = response
+            .into_json()
+            .map_err(|err| format!("解析 agent bridge 响应失败: {err}"))?;
+
+        let mut lines = vec![format!("session: {}", payload.session_id)];
+        if let Some(summary) = payload.summary.as_deref().filter(|value| !value.trim().is_empty()) {
+            lines.push(format!("摘要: {}", summary.trim()));
+        }
+        lines.push(String::new());
+        lines.push(payload.reply.trim().to_string());
+
+        Ok(lines.join("\n"))
+    })();
+
+    into_cmd_result(result, start.elapsed().as_millis() as u64)
 }
 
 /// 读取工作区文件内容
@@ -173,11 +222,19 @@ pub fn search_text(query: &str, path: Option<&str>, is_regex: bool) -> CmdResult
 
         let output = command.output().map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
-                "未找到 rg，请先安装 ripgrep。".to_string()
+                String::new()
             } else {
                 format!("执行搜索失败: {err}")
             }
-        })?;
+        });
+
+        let output = match output {
+            Ok(output) => output,
+            Err(message) if message.is_empty() => {
+                return fallback_text_search(trimmed_query, &target, is_regex);
+            }
+            Err(message) => return Err(message),
+        };
 
         match output.status.code() {
             Some(0) => {
@@ -232,17 +289,7 @@ pub fn run_tests(command: Option<&str>) -> CmdResult {
         .or_else(default_test_command)
         .unwrap_or_else(|| "cargo test".to_string());
 
-    #[cfg(target_os = "windows")]
-    let output = Command::new("cmd")
-        .args(["/C", &test_command])
-        .current_dir(&workspace)
-        .output();
-
-    #[cfg(not(target_os = "windows"))]
-    let output = Command::new("sh")
-        .args(["-c", &test_command])
-        .current_dir(&workspace)
-        .output();
+    let output = run_test_command(&workspace, &test_command);
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -356,13 +403,37 @@ pub fn run_shell(cmd: &str) -> CmdResult {
         Err(err) => return error_cmd_result(err),
     };
 
+    let start = Instant::now();
+
     #[cfg(target_os = "windows")]
-    {
-        run_cmd_in_dir("cmd", &["/C", cmd], 30, Some(&workspace))
-    }
+    let result = Command::new("cmd")
+        .args(["/C", cmd])
+        .current_dir(&workspace)
+        .output();
+
     #[cfg(not(target_os = "windows"))]
-    {
-        run_cmd_in_dir("sh", &["-c", cmd], 30, Some(&workspace))
+    let result = Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(&workspace)
+        .output();
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(output) => CmdResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code(),
+            duration_ms,
+        },
+        Err(e) => CmdResult {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("执行失败: {e}"),
+            exit_code: None,
+            duration_ms,
+        },
     }
 }
 
@@ -421,6 +492,314 @@ pub fn git_push_all(repo_path: Option<&str>, message: &str) -> CmdResult {
     ])
 }
 
+/// 查看 Git 提交历史
+pub fn git_log(count: Option<usize>, path: Option<&str>) -> CmdResult {
+    let workspace = match workspace_root() {
+        Ok(path) => path,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let ws = workspace.to_string_lossy();
+    let n = count.unwrap_or(20).min(100).to_string();
+    let mut args = vec!["-C", &ws, "log", "--oneline", "--no-decorate", "-n", &n];
+
+    let pathspec;
+    if let Some(p) = path.map(str::trim).filter(|p| !p.is_empty()) {
+        args.push("--");
+        pathspec = match normalize_pathspec(&workspace, p) {
+            Ok(s) => s,
+            Err(err) => return error_cmd_result(err),
+        };
+        args.push(&pathspec);
+    }
+
+    run_cmd("git", &args, 30)
+}
+
+/// 查看文件逐行 blame
+pub fn git_blame(path: &str) -> CmdResult {
+    let workspace = match workspace_root() {
+        Ok(path) => path,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let pathspec = match normalize_pathspec(&workspace, path) {
+        Ok(s) => s,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let ws = workspace.to_string_lossy();
+    run_cmd("git", &["-C", &ws, "blame", "--", &pathspec], 30)
+}
+
+/// 搜索符号（函数、结构体、类型定义）
+pub fn search_symbol(query: &str, path: Option<&str>) -> CmdResult {
+    let start = Instant::now();
+    let result = (|| -> Result<String, String> {
+        let trimmed_query = query.trim();
+        if trimmed_query.is_empty() {
+            return Err("符号名称不能为空。".to_string());
+        }
+
+        let target = match path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => resolve_workspace_target(path)?,
+            None => workspace_root()?,
+        };
+        let options = SearchOptions::from_explicit_path(path);
+
+        let pattern = symbol_definition_pattern(trimmed_query);
+
+        match run_rg_regex_search(&pattern, &target, options) {
+            Ok(SearchBackendResult::Matches(matches, truncated)) => {
+                Ok(format_grouped_search_reply(
+                    "符号",
+                    trimmed_query,
+                    &target,
+                    &matches,
+                    truncated,
+                    None,
+                ))
+            }
+            Ok(SearchBackendResult::NoMatches) => Ok(format!(
+                "搜索范围: {}\n符号: {}\n\n未找到匹配的符号定义。",
+                target.display(),
+                trimmed_query
+            )),
+            Ok(SearchBackendResult::FallbackRequired) => {
+                fallback_symbol_search(trimmed_query, &target, options)
+            }
+            Err(err) => Err(err),
+        }
+    })();
+
+    into_cmd_result(result, start.elapsed().as_millis() as u64)
+}
+
+/// 搜索符号引用位置
+pub fn find_references(query: &str, path: Option<&str>) -> CmdResult {
+    let start = Instant::now();
+    let result = (|| -> Result<String, String> {
+        let trimmed_query = query.trim();
+        if trimmed_query.is_empty() {
+            return Err("引用名称不能为空。".to_string());
+        }
+
+        let target = match path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => resolve_workspace_target(path)?,
+            None => workspace_root()?,
+        };
+
+        let options = SearchOptions::from_explicit_path(path);
+        let pattern = format!(r"\b{}\b", regex_escape(trimmed_query));
+        match run_rg_regex_search(&pattern, &target, options) {
+            Ok(SearchBackendResult::Matches(matches, truncated)) => {
+                let filtered = matches
+                    .into_iter()
+                    .filter(|item| !is_definition_line_for_symbol(&item.line_text, trimmed_query))
+                    .collect::<Vec<_>>();
+
+                if filtered.is_empty() {
+                    Ok(format!(
+                        "搜索范围: {}\n引用: {}\n\n未找到匹配引用。",
+                        target.display(),
+                        trimmed_query
+                    ))
+                } else {
+                    Ok(format_grouped_search_reply(
+                        "引用",
+                        trimmed_query,
+                        &target,
+                        &filtered,
+                        truncated,
+                        None,
+                    ))
+                }
+            }
+            Ok(SearchBackendResult::NoMatches) => Ok(format!(
+                "搜索范围: {}\n引用: {}\n\n未找到匹配引用。",
+                target.display(),
+                trimmed_query
+            )),
+            Ok(SearchBackendResult::FallbackRequired) => {
+                fallback_reference_search(trimmed_query, &target, options)
+            }
+            Err(err) => Err(err),
+        }
+    })();
+
+    into_cmd_result(result, start.elapsed().as_millis() as u64)
+}
+
+/// 搜索符号实现位置
+pub fn find_implementations(query: &str, path: Option<&str>) -> CmdResult {
+    let start = Instant::now();
+    let result = (|| -> Result<String, String> {
+        let trimmed_query = query.trim();
+        if trimmed_query.is_empty() {
+            return Err("实现名称不能为空。".to_string());
+        }
+
+        let target = match path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => resolve_workspace_target(path)?,
+            None => workspace_root()?,
+        };
+
+        let options = SearchOptions::from_explicit_path(path);
+        let pattern = implementation_pattern(trimmed_query);
+        match run_rg_regex_search(&pattern, &target, options) {
+            Ok(SearchBackendResult::Matches(matches, truncated)) => {
+                Ok(format_grouped_search_reply(
+                    "实现",
+                    trimmed_query,
+                    &target,
+                    &matches,
+                    truncated,
+                    None,
+                ))
+            }
+            Ok(SearchBackendResult::NoMatches) => Ok(format!(
+                "搜索范围: {}\n实现: {}\n\n未找到匹配实现。",
+                target.display(),
+                trimmed_query
+            )),
+            Ok(SearchBackendResult::FallbackRequired) => {
+                fallback_implementation_search(trimmed_query, &target, options)
+            }
+            Err(err) => Err(err),
+        }
+    })();
+
+    into_cmd_result(result, start.elapsed().as_millis() as u64)
+}
+
+/// 运行指定名称的测试
+pub fn run_specific_test(filter: &str) -> CmdResult {
+    let workspace = match workspace_root() {
+        Ok(path) => path,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let start = Instant::now();
+    let trimmed = filter.trim();
+    if trimmed.is_empty() {
+        return error_cmd_result("测试过滤词不能为空。".to_string());
+    }
+
+    // Detect project type and build the right test command
+    let test_command = if workspace.join("Cargo.toml").exists() {
+        format!("cargo test {trimmed}")
+    } else if workspace.join("package.json").exists() {
+        format!("npx jest --testNamePattern {trimmed}")
+    } else if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
+        format!("python -m pytest -k {trimmed}")
+    } else {
+        format!("cargo test {trimmed}")
+    };
+
+    let output = run_test_command(&workspace, &test_command);
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match output {
+        Ok(output) => {
+            let success = output.status.success();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            CmdResult {
+                success,
+                stdout: summarize_test_output(&test_command, &stdout, &stderr, success),
+                stderr: String::new(),
+                exit_code: output.status.code(),
+                duration_ms,
+            }
+        }
+        Err(error) => CmdResult {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("执行测试失败: {error}"),
+            exit_code: None,
+            duration_ms,
+        },
+    }
+}
+
+/// 按测试文件执行测试
+pub fn run_test_file(path: &str) -> CmdResult {
+    let workspace = match workspace_root() {
+        Ok(path) => path,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let start = Instant::now();
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return error_cmd_result("测试文件路径不能为空。".to_string());
+    }
+
+    let target = match resolve_workspace_target(trimmed) {
+        Ok(target) => target,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let command = match build_test_file_command(&workspace, &target) {
+        Ok(command) => command,
+        Err(err) => return error_cmd_result(err),
+    };
+
+    let output = run_test_command(&workspace, &command);
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match output {
+        Ok(output) => {
+            let success = output.status.success();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            CmdResult {
+                success,
+                stdout: summarize_test_output(&command, &stdout, &stderr, success),
+                stderr: String::new(),
+                exit_code: output.status.code(),
+                duration_ms,
+            }
+        }
+        Err(error) => CmdResult {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("执行测试失败: {error}"),
+            exit_code: None,
+            duration_ms,
+        },
+    }
+}
+
+/// 写入文件（创建或覆盖）
+pub fn write_file(path: &str, content: &str) -> CmdResult {
+    let start = Instant::now();
+    let result = (|| -> Result<String, String> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err("文件路径不能为空。".to_string());
+        }
+        let target = resolve_workspace_target(trimmed)?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+        }
+
+        fs::write(&target, content).map_err(|err| format!("写入文件失败: {err}"))?;
+
+        Ok(format!(
+            "已写入: {}\n大小: {} 字节",
+            target.display(),
+            content.len()
+        ))
+    })();
+
+    into_cmd_result(result, start.elapsed().as_millis() as u64)
+}
+
 fn resolve_repo_path(repo_path: Option<&str>) -> Option<String> {
     repo_path
         .map(str::trim)
@@ -449,6 +828,678 @@ fn default_test_command() -> Option<String> {
     Some(trimmed)
 }
 
+fn build_test_file_command(workspace: &Path, target: &Path) -> Result<String, String> {
+    if !target.exists() {
+        return Err(format!("测试文件不存在: {}", target.display()));
+    }
+
+    let relative = target
+        .strip_prefix(workspace)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    if workspace.join("Cargo.toml").exists() {
+        if relative.starts_with("tests/") && relative.ends_with(".rs") {
+            let stem = Path::new(&relative)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "无法解析 Rust 测试文件名。".to_string())?;
+            return Ok(format!("cargo test --test {stem}"));
+        }
+
+        let stem = Path::new(&relative)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "无法解析测试文件名。".to_string())?;
+        return Ok(format!("cargo test {stem}"));
+    }
+
+    if workspace.join("package.json").exists() {
+        return Ok(format!("npx jest {relative}"));
+    }
+
+    if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
+        return Ok(format!("python -m pytest {relative}"));
+    }
+
+    Err("当前工作区缺少已知测试运行器配置。".to_string())
+}
+
+fn run_test_command(workspace: &Path, test_command: &str) -> std::io::Result<std::process::Output> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", test_command]);
+        command
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = Command::new("sh");
+        command.args(["-c", test_command]);
+        command
+    };
+
+    command.current_dir(workspace);
+
+    if should_isolate_rust_test_target_dir(workspace, test_command) {
+        command.env("CARGO_TARGET_DIR", isolated_rust_test_target_dir(workspace));
+    }
+
+    command.output()
+}
+
+fn should_isolate_rust_test_target_dir(workspace: &Path, test_command: &str) -> bool {
+    workspace.join("Cargo.toml").exists() && test_command.trim_start().starts_with("cargo test")
+}
+
+fn isolated_rust_test_target_dir(workspace: &Path) -> PathBuf {
+    workspace.join("target").join("bridge-test-runner")
+}
+
+enum SearchBackendResult {
+    Matches(Vec<SearchMatch>, bool),
+    NoMatches,
+    FallbackRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchMatch {
+    path: PathBuf,
+    line_number: usize,
+    line_text: String,
+}
+
+#[derive(Clone, Copy)]
+struct SearchOptions {
+    exclude_test_paths: bool,
+    exclude_inline_rust_tests: bool,
+    exclude_runtime_artifacts: bool,
+}
+
+impl SearchOptions {
+    fn from_explicit_path(path: Option<&str>) -> Self {
+        let explicit_path = path.map(str::trim).filter(|path| !path.is_empty());
+        let exclude_test_paths = explicit_path
+            .map(|path| !path_targets_test_scope(Path::new(path)))
+            .unwrap_or(true);
+        let exclude_runtime_artifacts = explicit_path
+            .map(|path| !path_targets_runtime_artifact(Path::new(path)))
+            .unwrap_or(true);
+        Self {
+            exclude_test_paths,
+            exclude_inline_rust_tests: exclude_test_paths,
+            exclude_runtime_artifacts,
+        }
+    }
+}
+
+fn run_rg_regex_search(
+    pattern: &str,
+    target: &Path,
+    options: SearchOptions,
+) -> Result<SearchBackendResult, String> {
+    let mut command = Command::new("rg");
+    command.args(["-n", "--no-heading", "--color", "never"]);
+    if options.exclude_test_paths {
+        for glob in excluded_test_globs() {
+            command.arg("-g");
+            command.arg(glob);
+        }
+    }
+    if options.exclude_runtime_artifacts {
+        for glob in excluded_runtime_artifact_globs() {
+            command.arg("-g");
+            command.arg(glob);
+        }
+    }
+    command.arg(pattern);
+    command.arg(target);
+
+    let output = command.output().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            String::new()
+        } else {
+            format!("执行搜索失败: {err}")
+        }
+    });
+
+    let output = match output {
+        Ok(output) => output,
+        Err(message) if message.is_empty() => return Ok(SearchBackendResult::FallbackRequired),
+        Err(message) => return Err(message),
+    };
+
+    match output.status.code() {
+        Some(0) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let matches = collect_filtered_rg_matches(&stdout, options);
+            let truncated = matches.len() > 200;
+            let matches = matches.into_iter().take(200).collect::<Vec<_>>();
+            if matches.is_empty() {
+                Ok(SearchBackendResult::NoMatches)
+            } else {
+                Ok(SearchBackendResult::Matches(matches, truncated))
+            }
+        }
+        Some(1) => Ok(SearchBackendResult::NoMatches),
+        _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+    }
+}
+
+fn parse_rg_match_line(line: &str) -> Option<SearchMatch> {
+    let captures = Regex::new(r"^(.*?):(\d+):(.*)$").ok()?.captures(line)?;
+    Some(SearchMatch {
+        path: PathBuf::from(captures.get(1)?.as_str()),
+        line_number: captures.get(2)?.as_str().parse().ok()?,
+        line_text: captures.get(3)?.as_str().to_string(),
+    })
+}
+
+fn collect_filtered_rg_matches(output: &str, options: SearchOptions) -> Vec<SearchMatch> {
+    let mut filtered = Vec::new();
+    let mut inline_test_ranges = BTreeMap::<PathBuf, Vec<(usize, usize)>>::new();
+
+    for line in output.lines() {
+        let Some(item) = parse_rg_match_line(line) else {
+            continue;
+        };
+
+        if should_exclude_search_match(&item, options, &mut inline_test_ranges) {
+            continue;
+        }
+
+        filtered.push(item);
+    }
+
+    filtered
+}
+
+const SEARCH_MATCH_LIMIT_PER_FILE: usize = 10;
+
+fn format_grouped_search_reply(
+    label: &str,
+    query: &str,
+    target: &Path,
+    matches: &[SearchMatch],
+    truncated: bool,
+    fallback_note: Option<&str>,
+) -> String {
+    let mut groups = BTreeMap::<String, Vec<&SearchMatch>>::new();
+    for item in matches {
+        groups
+            .entry(display_search_path(&item.path))
+            .or_default()
+            .push(item);
+    }
+
+    let file_count = groups.len();
+    let mut rendered = Vec::new();
+    let mut truncated_per_file = false;
+    for (path, items) in groups {
+        rendered.push(path);
+        for item in items.iter().take(SEARCH_MATCH_LIMIT_PER_FILE) {
+            rendered.push(format!("  {}: {}", item.line_number, item.line_text.trim_end()));
+        }
+        if items.len() > SEARCH_MATCH_LIMIT_PER_FILE {
+            truncated_per_file = true;
+            rendered.push(format!(
+                "  … 另有 {} 处匹配未显示",
+                items.len() - SEARCH_MATCH_LIMIT_PER_FILE
+            ));
+        }
+        rendered.push(String::new());
+    }
+    while matches!(rendered.last(), Some(line) if line.is_empty()) {
+        rendered.pop();
+    }
+
+    let mut result = format!(
+        "搜索范围: {}\n{}: {}\n命中: {} 个文件，{} 处匹配\n\n{}",
+        target.display(),
+        label,
+        query,
+        file_count,
+        matches.len(),
+        rendered.join("\n")
+    );
+
+    if truncated {
+        result.push_str("\n\n… 结果过多，仅显示前 200 处匹配。");
+    }
+    if truncated_per_file {
+        result.push_str(&format!(
+            "\n\n… 为避免单文件结果刷屏，每个文件最多显示前 {} 处匹配。",
+            SEARCH_MATCH_LIMIT_PER_FILE
+        ));
+    }
+    if let Some(note) = fallback_note {
+        result.push_str("\n\n");
+        result.push_str(note);
+    }
+
+    result
+}
+
+fn display_search_path(path: &Path) -> String {
+    if let Ok(workspace) = workspace_root() {
+        if let Ok(relative) = path.strip_prefix(&workspace) {
+            let display = relative.to_string_lossy().replace('\\', "/");
+            if !display.is_empty() {
+                return display;
+            }
+        }
+    }
+
+    path.display().to_string().replace('\\', "/")
+}
+
+fn fallback_text_search(query: &str, target: &Path, is_regex: bool) -> Result<String, String> {
+    let regex = if is_regex {
+        Some(Regex::new(query).map_err(|err| format!("正则无效: {err}"))?)
+    } else {
+        None
+    };
+
+    let matches = search_text_in_files(target, SearchOptions { exclude_test_paths: false, exclude_inline_rust_tests: false, exclude_runtime_artifacts: false }, |_, line| {
+        match &regex {
+            Some(regex) => regex.is_match(line),
+            None => line.contains(query),
+        }
+    })?;
+
+    let mut result = format!(
+        "搜索范围: {}\n模式: {}\n关键词: {}\n",
+        target.display(),
+        if is_regex { "正则" } else { "文本" },
+        query
+    );
+
+    if matches.is_empty() {
+        result.push_str("\n未找到匹配结果。\n\n(当前环境未安装 rg，已自动使用内置搜索。)");
+        return Ok(result);
+    }
+
+    result.push('\n');
+    result.push_str(&format_search_match_lines(&matches).join("\n"));
+    if matches.len() >= 200 {
+        result.push_str("\n\n… 搜索结果过多，仅显示前 200 行。");
+    }
+    result.push_str("\n\n(当前环境未安装 rg，已自动使用内置搜索。)");
+    Ok(result)
+}
+
+fn fallback_symbol_search(
+    query: &str,
+    target: &Path,
+    options: SearchOptions,
+) -> Result<String, String> {
+    let pattern = symbol_definition_pattern(query);
+    let regex = Regex::new(&pattern).map_err(|err| format!("符号搜索模式无效: {err}"))?;
+
+    let matches = search_text_in_files(target, options, |_, line| {
+        regex.is_match(line)
+    })?;
+
+    let mut result = format!("搜索范围: {}\n符号: {}\n", target.display(), query);
+
+    if matches.is_empty() {
+        result.push_str("\n未找到匹配的符号定义。\n\n(当前环境未安装 rg，已自动使用内置搜索。)");
+        return Ok(result);
+    }
+
+    Ok(format_grouped_search_reply(
+        "符号",
+        query,
+        target,
+        &matches,
+        matches.len() >= 200,
+        Some("(当前环境未安装 rg，已自动使用内置搜索。)"),
+    ))
+}
+
+fn fallback_reference_search(
+    query: &str,
+    target: &Path,
+    options: SearchOptions,
+) -> Result<String, String> {
+    let pattern = format!(r"\b{}\b", regex_escape(query));
+    let regex = Regex::new(&pattern).map_err(|err| format!("引用搜索模式无效: {err}"))?;
+    let matches = search_text_in_files(target, options, |_, line| {
+        regex.is_match(line) && !is_definition_line_for_symbol(line, query)
+    })?;
+
+    if matches.is_empty() {
+        return Ok(format!(
+            "搜索范围: {}\n引用: {}\n\n未找到匹配引用。\n\n(当前环境未安装 rg，已自动使用内置搜索。)",
+            target.display(),
+            query
+        ));
+    }
+
+    Ok(format_grouped_search_reply(
+        "引用",
+        query,
+        target,
+        &matches,
+        matches.len() >= 200,
+        Some("(当前环境未安装 rg，已自动使用内置搜索。)"),
+    ))
+}
+
+fn is_definition_line_for_symbol(line: &str, query: &str) -> bool {
+    let pattern = symbol_definition_pattern(query);
+
+    Regex::new(&pattern)
+        .map(|regex| regex.is_match(line))
+        .unwrap_or(false)
+}
+
+fn symbol_definition_pattern(query: &str) -> String {
+    let escaped = regex_escape(query);
+    format!(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|type|trait|impl|class|def|function|const|let|interface|mod)\s+{escaped}\b"
+    )
+}
+
+fn implementation_pattern(query: &str) -> String {
+    let escaped = regex_escape(query);
+    format!(
+        r"(?:^\s*impl\b[^\n]*\b{escaped}\b|^\s*class\s+{escaped}\b|^\s*interface\s+{escaped}\b|^\s*\w[^\n]*\bimplements\b[^\n]*\b{escaped}\b|^\s*\w[^\n]*\bextends\b[^\n]*\b{escaped}\b)"
+    )
+}
+
+fn fallback_implementation_search(
+    query: &str,
+    target: &Path,
+    options: SearchOptions,
+) -> Result<String, String> {
+    let regex = Regex::new(&implementation_pattern(query))
+        .map_err(|err| format!("实现搜索模式无效: {err}"))?;
+    let matches = search_text_in_files(target, options, |_, line| regex.is_match(line))?;
+
+    if matches.is_empty() {
+        return Ok(format!(
+            "搜索范围: {}\n实现: {}\n\n未找到匹配实现。\n\n(当前环境未安装 rg，已自动使用内置搜索。)",
+            target.display(),
+            query
+        ));
+    }
+
+    Ok(format_grouped_search_reply(
+        "实现",
+        query,
+        target,
+        &matches,
+        matches.len() >= 200,
+        Some("(当前环境未安装 rg，已自动使用内置搜索。)"),
+    ))
+}
+
+fn format_search_match_lines(matches: &[SearchMatch]) -> Vec<String> {
+    matches
+        .iter()
+        .map(|item| format!("{}:{}:{}", item.path.display(), item.line_number, item.line_text))
+        .collect()
+}
+
+fn should_exclude_search_match(
+    item: &SearchMatch,
+    options: SearchOptions,
+    inline_test_ranges: &mut BTreeMap<PathBuf, Vec<(usize, usize)>>,
+) -> bool {
+    if options.exclude_runtime_artifacts && is_runtime_artifact_path(&item.path) {
+        return true;
+    }
+
+    if options.exclude_test_paths && is_test_path(&item.path) {
+        return true;
+    }
+
+    if options.exclude_inline_rust_tests && is_rust_inline_test_line(item, inline_test_ranges) {
+        return true;
+    }
+
+    false
+}
+
+fn is_rust_inline_test_line(
+    item: &SearchMatch,
+    inline_test_ranges: &mut BTreeMap<PathBuf, Vec<(usize, usize)>>,
+) -> bool {
+    if item.path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        return false;
+    }
+
+    let ranges = inline_test_ranges.entry(item.path.clone()).or_insert_with(|| {
+        fs::read_to_string(&item.path)
+            .map(|content| rust_inline_test_module_ranges(&content))
+            .unwrap_or_default()
+    });
+
+    ranges
+        .iter()
+        .any(|(start, end)| item.line_number >= *start && item.line_number <= *end)
+}
+
+fn rust_inline_test_module_ranges(content: &str) -> Vec<(usize, usize)> {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut pending_cfg_test = false;
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+
+        if trimmed.starts_with("#[cfg(test)]") {
+            pending_cfg_test = true;
+            index += 1;
+            continue;
+        }
+
+        if pending_cfg_test && (trimmed.is_empty() || trimmed.starts_with("#[")) {
+            index += 1;
+            continue;
+        }
+
+        if pending_cfg_test && is_rust_test_module_declaration(trimmed) {
+            if let Some(end_line) = find_rust_module_end_line(&lines, index) {
+                ranges.push((index + 1, end_line));
+                index = end_line;
+                pending_cfg_test = false;
+                continue;
+            }
+        }
+
+        pending_cfg_test = false;
+        index += 1;
+    }
+
+    ranges
+}
+
+fn is_rust_test_module_declaration(line: &str) -> bool {
+    line.starts_with("mod tests")
+        || line.starts_with("pub mod tests")
+        || line.starts_with("pub(crate) mod tests")
+        || line.starts_with("pub(super) mod tests")
+        || line.starts_with("pub(self) mod tests")
+}
+
+fn find_rust_module_end_line(lines: &[&str], start_index: usize) -> Option<usize> {
+    let mut brace_depth = 0isize;
+    let mut opened = false;
+
+    for (index, line) in lines.iter().enumerate().skip(start_index) {
+        if line.contains('{') {
+            opened = true;
+        }
+
+        if opened {
+            brace_depth += line.chars().filter(|ch| *ch == '{').count() as isize;
+            brace_depth -= line.chars().filter(|ch| *ch == '}').count() as isize;
+            if brace_depth == 0 {
+                return Some(index + 1);
+            }
+        }
+    }
+
+    None
+}
+
+fn search_text_in_files<F>(
+    target: &Path,
+    options: SearchOptions,
+    mut matches_line: F,
+) -> Result<Vec<SearchMatch>, String>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let mut results = Vec::new();
+    visit_searchable_files(target, options, &mut |path| {
+        if results.len() >= 200 {
+            return Ok(());
+        }
+
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(()),
+        };
+
+        if bytes.contains(&0) {
+            return Ok(());
+        }
+
+        let content = String::from_utf8_lossy(&bytes);
+        let inline_test_ranges = if options.exclude_inline_rust_tests
+            && path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+        {
+            rust_inline_test_module_ranges(&content)
+        } else {
+            Vec::new()
+        };
+        for (index, line) in content.lines().enumerate() {
+            let line_number = index + 1;
+            if inline_test_ranges
+                .iter()
+                .any(|(start, end)| line_number >= *start && line_number <= *end)
+            {
+                continue;
+            }
+            if matches_line(path, line) {
+                results.push(SearchMatch {
+                    path: path.to_path_buf(),
+                    line_number,
+                    line_text: line.to_string(),
+                });
+                if results.len() >= 200 {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+
+    Ok(results)
+}
+
+fn visit_searchable_files<F>(
+    target: &Path,
+    options: SearchOptions,
+    visit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
+    if target.is_file() {
+        return visit(target);
+    }
+
+    let entries = fs::read_dir(target).map_err(|err| format!("读取目录失败: {err}"))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".next" | "dist" | "build") {
+                continue;
+            }
+            if options.exclude_test_paths && is_test_path(&path) {
+                continue;
+            }
+            visit_searchable_files(&path, options, visit)?;
+        } else if file_type.is_file() {
+            if options.exclude_runtime_artifacts && is_runtime_artifact_path(&path) {
+                continue;
+            }
+            if options.exclude_test_paths && is_test_path(&path) {
+                continue;
+            }
+            visit(&path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn excluded_test_globs() -> &'static [&'static str] {
+    &["!tests/**", "!test/**", "!__tests__/**", "!spec/**", "!specs/**"]
+}
+
+fn excluded_runtime_artifact_globs() -> &'static [&'static str] {
+    &[
+        "!.feishu-vscode-bridge-audit.jsonl",
+        "!.feishu-vscode-bridge-session.json",
+    ]
+}
+
+fn path_targets_test_scope(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => is_test_component(&name.to_string_lossy()),
+        _ => false,
+    })
+}
+
+fn path_targets_runtime_artifact(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => is_runtime_artifact_name(&name.to_string_lossy()),
+        _ => false,
+    })
+}
+
+fn is_test_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => is_test_component(&name.to_string_lossy()),
+        _ => false,
+    })
+}
+
+fn is_runtime_artifact_path(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| is_runtime_artifact_name(&name.to_string_lossy()))
+        .unwrap_or(false)
+}
+
+fn is_test_component(name: &str) -> bool {
+    matches!(name, "tests" | "test" | "__tests__" | "spec" | "specs")
+}
+
+fn is_runtime_artifact_name(name: &str) -> bool {
+    matches!(name, ".feishu-vscode-bridge-audit.jsonl" | ".feishu-vscode-bridge-session.json")
+}
+
 fn error_cmd_result(message: String) -> CmdResult {
     CmdResult {
         success: false,
@@ -464,6 +1515,40 @@ fn workspace_root() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| "无法定位当前工作区路径。".to_string())
+}
+
+fn agent_bridge_base_url() -> Result<String, String> {
+    dotenvy::dotenv().ok();
+
+    if let Ok(url) = std::env::var(AGENT_BRIDGE_URL_ENV) {
+        let trimmed = url.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let port = std::env::var(AGENT_BRIDGE_PORT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_AGENT_BRIDGE_PORT);
+
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+fn format_agent_bridge_error(error: ureq::Error, endpoint: &str) -> String {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_else(|_| String::new());
+            if body.trim().is_empty() {
+                format!("agent bridge 请求失败: HTTP {status} ({endpoint})")
+            } else {
+                format!("agent bridge 请求失败: HTTP {status} ({endpoint})\n{body}")
+            }
+        }
+        ureq::Error::Transport(err) => format!(
+            "无法连接到本地 agent bridge ({endpoint}): {err}. 请先在 VS Code 中启动 companion extension。"
+        ),
+    }
 }
 
 fn resolve_workspace_target(path: &str) -> Result<PathBuf, String> {
@@ -680,6 +1765,18 @@ fn into_cmd_result(result: Result<String, String>, duration_ms: u64) -> CmdResul
             duration_ms,
         },
     }
+}
+
+/// Escape special regex characters for use in rg patterns.
+fn regex_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if matches!(c, '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 fn summarize_test_output(command: &str, stdout: &str, stderr: &str, success: bool) -> String {
@@ -945,8 +2042,417 @@ mod tests {
     }
 
     #[test]
+    fn fallback_text_search_finds_plain_matches_without_rg() {
+        let workspace = unique_temp_dir("fallback-search-text");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "fn parse_intent() {}\nfn other() {}\n",
+        )
+        .unwrap();
+
+        let result = fallback_text_search("parse_intent", &workspace, false).unwrap();
+
+        assert!(result.contains("parse_intent"));
+        assert!(result.contains("内置搜索"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_symbol_search_finds_function_definition_without_rg() {
+        let workspace = unique_temp_dir("fallback-search-symbol");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn parse_intent() {}\nstruct Bridge {}\n",
+        )
+        .unwrap();
+
+        let result = fallback_symbol_search(
+            "parse_intent",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: false,
+                exclude_inline_rust_tests: false,
+                exclude_runtime_artifacts: false,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("parse_intent"));
+        assert!(result.contains("pub fn parse_intent"));
+        assert!(result.contains("命中: 1 个文件，1 处匹配"));
+        assert!(result.contains("src/lib.rs"));
+        assert!(result.contains("内置搜索"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_symbol_search_ignores_string_literal_false_positive() {
+        let workspace = unique_temp_dir("fallback-search-symbol-literal");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "fn real_symbol() {}\nassert!(text.contains(\"fn fake_symbol() {}\"));\n",
+        )
+        .unwrap();
+
+        let result = fallback_symbol_search(
+            "fake_symbol",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: false,
+                exclude_inline_rust_tests: false,
+                exclude_runtime_artifacts: false,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("未找到匹配的符号定义"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_reference_search_finds_symbol_occurrences_without_rg() {
+        let workspace = unique_temp_dir("fallback-reference-search");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn parse_intent() {}\nfn call() { parse_intent(); }\n",
+        )
+        .unwrap();
+
+        let result = fallback_reference_search(
+            "parse_intent",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("parse_intent"));
+        assert!(result.contains("fn call() { parse_intent(); }"));
+        assert!(!result.contains("pub fn parse_intent() {}"));
+        assert!(result.contains("命中: 1 个文件，1 处匹配"));
+        assert!(result.contains("内置搜索"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_implementation_search_finds_impl_blocks_without_rg() {
+        let workspace = unique_temp_dir("fallback-implementation-search");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "struct Bridge;\nimpl Bridge { fn new() -> Self { Self } }\n",
+        )
+        .unwrap();
+
+        let result = fallback_implementation_search(
+            "Bridge",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("impl Bridge"));
+        assert!(result.contains("命中: 1 个文件，1 处匹配"));
+        assert!(result.contains("内置搜索"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_implementation_search_ignores_string_literal_false_positive() {
+        let workspace = unique_temp_dir("fallback-implementation-literal");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "assert!(result.contains(\"impl Bridge\"));\n",
+        )
+        .unwrap();
+
+        let result = fallback_implementation_search(
+            "Bridge",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("未找到匹配实现"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_reference_search_excludes_test_directories_by_default() {
+        let workspace = unique_temp_dir("fallback-reference-excludes-tests");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "fn call() { parse_intent(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("tests/reference_test.rs"),
+            "#[test]\nfn check() { parse_intent(); }\n",
+        )
+        .unwrap();
+
+        let result = fallback_reference_search(
+            "parse_intent",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("src/lib.rs"));
+        assert!(!result.contains("tests/reference_test.rs"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_reference_search_keeps_explicit_test_scope() {
+        let workspace = unique_temp_dir("fallback-reference-keep-tests");
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        fs::write(
+            workspace.join("tests/reference_test.rs"),
+            "#[test]\nfn check() { parse_intent(); }\n",
+        )
+        .unwrap();
+
+        let result = fallback_reference_search(
+            "parse_intent",
+            &workspace.join("tests"),
+            SearchOptions {
+                exclude_test_paths: false,
+                exclude_inline_rust_tests: false,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("reference_test.rs"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn search_options_detect_explicit_test_scope() {
+        assert!(SearchOptions::from_explicit_path(None).exclude_test_paths);
+        assert!(SearchOptions::from_explicit_path(None).exclude_inline_rust_tests);
+        assert!(SearchOptions::from_explicit_path(None).exclude_runtime_artifacts);
+        assert!(SearchOptions::from_explicit_path(Some("src")).exclude_test_paths);
+        assert!(SearchOptions::from_explicit_path(Some("src")).exclude_inline_rust_tests);
+        assert!(SearchOptions::from_explicit_path(Some("src")).exclude_runtime_artifacts);
+        assert!(!SearchOptions::from_explicit_path(Some("tests")).exclude_test_paths);
+        assert!(!SearchOptions::from_explicit_path(Some("tests")).exclude_inline_rust_tests);
+        assert!(SearchOptions::from_explicit_path(Some("tests")).exclude_runtime_artifacts);
+        assert!(!SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_test_paths);
+        assert!(!SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_inline_rust_tests);
+        assert!(SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_runtime_artifacts);
+        assert!(!SearchOptions::from_explicit_path(Some(".feishu-vscode-bridge-audit.jsonl")).exclude_runtime_artifacts);
+    }
+
+    #[test]
+    fn fallback_reference_search_excludes_runtime_artifacts_by_default() {
+        let workspace = unique_temp_dir("fallback-reference-runtime-artifacts");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "fn call() { parse_intent(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".feishu-vscode-bridge-audit.jsonl"),
+            "{\"command\":\"搜索符号 parse_intent 在 src\"}\n",
+        )
+        .unwrap();
+
+        let result = fallback_reference_search(
+            "parse_intent",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("src/lib.rs"));
+        assert!(!result.contains(".feishu-vscode-bridge-audit.jsonl"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_reference_search_keeps_explicit_runtime_artifact_scope() {
+        let workspace = unique_temp_dir("fallback-reference-runtime-explicit");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join(".feishu-vscode-bridge-audit.jsonl"),
+            "{\"command\":\"搜索符号 parse_intent 在 src\"}\n",
+        )
+        .unwrap();
+
+        let result = fallback_reference_search(
+            "parse_intent",
+            &workspace.join(".feishu-vscode-bridge-audit.jsonl"),
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: false,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains(".feishu-vscode-bridge-audit.jsonl"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_reference_search_excludes_inline_rust_test_module_by_default() {
+        let workspace = unique_temp_dir("fallback-reference-inline-tests");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "fn parse_intent() {}\nfn call() { parse_intent(); }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn it_works() { parse_intent(); }\n}\n",
+        )
+        .unwrap();
+
+        let result = fallback_reference_search(
+            "parse_intent",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("fn call() { parse_intent(); }"));
+        assert!(!result.contains("fn it_works() { parse_intent(); }"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fallback_implementation_search_excludes_inline_rust_test_module_by_default() {
+        let workspace = unique_temp_dir("fallback-implementation-inline-tests");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "struct Bridge;\n#[cfg(test)]\nmod tests {\n    use super::*;\n    impl Bridge { fn test_only() -> Self { Bridge } }\n}\n",
+        )
+        .unwrap();
+
+        let result = fallback_implementation_search(
+            "Bridge",
+            &workspace,
+            SearchOptions {
+                exclude_test_paths: true,
+                exclude_inline_rust_tests: true,
+                exclude_runtime_artifacts: true,
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("未找到匹配实现"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn format_grouped_search_reply_limits_matches_per_file() {
+        let matches = (1..=12)
+            .map(|line_number| SearchMatch {
+                path: PathBuf::from("src/lib.rs"),
+                line_number,
+                line_text: format!("match_{line_number}"),
+            })
+            .collect::<Vec<_>>();
+
+        let result = format_grouped_search_reply(
+            "引用",
+            "parse_intent",
+            Path::new("src"),
+            &matches,
+            false,
+            None,
+        );
+
+        assert!(result.contains("命中: 1 个文件，12 处匹配"));
+        assert!(result.contains("  10: match_10"));
+        assert!(!result.contains("  11: match_11"));
+        assert!(result.contains("  … 另有 2 处匹配未显示"));
+        assert!(result.contains("每个文件最多显示前 10 处匹配"));
+    }
+
+    #[test]
+    fn parse_rg_match_line_supports_windows_paths() {
+        let parsed = parse_rg_match_line(r"C:\repo\src\lib.rs:42:fn parse_intent() {}").unwrap();
+
+        assert_eq!(parsed.path, PathBuf::from(r"C:\repo\src\lib.rs"));
+        assert_eq!(parsed.line_number, 42);
+        assert_eq!(parsed.line_text, "fn parse_intent() {}");
+    }
+
+    #[test]
+    fn build_test_file_command_maps_rust_integration_test() {
+        let workspace = unique_temp_dir("test-file-command");
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        let test_file = workspace.join("tests/approval_card_flow.rs");
+        fs::write(&test_file, "#[test]\nfn demo() {}\n").unwrap();
+
+        let command = build_test_file_command(&workspace, &test_file).unwrap();
+        assert_eq!(command, "cargo test --test approval_card_flow");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn should_isolate_rust_test_target_dir_for_cargo_test_commands() {
+        let workspace = unique_temp_dir("test-target-dir");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+
+        assert!(should_isolate_rust_test_target_dir(&workspace, "cargo test --test approval_card_flow"));
+        assert_eq!(
+            isolated_rust_test_target_dir(&workspace),
+            workspace.join("target").join("bridge-test-runner")
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn run_shell_uses_workspace_env_as_cwd() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let workspace = unique_temp_dir("run-shell-cwd");
         fs::create_dir_all(&workspace).unwrap();
 
@@ -1083,11 +2589,11 @@ mod tests {
 
         let apply = apply_patch(patch);
         assert!(apply.success, "{}", apply.to_reply("apply patch"));
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "new\n");
+        assert_eq!(fs::read_to_string(&file_path).unwrap().replace("\r\n", "\n"), "new\n");
 
         let reverse = reverse_patch(patch);
         assert!(reverse.success, "{}", reverse.to_reply("reverse patch"));
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "old\n");
+        assert_eq!(fs::read_to_string(&file_path).unwrap().replace("\r\n", "\n"), "old\n");
 
         unsafe {
             std::env::remove_var(WORKSPACE_PATH_ENV);

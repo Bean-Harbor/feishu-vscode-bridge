@@ -1,5 +1,36 @@
 # Work Log
 
+## 2026-03-30
+
+### Summary
+
+- Continued the remote-agent bridge A0 work by turning the companion VS Code extension into a locally runnable ask bridge on Windows, then driving the first end-to-end Feishu validation loop through `问 Copilot <问题>`
+- Fixed the Windows Extension Development Host prelaunch build path by pinning the workspace task to the installed Node.js toolchain (`C:\Program Files\nodejs\npm.cmd`) and injecting that directory into the task `PATH`, which removed the earlier `npm` / `node` resolution failures from `F5`
+- Confirmed the companion extension now launches inside an Extension Development Host and exposes the local bridge endpoint (`http://127.0.0.1:8765`) through the `Feishu Agent Bridge` output channel
+- Revalidated that long-running stale `bridge-cli.exe` processes on Windows can silently steal Feishu traffic and route it to older parser logic; cleared the stale listeners, then restarted a single isolated listener so `问 Copilot ...` reliably reaches the current build
+- Completed the first real Feishu ask-style smoke: Feishu -> Rust listener -> local companion extension -> VS Code LM / Copilot model -> Feishu reply now works with the Feishu session key reused as the local bridge `sessionId`
+- Added workspace bootstrap behavior to the companion extension so an Extension Development Host launched without a folder can attach the repository workspace and expose local source files to the ask bridge
+- Added first-pass workspace grounding in the companion extension: ask requests now retrieve likely relevant source snippets from the workspace before invoking the model instead of relying only on active-editor metadata
+- Tightened workspace-snippet retrieval to prefer real source definitions over README, runtime session files, audit logs, and test-only noise, after the first grounded Feishu reply still surfaced low-value context around `parse_intent`
+- Simplified the Feishu-visible ask response shape by removing raw retrieved-context dumps from the Rust reply formatter, so the bridge can return `session`, `摘要`, and the model answer without flooding Feishu with internal retrieval context
+- Verified the improved grounded ask path in real Feishu: the bridge reply now references `src/lib.rs` and the `parse_intent` definition instead of failing with `无法识别指令` or claiming no workspace context was available
+
+### Files Updated
+
+- `.vscode/tasks.json` — pinned the Windows build task to the installed Node.js toolchain and injected the Node install directory into `PATH` so Extension Development Host prelaunch builds work reliably on this Windows host
+- `.vscode/launch.json` — passed bootstrap workspace information into the Extension Development Host so the companion extension can attach the repository automatically during local ask-bridge smoke runs
+- `vscode-agent-bridge/src/extension.ts` — added workspace bootstrap, local workspace-snippet retrieval, source-snippet ranking/filtering, and tighter ask-grounding behavior for `问 Copilot`
+- `src/vscode.rs` — trimmed the Feishu-visible ask reply format so raw debug retrieval context is no longer echoed back to the user
+- `docs/work_log.md` — recorded the Windows extension-host startup fixes and the first end-to-end grounded ask-style Feishu validation
+
+### Verification
+
+- `npm.cmd run compile` in `vscode-agent-bridge/` after the Windows task / bootstrap / snippet-retrieval changes
+- VS Code task validation: `build-feishu-agent-bridge-extension` now succeeds from the workspace task runner instead of failing with `npm` / `node` not found
+- Extension Development Host smoke: confirmed `Feishu Agent Bridge` output shows `Agent bridge listening on http://127.0.0.1:8765`
+- Windows listener verification: confirmed only one fresh isolated `bridge-cli.exe` listener remained after clearing stale processes, preventing old binaries from intercepting Feishu traffic
+- Live Feishu validation: `问 Copilot parse_intent 这个函数是干什么的` first succeeded through the local companion extension, then succeeded again with workspace-aware grounding after the development-host workspace bootstrap was fixed
+
 ## 2026-03-29
 
 ### Summary
@@ -46,6 +77,32 @@
 - Completed live Feishu re-validation for `执行计划 git status; $ pwd` -> `继续` -> `批准`, confirming approved `$ pwd` now runs inside `/Users/Bean/Documents/trae_projects/feishu-vscode-bridge`
 - Synced the workspace-cwd fix to GitHub as commit `7b8d777` (`Fix shell commands to respect workspace cwd`)
 - Ignored the local `.feishu-vscode-bridge-audit.jsonl` runtime audit artifact so future Git syncs stay focused on source and docs changes
+- Started `P2.3` higher-order code tools with five new bridge commands: `搜索符号`, `运行指定测试`, `git log`, `git blame`, and `写入文件`
+- Added parser coverage, help-text updates, and bridge dispatch for the new P2.3 commands so they work both as direct commands and inside plans
+- Implemented ripgrep-based symbol-definition search for common function / type / struct / trait declaration forms
+- Implemented narrower test triggering via `运行指定测试`, with workspace-type-aware command selection for Rust, Node, and Python projects
+- Implemented `git log` with optional count / path filters and `git blame` for file-level history inspection from Feishu
+- Implemented approval-gated `写入文件` for creating or overwriting text files within the workspace root
+- Implemented a second P2.3 batch with `查找引用`, `查找实现`, and `运行测试文件` for broader code navigation and narrower validation flows
+- Added rg-backed plus built-in fallback search paths for references and implementations, so symbol navigation still works on hosts without ripgrep installed
+- Added workspace-aware test-file execution heuristics, including `cargo test --test <stem>` for Rust integration tests under `tests/`
+- Added `跳定义` as a Feishu-friendly alias for symbol-definition lookup, so wording can match IDE habits without introducing a separate execution path
+- Fixed a Windows-specific Rust test-runner file-lock issue by isolating bridge-triggered `cargo test` builds under `target/bridge-test-runner`
+- Refined `查找引用` and `查找实现` output to group matches by file, align `rg` and fallback filtering, and skip common test directories by default unless the user explicitly scopes into them
+- Tightened symbol-definition and implementation matching so fallback search no longer treats assertion string literals like `"fn foo"` or `"impl Bridge"` as real code definitions
+- Default Rust symbol-navigation searches now also skip inline `#[cfg(test)] mod tests` blocks, so `src/`-scoped queries stop surfacing unit-test-only matches unless the user explicitly searches test scope
+- `搜索符号` now uses the same file-grouped presentation as `查找引用` / `查找实现`, so all three code-navigation replies share one output shape
+- Grouped code-navigation replies now cap display to the first 10 matches per file and summarize the hidden remainder, so one noisy file no longer floods the whole Feishu reply
+- Default code-navigation searches now also skip runtime bridge artifacts like `.feishu-vscode-bridge-audit.jsonl` and `.feishu-vscode-bridge-session.json`, while still allowing explicit file-scoped search into those artifacts
+- Real Feishu regression exposed that an older long-running `target/debug` listener process could stay alive while no longer delivering replies reliably; starting a fresh listener from an isolated target directory restored message delivery without needing to kill the locked binary
+- Re-ran the latest P2.3 three-step Feishu plan after the grouped-search refinements and confirmed the new grouped `搜索符号` / `查找引用` output now survives the full `执行计划 -> 继续 -> 继续` card-callback path with paired audit entries on Windows
+- Re-validated the real Feishu `重新执行失败步骤` path on Windows with a deterministic failing `运行测试文件` step, confirming the bridge still pauses on the failed step, retries it through the card callback, and records paired retry audit entries without incorrectly advancing the plan
+- Standardized listener startup around repository helper scripts that default live Feishu runs to `target/bridge-live-runner`, so future validation no longer depends on ad hoc environment commands or the fragile long-running `target/debug` binary on Windows
+- Reframed the roadmap from a command bridge into a `remote agent bridge`, then started A0 by adding a VS Code companion extension scaffold with a local HTTP ask endpoint, session map, minimal editor-context injection, and Copilot / LM API request path
+- Wired the first Rust-side `问 Copilot` path into the bridge: Feishu / CLI prompts can now parse into `AskAgent`, forward to the companion extension over local HTTP with the Feishu session key as `sessionId`, and persist the ask reply like other direct-command results
+- Added a dedicated companion-extension README, then verified that the current Windows host still lacks both `node` and `npm`; the Rust side is ready for the ask-style smoke, but the extension cannot yet be built locally until a Node.js toolchain is installed or exposed on `PATH`
+- Installed Node.js LTS on the Windows host via `winget`, confirmed both `node` and `npm` are now on `PATH`, then completed the first local `npm install && npm run compile` pass for `vscode-agent-bridge`
+- Added workspace-level VS Code launch/task config for the companion extension, so the first ask-style smoke now has a repeatable `F5` path into an Extension Development Host instead of requiring ad hoc manual setup
 
 ### Files Added
 
@@ -53,6 +110,15 @@
 - `docs/feishu_chat_templates.md` — copy-paste Feishu conversation templates for the most common development workflows
 - `docs/feishu_quick_ref.md` — condensed one-page Feishu operator cheat sheet
 - `docs/feishu_group_notice.md` — ultra-short pinned-message version for Feishu groups and doc headers
+- `vscode-agent-bridge/package.json` — initial VS Code companion extension manifest for the remote agent bridge
+- `vscode-agent-bridge/tsconfig.json` — TypeScript build config for the companion extension
+- `vscode-agent-bridge/src/extension.ts` — first A0 extension runtime with a local bridge server, session map, and Copilot / LM ask path
+- `vscode-agent-bridge/README.md` — build and launch instructions for the companion extension, including Node.js and extension-host prerequisites
+- `.vscode/launch.json` — workspace launch config for the `vscode-agent-bridge` Extension Development Host
+- `.vscode/tasks.json` — workspace build task that compiles the companion extension before launch
+- `src/lib.rs` — added `AskAgent` intent parsing, help text, and parser regression coverage for `问 Copilot` / `ask copilot`
+- `src/vscode.rs` — added the local companion-extension HTTP client for `/v1/chat/ask`, with configurable bridge endpoint env vars and user-facing transport errors
+- `src/bridge.rs` — routed `AskAgent` through direct execution so bridge sessions now forward ask-style prompts to the companion extension using the Feishu session key
 
 ### Files Updated
 
@@ -70,6 +136,9 @@
 - `src/bridge.rs` — threaded persisted task context into plan-card rendering so Feishu cards now display current task and latest result
 - `src/lib.rs` — added parsing for failure-explanation, last-result, and last-file follow-up prompts
 - `src/bridge.rs` — added stored last-step / last-file metadata and routed new follow-up replies through persisted session state
+- `scripts/start-live-listener.ps1` — added a Windows helper that loads `.env`, pins `BRIDGE_WORKSPACE_PATH`, defaults approvals to `none`, and launches `bridge-cli listen` from `target/bridge-live-runner`
+- `scripts/start-live-listener.sh` — added a POSIX helper with the same isolated-target live-listener defaults for repeatable Feishu validation
+- `.gitignore` — now ignores companion-extension build artifacts under `vscode-agent-bridge/node_modules` and `vscode-agent-bridge/out`
 - `src/vscode.rs` — added unified-diff path extraction helper reused by bridge session tracking for `ApplyPatch`
 - `src/lib.rs` — added parsing/help coverage for `把刚才的 diff 发我`
 - `src/bridge.rs` — added recent-file-list and last-diff persistence plus follow-up card actions
@@ -100,6 +169,21 @@
 - `src/bridge.rs` — now appends bridge-layer action audit entries for continue / execute-all / retry / approve / reject flows, including resulting status metadata
 - `src/executor.rs` — added a cwd-aware command runner so shell execution can explicitly target the resolved workspace directory
 - `src/vscode.rs` — routed `run_shell` through the workspace-aware executor and added a regression test for `BRIDGE_WORKSPACE_PATH` cwd behavior
+- `src/lib.rs` — added parsing, help text, approval policy, and tests for `搜索符号`, `运行指定测试`, `git log`, `git blame`, and `写入文件`
+- `src/vscode.rs` — implemented symbol search, narrowed test execution, Git history inspection, and workspace-scoped text file writing
+- `src/bridge.rs` — wired the new higher-order tools into direct execution and plan execution
+- `README.md` — documented the new P2.3 workspace and Git commands plus the `运行指定测试` and `写入文件` behavior
+- `src/lib.rs` — added parsing and tests for `查找引用`, `查找实现`, and `运行测试文件`
+- `src/vscode.rs` — implemented reference search, implementation search, and test-file execution with no-ripgrep fallback coverage, and isolates Windows Rust test runs from the main target dir
+- `src/vscode.rs` — now groups reference / implementation matches by file, excludes common test directories by default for those queries, and keeps `rg` and built-in fallback behavior aligned
+- `src/vscode.rs` — tightened definition / implementation regexes to reduce string-literal false positives in fallback symbol navigation
+- `src/vscode.rs` — now filters Rust inline test modules from default symbol/reference/implementation search results, while keeping explicit test-directory scope available
+- `src/vscode.rs` — `搜索符号` now uses the same grouped-by-file formatter as the reference and implementation search replies
+- `src/vscode.rs` — grouped symbol/reference/implementation replies now cap each file section to 10 displayed matches and append a hidden-count summary when truncated
+- `src/vscode.rs` — code-navigation search now excludes runtime bridge artifacts by default in both `rg` and built-in fallback paths, while preserving explicit file-scoped search into those artifacts
+- `src/bridge.rs` — wired the second P2.3 batch into bridge descriptions and execution dispatch
+- `README.md` — documented `查找引用`, `查找实现`, `运行测试文件`, and the `跳定义` usage example
+- `README.md` — documented grouped reference / implementation output plus the default test-directory exclusion rule
 - `README.md` — documented group-chat session isolation and the new `.feishu-vscode-bridge-audit.jsonl` audit trail
 - `README.md` — documented the current attachment / multimodal input boundary and the required text-based downgrade path
 - `.gitignore` — now ignores the local `.feishu-vscode-bridge-audit.jsonl` runtime audit file to keep Git status clean between live Feishu validation runs
@@ -134,7 +218,32 @@
 - `cargo test` after adding bridge-layer action audit entries for continue / execute-all / retry / approve / reject flows
 - `cargo test run_shell_uses_workspace_env_as_cwd`
 - `cargo test`
+- `cargo test` after adding `搜索符号`, `运行指定测试`, `git log`, `git blame`, and `写入文件`
+- `cargo test` after adding `查找引用`, `查找实现`, and `运行测试文件`
+- `./target/debug/bridge-cli "运行测试文件 tests/approval_card_flow.rs"` on Windows, confirming the isolated test target avoids `bridge-cli.exe` file-lock failures
 - Live Feishu validation: send `执行计划 git status; $ pwd`, then `继续`, then `批准`, and verify the final `$ pwd` output is `/Users/Bean/Documents/trae_projects/feishu-vscode-bridge`
+- Live Feishu validation: on a Windows host without `rg`, `搜索符号 parse_intent 在 src` initially failed with `未找到 rg，请先安装 ripgrep。`; added a built-in fallback search path and revalidated the same Feishu command successfully end to end
+- Live Feishu validation: `运行指定测试 parse_search`, `git log 5 src/lib.rs`, `git blame src/lib.rs`, and `写入文件 scratch/demo.txt` all succeeded over the real Feishu message path, and `scratch/demo.txt` was created with the expected content
+- Live Feishu validation: `跳定义 parse_intent 在 src`, `查找引用 parse_intent 在 src`, `查找实现 Bridge 在 src`, and `运行测试文件 tests/approval_card_flow.rs` all succeeded over the real Feishu message path on Windows
+- Live Feishu validation: `执行计划 跳定义 parse_intent 在 src; 查找引用 parse_intent 在 src; 运行测试文件 tests/approval_card_flow.rs` returned a continuation card after the first step, confirming the new commands can enter the persisted plan flow; the remaining callback-path validation is to click `继续`
+- Live Feishu validation: after clicking `继续` on that plan card, the listener received `card.action.trigger`, executed the second step (`查找引用 parse_intent 在 src`), and returned the next continuation card for step 3, confirming the new P2.3 commands also work through the real Feishu card-callback resume path
+- Live Feishu validation: clicking `继续` a second time completed the third step (`运行测试文件 tests/approval_card_flow.rs`) and returned a final completion card with `状态: 已完成`, confirming the full three-step plan can execute end to end over real Feishu card callbacks
+- `CARGO_TARGET_DIR=target/bridge-test-runner cargo test` after refining `查找引用` / `查找实现` result grouping and default test-directory exclusion on Windows without colliding with the running listener binary
+- Local CLI smoke validation: after tightening the fallback patterns, `查找实现 Bridge 在 src` and `搜索符号 fake_symbol 在 src` no longer return assertion-string false positives
+- Local CLI smoke validation: after filtering Rust inline test modules, `查找引用 parse_intent 在 src` now collapses from test-heavy noise down to the real non-test matches in `src/bridge.rs`
+- Local fallback regression validation: `搜索符号 parse_intent` now reports grouped file counts, matching the reference / implementation reply style
+- Added a grouped-output regression test to confirm one file can report 12 total matches while only showing the first 10 lines plus a hidden-count summary
+- Local CLI smoke validation: root-scoped `查找引用 parse_intent` no longer surfaces `.feishu-vscode-bridge-audit.jsonl`, confirming runtime artifact filtering is active
+- Live Feishu validation: after the original `target/debug` listener stopped replying despite the process still existing, a fresh listener started from `target/bridge-live-runner` successfully received `搜索符号 parse_intent 在 src`, sent the reply, and returned the new grouped output (`命中: 1 个文件，1 处匹配`, `src/lib.rs`) over the real Feishu text-message path
+- Live Feishu validation: `执行计划 搜索符号 parse_intent 在 src; 查找引用 parse_intent 在 src; 运行测试文件 tests/approval_card_flow.rs` again returned a continuation card with grouped step-1 output, the first `继续` produced grouped `查找引用` output (`命中: 1 个文件，2 处匹配`, `src/bridge.rs`), the second `继续` completed `运行测试文件 tests/approval_card_flow.rs`, and the audit log recorded matching `message`, `card_action`, and `plan_action` entries for the whole chain
+- Live Feishu validation: `执行计划 搜索符号 parse_intent 在 src; 运行测试文件 tests/does_not_exist.rs; 运行测试文件 tests/approval_card_flow.rs` paused on step 2 with `状态: 失败暂停` and `测试文件不存在`, then clicking `重新执行失败步骤` retried the same failing step, kept the plan paused on step 2, and produced matching `card_action` plus `plan_action` audit entries for the retry path
+- `powershell -ExecutionPolicy Bypass -File .\scripts\start-live-listener.ps1 -PrintOnly`
+- VS Code diagnostics check for `vscode-agent-bridge/src/extension.ts`, `vscode-agent-bridge/package.json`, and `docs/copilot_bridge_porting_plan.md`, then removed the redundant command activation-event warnings from the extension manifest
+- VS Code diagnostics check for `src/lib.rs`, `src/vscode.rs`, and `src/bridge.rs` after adding `AskAgent`
+- Attempted `npm install && npm run compile` inside `vscode-agent-bridge/`, but this host currently has neither `node` nor `npm` on `PATH`; recorded the prerequisite and left the next smoke step blocked on installing Node.js
+- `winget install --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements --silent`
+- `npm install && npm run compile` inside `vscode-agent-bridge/`
+- VS Code diagnostics check for `.vscode/launch.json`, `.vscode/tasks.json`, and `vscode-agent-bridge/README.md`
 
 ## 2026-03-28
 

@@ -69,10 +69,13 @@ Compatibility status:
 - Configurable approval gates for selected command types before execution, including approval handling for patch application
 - Configurable default workspace path for Git operations
 - JSONL audit logging for Feishu inbound messages and card callbacks, including session key, sender, command, reply kind, and send outcome
-- Workspace read/search/test/change tools: `读取`, `列出`, `搜索`, `运行测试`, `查看 diff`, `应用补丁`
+- Workspace read/search/test/change tools: `读取`, `列出`, `搜索`, `搜索符号`, `查找引用`, `查找实现`, `运行测试`, `运行指定测试`, `运行测试文件`, `写入文件`, `查看 diff`, `应用补丁`, `git log`, `git blame`
+- Experimental ask-style bridge command: `问 Copilot <问题>` forwards a prompt to the local companion extension under `vscode-agent-bridge/` and returns the model reply to Feishu
 - Patch rollback support via reverse apply of the latest remembered patch
 - Minimal CLI demo executor
 - Native desktop setup GUI for initial configuration
+
+Companion extension setup notes: see [vscode-agent-bridge/README.md](/Users/beanw/OpenSource/feishu-vscode-bridge/vscode-agent-bridge/README.md) for the local Node.js prerequisite, build steps, and extension-host launch flow for the remote agent bridge.
 
 ## Plan Commands
 
@@ -83,6 +86,8 @@ One-page quick ref: see `docs/feishu_quick_ref.md` for a condensed cheat sheet s
 Ultra-short group notice: see `docs/feishu_group_notice.md` for a minimal pinned-message version.
 
 Live regression checklist: see `docs/feishu_live_regression_checklist.md` for a repeatable real-Feishu validation pass before or after shipping bridge changes.
+
+For the companion-extension launch flow used by the remote agent bridge, see [vscode-agent-bridge/README.md](/Users/beanw/OpenSource/feishu-vscode-bridge/vscode-agent-bridge/README.md).
 
 - `执行计划 <命令1>; <命令2>`: execute exactly one step, then pause
 - `继续`: execute the next pending step, or retry the failed step
@@ -113,10 +118,21 @@ Workspace examples:
 读取 src/lib.rs 1-120
 列出 src
 搜索 parse_intent 在 src
+搜索符号 parse_intent 在 src
+跳定义 parse_intent 在 src
+查找引用 parse_intent 在 src
+查找实现 Bridge 在 src
 运行测试
 运行测试 cargo test --lib
+问 Copilot parse_intent 这个函数是干什么的
+运行指定测试 parse_search
+运行测试文件 tests/approval_card_flow.rs
+写入文件 scratch/demo.txt
+hello from feishu
 查看 diff
 查看 diff src/lib.rs
+git log 5 src/lib.rs
+git blame src/lib.rs
 应用补丁
 diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
@@ -125,6 +141,15 @@ diff --git a/src/lib.rs b/src/lib.rs
 -old
 +new
 ```
+
+Search behavior notes:
+
+- `搜索符号`, `查找引用`, and `查找实现` now group matches by file so Feishu replies stay readable on larger workspaces
+- `查找引用` and `查找实现` now group matches by file so Feishu replies stay readable on larger workspaces
+- When no explicit test scope is requested, `查找引用` and `查找实现` skip common test directories such as `tests/`, `test/`, and `__tests__/` by default; if you want those matches, scope the command into that path explicitly
+- In Rust source files, default symbol-navigation queries also skip inline `#[cfg(test)] mod tests` blocks to reduce noise from unit-test-only matches
+- When one file has many hits, grouped code-navigation replies show only the first 10 matches for that file and summarize the hidden remainder
+- Default code-navigation searches also skip runtime bridge artifacts such as `.feishu-vscode-bridge-audit.jsonl` and `.feishu-vscode-bridge-session.json`; if you want them, scope the command to that file explicitly
 
 Session notes:
 
@@ -265,6 +290,23 @@ These commands will operate on `BRIDGE_WORKSPACE_PATH` by default.
 
 `运行测试` supports either a default workspace test command or an explicit command sent from Feishu.
 
+`运行指定测试 <过滤词>` runs a narrower subset of tests. Current behavior is heuristic by workspace type:
+
+- Rust workspace: `cargo test <过滤词>`
+- Node workspace: `npx jest --testNamePattern <过滤词>`
+- Python workspace: `python -m pytest -k <过滤词>`
+
+`运行测试文件 <路径>` runs a test file directly when the workspace layout is recognized.
+
+- Rust integration test under `tests/*.rs`: `cargo test --test <file_stem>`
+- Other Rust test file: falls back to `cargo test <file_stem>`
+- Node workspace: `npx jest <path>`
+- Python workspace: `python -m pytest <path>`
+
+On Windows Rust workspaces, bridge-triggered `cargo test` commands use an isolated `target/bridge-test-runner` directory to avoid file-lock conflicts when the running `bridge-cli.exe` triggers tests in the same repository.
+
+`写入文件 <路径>\n<内容>` creates or overwrites a text file under the current workspace root. Like `应用补丁`, it is approval-gated by default.
+
 Configure the default command with:
 
 ```bash
@@ -319,12 +361,35 @@ You can use `setup-gui` to generate or update the file. Existing non-Feishu envi
 
 ### 2. Start the Listener
 
-Run the listener from the repository root so persisted session state is written to the correct working directory:
+Run the listener from the repository root so persisted session state is written to the correct working directory.
+
+For regular live Feishu validation, prefer the helper script because it builds into an isolated target directory and avoids Windows file-lock issues from a long-running `target/debug/bridge-cli.exe`:
 
 ```bash
-killall bridge-cli 2>/dev/null || true
-cargo build --bin bridge-cli
-./target/debug/bridge-cli listen
+./scripts/start-live-listener.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\start-live-listener.ps1
+```
+
+The helper script:
+
+- loads `.env` automatically when present
+- sets `BRIDGE_WORKSPACE_PATH` to the repository root by default
+- sets `BRIDGE_APPROVAL_REQUIRED=none` by default
+- builds and runs the listener from `target/bridge-live-runner`
+
+You can still override the defaults, for example:
+
+```powershell
+.\scripts\start-live-listener.ps1 -ApprovalRequired default -WorkspacePath C:\path\to\repo
+```
+
+```bash
+./scripts/start-live-listener.sh --approval-required default --workspace-path /absolute/path/to/repo
 ```
 
 Expected startup logs:
@@ -345,9 +410,15 @@ killall bridge-cli 2>/dev/null || true
 log=/tmp/feishu-vscode-bridge-listen-fresh.log
 : > "$log"
 echo "=== restarted $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$log"
-set -a && source .env && set +a
-cargo build --bin bridge-cli
-./target/debug/bridge-cli listen >> "$log" 2>&1
+./scripts/start-live-listener.sh >> "$log" 2>&1
+```
+
+On Windows PowerShell:
+
+```powershell
+$log = "./scratch/feishu-vscode-bridge-listen-fresh.log"
+"=== restarted $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Set-Content $log
+.\scripts\start-live-listener.ps1 *>> $log
 ```
 
 Inspect logs with:
@@ -465,7 +536,7 @@ When a step-by-step plan pauses, the listener writes session state to:
 .feishu-vscode-bridge-session.json
 ```
 
-This file is created in the current working directory of the `bridge-cli listen` process, so always start the listener from the repository root.
+This file is created in the current working directory of the `bridge-cli listen` process, so always start the listener from the repository root. The helper scripts above already `cd` into the repository root before launching the listener.
 
 ## Next Milestones
 

@@ -10,14 +10,19 @@
 - 已编译监听器：`cargo build`
 - 建议关闭审批：`BRIDGE_APPROVAL_REQUIRED=none`
 - 建议固定工作区：`BRIDGE_WORKSPACE_PATH=/absolute/path/to/repo`
+- 建议优先使用仓库内启动脚本，它默认走 `target/bridge-live-runner`，可避开 Windows 上长期运行的 `target/debug/bridge-cli.exe` 锁文件问题
 
 推荐启动命令：
 
 ```bash
 cd /Users/Bean/Documents/trae_projects/feishu-vscode-bridge
-set -a
-source .env
-env BRIDGE_WORKSPACE_PATH=/Users/Bean/Documents/trae_projects/feishu-vscode-bridge BRIDGE_APPROVAL_REQUIRED=none ./target/debug/bridge-cli listen
+./scripts/start-live-listener.sh
+```
+
+Windows PowerShell：
+
+```powershell
+.\scripts\start-live-listener.ps1
 ```
 
 启动成功的最低标志：

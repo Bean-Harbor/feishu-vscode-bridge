@@ -27,3 +27,4 @@ serde_json = "1"
 dotenvy = "0.15"
 tungstenite = { version = "0.24", features = ["native-tls"] }
 prost = "0.13"
+regex = "1"

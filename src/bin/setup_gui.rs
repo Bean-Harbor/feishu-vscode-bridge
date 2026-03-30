@@ -10,6 +10,7 @@
 
 #[cfg(not(target_os = "macos"))]
 use eframe::egui;
+#[cfg(target_os = "macos")]
 use std::io::{self, Write};
 #[cfg(not(target_os = "macos"))]
 use std::path::Path;
@@ -414,6 +415,53 @@ fn detect_vscode() -> VscodeStatus {
     }
 
     VscodeStatus::NotFound
+}
+
+// ──────────────────────────── 工作区辅助函数 ────────────────────────────
+
+/// 返回当前工作区根目录（Cargo 项目根或 cwd）。
+#[cfg(not(target_os = "macos"))]
+fn workspace_dir() -> Result<PathBuf, String> {
+    // 优先取 CARGO_MANIFEST_DIR（cargo run 时设置），否则用 cwd
+    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    std::env::current_dir().map_err(|e| format!("无法获取当前目录：{e}"))
+}
+
+/// 用 VS Code 打开工作区目录。
+#[cfg(not(target_os = "macos"))]
+fn launch_vscode_for_workspace() -> Result<(), String> {
+    let dir = workspace_dir()?;
+    Command::new("code")
+        .arg(dir.as_os_str())
+        .spawn()
+        .map_err(|e| format!("无法启动 VS Code：{e}"))?;
+    Ok(())
+}
+
+/// 用系统文件管理器打开工作区目录。
+#[cfg(not(target_os = "macos"))]
+fn open_workspace_directory() -> Result<(), String> {
+    let dir = workspace_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(dir.as_os_str())
+            .spawn()
+            .map_err(|e| format!("无法打开目录：{e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(dir.as_os_str())
+            .spawn()
+            .map_err(|e| format!("无法打开目录：{e}"))?;
+    }
+    Ok(())
 }
 
 // ──────────────────────────── 中文字体加载 ────────────────────────────

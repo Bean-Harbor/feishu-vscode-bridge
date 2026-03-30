@@ -2,270 +2,242 @@
 
 ## Goal
 
-把 `feishu-vscode-bridge` 补齐为一个可从飞书远程完成主要 Copilot Chat 开发动作的桥接层，优先补工作区读写、搜索、测试和变更能力，而不是继续扩展与当前目标无关的其他平台能力。
+把 `feishu-vscode-bridge` 从“飞书 -> 本地开发命令桥”推进成“飞书 -> VS Code remote agent bridge”：用户在飞书窗口里发起任务后，桥接器不只是回一条建议或执行单条命令，而是像一个持续工作的 agent，会复用 VS Code 工作区上下文、维护会话状态、调用模型、编排工具动作，并把执行进度与结果持续回传到飞书。
 
 ## Product Target
 
-- 用户在 Copilot Chat 里常做的事情，优先做到可以从飞书发起和接收结果
-- 优先做“读代码 -> 查目录 -> 搜索 -> 跑测试 -> 看 diff -> 改文件”这条主链路
-- 继续复用当前仓库已经有的计划执行、审批卡片、会话持久化和 Feishu 卡片交互能力
+- 用户在飞书里获得接近 VS Code Copilot Chat agent 的连续工作体验，而不是只得到一次性问答
+- 优先打通“远程发问 -> VS Code 侧建立 agent 会话 -> 获取编辑器上下文 -> 模型回复 -> 需要时调用本地工具 -> 回飞书”的主链路
+- 继续复用当前仓库已经完成的 Feishu 卡片、审批、计划执行、审计、会话持久化与本地工具执行能力
+- 明确区分两层能力：
+  - `ask bridge`：一次性提问与回答
+  - `agent bridge`：可持续推进任务、读写工作区、调用工具、恢复上下文
 
 ## Implementation Base
 
-- 当前仓库：已有 Feishu 交互卡片、计划执行、审批、基础 VS Code CLI / Git / shell 封装
-- 后续增强优先基于当前仓库内聚演进，避免把计划依赖绑定到外部项目
+- 当前 Rust 桥接层已经具备：Feishu 消息收发、卡片回调、审批、会话持久化、审计、以及工作区读写/搜索/测试/Git 能力
+- 当前缺失的是 VS Code 侧的 companion extension，它负责接入 Copilot / Language Model API、读取编辑器上下文、维护 agent session，并暴露本地 bridge protocol 给 Rust 监听器调用
+- 因此后续工作不再只是继续给 Rust 增加命令，而是引入一个新的 VS Code extension 组件，并把 Rust bridge 与 extension bridge 串起来
 
 ## Delivery Principles
 
-1. 先补远程开发闭环，再补平台层增强
-2. 尽量复用现有 `Intent -> bridge runtime -> executor/vscode -> Feishu reply` 架构
-3. 每一批功能都要有明确的飞书侧触发方式、输出格式和验证路径
-4. 高风险动作继续走审批，不为追求“像 Copilot”而削弱安全边界
+1. 先把 remote agent 的最小闭环跑通，再做复杂工具编排
+2. 不以“控制现有内置 Copilot Chat 面板会话”为前提，优先实现由 companion extension 自己维护的 bridge session
+3. Rust 继续承担 Feishu 入口、审批、安全边界、审计和本地工具执行；VS Code extension 负责模型、编辑器上下文和 agent 会话
+4. 每一批能力都要同时包含：
+   - 飞书侧触发方式
+   - VS Code / extension 侧状态变化
+   - 失败路径与回退策略
+   - 真实飞书验证路径
 
-## P0
+## Current Status
+
+已完成的“命令桥”基础：
+
+- 飞书文本消息、卡片回调、审批、失败重试、会话持久化、审计
+- 工作区读写、搜索、测试、diff、patch、Git 历史与 blame
+- 真实飞书回归：文本链路、卡片继续链路、失败重试链路、以及 Windows listener 启动标准化
+
+仍未完成的“agent bridge”关键缺口：
+
+- 尚无 VS Code companion extension
+- 尚未建立 Feishu session -> VS Code agent session 的映射
+- 尚未通过 Copilot / Language Model API 发起会话式请求
+- 尚未把编辑器上下文（active editor、selection、diagnostics 等）注入会话
+- 尚未形成“模型决定 -> 工具编排 -> 结果再喂回模型”的 agent 回路
+
+## A0 Foundation
 
 ### Objective
 
-先补齐只读和低风险执行能力，让飞书端具备基础代码理解与验证闭环。
+先建立 remote agent bridge 的基础连接能力，让 VS Code 侧 companion extension 能作为本地 agent runtime 存在，并让 Rust bridge 能向它发起一次会话式提问。
 
 ### Scope
 
-- `read_file`
-  - 支持读取单文件
-  - 支持起止行范围
-  - 支持输出截断和省略提示
-- `list_directory`
-  - 支持列目录
-  - 区分文件和目录
-  - 支持限制返回数量，避免飞书消息过长
-- `search_text`
-  - 优先用 `rg`
-  - 支持普通文本和正则两种模式
-  - 返回文件路径和行号摘要
-- `run_tests`
-  - 先支持工作区默认测试命令和显式传入测试命令
-  - 输出通过 / 失败摘要和关键失败片段
+- 新增 VS Code companion extension 工程
+- 提供本地 bridge server
+  - 接收来自 Rust / Feishu bridge 的会话请求
+  - 暴露健康检查与基础 ask 接口
+- 使用 VS Code Language Model API / Copilot model 发起请求
+- 维护最小 session store
+  - `session_id`
+  - `message history`
+  - 最近一次模型结果摘要
+- 注入最小编辑器上下文
+  - 当前 workspace
+  - active file
+  - selected text
 
 ### Why First
 
-- 这是“我在 Copilot Chat 里先看代码、搜代码、跑测试”的最小闭环
-- 这批能力基本不涉及文件写入，风险最低，最适合先在飞书真实场景验证
-- 当前仓库已有计划执行和回复机制，接入成本最低
+- 没有 companion extension，就没有真正的 VS Code-side agent session
+- 这一步能快速验证最关键的前提：Copilot model 是否能被 extension 调用，并稳定返回结果给 Feishu
 
 ### Expected User Flows
 
-- `读取 src/lib.rs 1-120`
-- `列出 src`
-- `搜索 parse_intent`
-- `运行测试`
-- `执行计划 搜索 parse_intent; 读取 src/lib.rs 1-200; 运行测试`
-
-### Implementation Notes
-
-- 新能力尽量走独立工具函数，避免把所有逻辑堆进 `main.rs`
-- 如果当前 `Intent` 结构不够表达参数，先补解析层，再补执行层
-- 输出要对飞书友好，默认摘要化，必要时引导用户缩小范围
+- 飞书发送：`问 Copilot parse_intent 这个函数是干什么的`
+- Rust bridge 把消息转给 extension
+- extension 建立 / 复用 `session_id`
+- extension 读取 active editor context
+- extension 调用 Copilot model，返回文本答案
+- Rust bridge 把回复回给飞书
 
 ### Acceptance Criteria
 
-- 飞书消息可直接触发以上四类动作
-- 返回内容包含足够的文件定位信息与失败原因
-- 长输出不会导致卡片或文本回复不可用
-- `cargo test` 通过
-- 至少完成一轮真实飞书联调
+- 本地 extension 可被激活并启动 bridge server
+- 能处理至少 1 条 ask-style 会话请求
+- 能返回来自 Copilot / LM API 的模型回答
+- 会话 ID 在多次请求之间可复用
+- `cargo test` 仍通过；extension 能完成本地 smoke
 
-## P1
+## A1 Session Bridge
 
 ### Objective
 
-在 P0 基础上补齐代码变更前后的关键能力，让飞书端进入“可审查、可修改”的阶段。
+把 ask-style 单次调用升级成真正的 bridge session，让飞书里的连续追问能映射到 VS Code extension 侧的同一会话历史。
 
 ### Scope
 
-- `git_diff`
-  - 查看当前工作区未提交变更
-  - 支持指定文件 diff
-  - 支持摘要输出
-- `apply_patch`
-  - 支持基于补丁修改文本文件
-  - 保持最小变更原则
-  - 明确失败反馈
-- 会话上下文增强
-  - 持久化 `current_task`、`pending_steps`、`last_result`、`last_action`
-  - 让 `继续`、`重新执行失败步骤`、再次追问时更像持续对话而不是单条命令
+- Feishu session key -> extension session key 映射
+- extension 内部会话历史持久化 / 生命周期管理
+- 会话级上下文汇总
+  - 最近消息
+  - 最近模型回复
+  - 最近文件上下文
+- 支持飞书连续追问复用同一 session
 
 ### Why Second
 
-- 没有 diff 和 patch，飞书端最多只能看和测，不能形成实际编码闭环
-- 但写文件风险显著高于读取和测试，应该放在 P0 验证稳定之后
+- 这是从 `ask bridge` 迈向 `agent bridge` 的分水岭
+- 没有稳定 session，后续的 agent 编排只能退化成一问一答
 
 ### Expected User Flows
 
-- `查看 diff`
-- `查看 src/lib.rs 的 diff`
-- `按以下补丁修改 src/lib.rs ...`
-- `继续刚才的任务`
-
-### Implementation Notes
-
-- `apply_patch` 必须沿用当前仓库审批策略，对高风险写操作保留审批入口
-- 需要明确补丁格式和失败回显，否则飞书端调试成本会很高
-- 可以先支持仓库内文本文件，不急着做二进制文件和复杂重命名
+- 飞书发送：`这个报错先别改，告诉我根因`
+- 接着发送：`那最小修复方案呢`
+- 接着发送：`先只改测试，不动主逻辑`
+- extension 会在同一 session 下持续理解上下文，而不是每次当成新问题
 
 ### Acceptance Criteria
 
-- 飞书可查看当前变更摘要和指定文件 diff
-- 飞书可提交文本补丁并得到成功 / 失败反馈
-- 写入后可直接串联 `查看 diff` 和 `运行测试`
-- 会话状态能支撑 `继续` 这类跨消息动作
-- 真实飞书联调通过至少一个“读 -> 改 -> diff -> 测试”场景
+- 连续三轮追问共享同一 session history
+- 切换到不同 Feishu sender / chat 后不会串线
+- session 可被显式重置或自然过期
 
-## P2.1
+## A2 Context Bridge
 
 ### Objective
 
-先补齐会话连续性和回复体验，让飞书里的追问更像持续开发对话，而不是命令回显。
+让 bridge session 不只知道“聊天历史”，还知道当前 VS Code 工作现场，向真正的 agent 体验靠近。
 
 ### Scope
 
-- 回复体验增强
-  - 失败说明更像 Copilot Chat 风格摘要，而不是原始执行日志拼接
-  - 上一步结果、diff、文件列表等追问回复更统一
-  - 卡片标题、摘要、正文层次更稳定
-- 会话连续性增强
-  - 更明确的当前任务摘要
-  - 更稳定的最近步骤 / 最近文件 / 最近 diff 继承逻辑
-  - 降低用户必须重复背景的频率
+- 采集并注入：
+  - active editor URI
+  - selection / visible range
+  - diagnostics / Problems 摘要
+  - workspace folders
+  - 可选：最近打开文件
+- 提供明确的上下文边界与截断策略
+- 将上下文摘要纳入会话请求与回显
 
-### Why First In P2
+### Why Third
 
-- 这是最直接影响飞书使用体验的部分
-- 不需要先扩展新协议或新工具，就能明显提升“像 Copilot Chat”的程度
-- 与当前已经完成的计划执行、追问、卡片能力连续性最强
+- 用户之所以觉得 Copilot Chat 像 agent，不只是因为模型，而是因为它看得到当前编辑器上下文
 
 ### Acceptance Criteria
 
-- 同一个任务连续追问时，回复更像持续对话而不是独立命令结果
-- 失败、结果、diff、文件追问的回复格式基本统一
-- 至少完成一轮真实飞书体验验证
+- 模型回答能引用当前文件或选区
+- 上下文过大时能被可控截断
+- 用户可感知当前上下文来源，而不是黑箱行为
 
-### Expected User Flows
-
-- `执行全部 读取 src/lib.rs 1-80; $ false` 之后发送 `刚才为什么失败`
-- `查看 diff` 之后发送 `把刚才的 diff 发我`
-- `应用补丁 ...` 之后发送 `把刚才改动的文件列表发我` 再发送 `继续改刚才那个文件`
-- 计划执行完成后发送 `继续刚才的任务`，先拿到任务摘要，再继续针对上一步结果追问
-
-### Implementation Notes
-
-- 优先抽象统一的回复渲染层，而不是给每个追问命令单独拼字符串
-- 失败说明、结果回放、diff 回放、文件追问应共享一套标题 / 摘要 / 正文结构
-- 会话摘要应优先复用已持久化状态，避免为追问再次执行昂贵动作
-- 先解决“同一任务追问体验不一致”，再考虑增加新命令
-
-### Suggested Work Breakdown
-
-- P2.1.1 统一追问回复骨架
-  - 把失败说明、结果回放、diff 回放、文件追问整理成统一的回复结构
-  - 对齐文本回复与卡片回复的标题、状态、摘要字段
-- P2.1.2 强化失败与结果摘要
-  - 让 `刚才为什么失败` 优先输出任务上下文、失败步骤、关键错误摘要、下一步建议
-  - 让 `把上一步结果发我` 在保留原始结果的同时给出简短导语
-- P2.1.3 强化任务连续性
-  - 让 `继续刚才的任务` 返回更明确的任务目标、最近步骤、最近文件、最近 diff 摘要
-  - 优化最近文件 / 最近 diff / 最近结果的继承和优先级
-- P2.1.4 飞书真实链路验证（已完成）
-  - 已验证一条失败追问链路和一条 diff 追问链路
-  - 已把验证结果和边界情况记录到 `docs/work_log.md`
-
-## P2.2
+## A3 Tool Loop
 
 ### Objective
 
-在体验连续性稳定后，再补 Feishu 传输层、附件输入和审批审计能力。
+把 extension 侧模型会话和当前 Rust 工具桥接起来，形成真正的 agent loop：模型可以决定读文件、搜代码、跑测试、看 diff，再根据结果继续回复。
 
 ### Scope
 
-- 更成熟的 Feishu 传输与适配层
-  - 群聊 / 私聊上下文处理增强
-  - 更稳的消息适配和回复策略
-- 审批与审计增强
-  - 更完整的审批记录
-  - 更清晰的操作审计轨迹
-- 附件与多模态输入
-  - 为后续截图、日志、补丁片段、附件驱动任务做准备
+- 设计 extension <-> Rust bridge tool protocol
+- 由 extension 发起工具调用请求
+- 由 Rust bridge 执行现有工具能力
+- 把工具结果回注入模型上下文
+- 首批接入工具：
+  - `read_file`
+  - `search_text`
+  - `search_symbol`
+  - `find_references`
+  - `run_tests`
+  - `git_diff`
 
-### Why Second In P2
+### Why Fourth
 
-- 这些能力主要提升稳定性、治理和输入丰富度
-- 它们重要，但不应先于用户最直观感受到的对话体验问题
+- 只有会话桥和上下文桥还不够；真正的 agent 必须能自主调用工具
+- 当前 Rust 侧已经有大量可靠工具能力，应该复用而不是在 extension 重造一套
 
 ### Acceptance Criteria
 
-- 飞书多种消息形态下体验更稳定
-- 审批和操作记录更可追踪
-- 附件输入具备清晰的约束和处理路径
+- 能完成 1 条“模型 -> 工具 -> 模型 -> 飞书”的闭环
+- 工具调用在飞书侧可见且可审计
+- 失败的工具调用不会破坏会话状态
 
-### Suggested Work Breakdown
-
-- P2.2.1 会话隔离与基础审计
-  - 按 `chat_id + sender_id` 隔离飞书会话，避免群聊多人共享同一份连续上下文
-  - 为消息和卡片回调补充本地 JSONL 审计记录，至少包含发送者、命令、回复类型和发送结果
-- P2.2.2 附件输入约束
-  - 已实现：识别飞书附件 / 图片 / 语音 / 媒体消息，以及富文本里的图片/附件/媒体/语音块，并直接回复降级说明
-  - 当前约束：只自动处理纯文本 `text` 与纯文本富文本 `post`；非纯文本内容要求用户转成文字后再发
-  - 下一步可在这个入口上继续扩展截图、日志片段、补丁片段的结构化接入
-- P2.2.3 审批轨迹增强
-  - 已实现：批准 / 拒绝 / 继续 / 执行全部 / 重试失败步骤会追加桥接层动作审计
-  - 已实现：动作审计显式记录 `action_name`、`result_status`、`result_summary`，便于区分失败、拒绝、成功三类状态
-  - 下一步建议做一次真实飞书回归，核对 `card.action.trigger` 原始事件与 bridge-layer 动作审计是否成对落盘
-
-## P2.3
+## A4 Controlled Write Path
 
 ### Objective
 
-最后再扩展更高阶代码工具，把桥接器从基础远程开发闭环推进到更强的工程辅助层。
+在 agent loop 稳定后，再把补丁、写文件、测试回归、审批接入到 agent 编排里，让 agent 真正具备受控改代码能力。
 
 ### Scope
 
-- 更高阶代码工具
-  - 符号级搜索
-  - 更细粒度测试触发
-  - 更多 IDE / MCP 风格工作区动作
-
-### Why Third In P2
-
-- 这部分会扩大能力面，但不是当前最核心的体验瓶颈
-- 在回复体验和传输稳定性没打磨前，继续加工具更容易让产品面变宽、体验变散
+- 接入 `apply_patch` / `write_file` / `run_test_file`
+- 保持审批边界
+- 把 patch / diff / test result 重新喂给 session
+- 让飞书能看到“方案 -> 修改 -> 验证”的连续链路
 
 ### Acceptance Criteria
 
-- 能支撑更复杂、更长链路的远程开发交互
-- 新工具能力有清晰的飞书触发方式、输出格式和验证路径
+- 至少完成 1 条真实飞书 `分析 -> 改代码 -> 查看 diff -> 跑测试 -> 汇报结果` agent 链路
+- 写操作全部仍走现有审批边界
+
+## A5 Publishability
+
+### Objective
+
+把 remote agent bridge 从可跑的开发原型推进成可安装、可配置、可复现的独立发布物。
+
+### Scope
+
+- 完整 extension 安装与启动说明
+- Rust bridge 与 extension 的启动顺序与健康检查
+- 配置向导补充 extension 依赖检查
+- 日志、诊断、常见失败处理文档
+
+### Acceptance Criteria
+
+- 新用户按文档可在一台机器上完成 setup
+- 能完成 1 条 ask-style smoke 和 1 条 agent-style smoke
 
 ## Suggested Build Order
 
-1. P0.1 `read_file` - completed on 2026-03-29
-2. P0.2 `list_directory` - completed on 2026-03-29
-3. P0.3 `search_text` - completed on 2026-03-29
-4. P0.4 `run_tests` - completed on 2026-03-29
-5. P1.1 `git_diff` - completed on 2026-03-29
-6. P1.2 `apply_patch` - completed on 2026-03-29
-7. P1.3 会话上下文增强 - completed on 2026-03-29
-8. P2.1.1 统一追问回复骨架 - completed on 2026-03-29
-9. P2.1.2 强化失败与结果摘要 - completed on 2026-03-29
-10. P2.1.3 强化任务连续性 - completed on 2026-03-29
-11. P2.1.4 飞书真实链路验证
-12. P2.2 Feishu 传输、附件与审计增强
-13. P2.3 更高阶代码工具
+1. M0 已完成：Feishu 命令桥、会话、卡片、审批、审计、工作区工具
+2. A0.1 新增 companion extension 工程骨架
+3. A0.2 在 extension 内启动本地 bridge server
+4. A0.3 用 Copilot / LM API 跑通单次 ask 请求
+5. A1.1 建立 session 映射与历史复用
+6. A2.1 注入 active editor / selection / diagnostics
+7. A3.1 定义 extension <-> Rust tool protocol
+8. A3.2 接入只读工具闭环
+9. A4.1 接入受控写路径与审批
+10. A5.1 文档、setup、发布收尾
 
 ## Non-Goals For Now
 
-- 与当前独立桥接目标无关的平台能力扩展
-- 与当前远程编码闭环无关的 GUI 能力
-- 过早引入复杂多智能体编排
-- 在没有真实飞书验证前扩展大量新命令
+- 尝试直接控制现有内置 GitHub Copilot Chat 面板的私有会话状态
+- 在 companion extension 里重写一整套本地工具执行系统
+- 在没有 session / context / tool loop 基础前，直接追求复杂多 agent 编排
+- 为了“像 agent”而绕过现有审批与审计边界
 
 ## How To Resume Later
 
-后续如果上下文丢失，直接从本文件按 `Suggested Build Order` 继续实现。`P2.1.4` 已完成，当前已进入 `P2.2`，并已落地 `P2.2.1` 的会话隔离与基础审计、`P2.2.2` 的附件 / 多模态输入约束、`P2.2.3` 的桥接层动作审计；下一步优先做真实飞书回归，验证审批 / 重试审计的完整性。
+后续如果上下文丢失，直接把当前仓库视为“命令桥已完成，agent bridge 未开始”的状态继续推进。第一优先级不是再给 Rust 增加更多零散命令，而是完成 A0：落 companion extension、建立本地 bridge server、打通一条 ask-style Copilot / LM 请求。A0 完成后，再继续 A1 session、A2 上下文、A3 工具回路。

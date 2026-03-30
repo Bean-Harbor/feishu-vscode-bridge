@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build-feishu-agent-bridge-extension",
+      "type": "shell",
+      "command": "npm",
+      "windows": {
+        "command": "C:\\Program Files\\nodejs\\npm.cmd",
+        "options": {
+          "env": {
+            "PATH": "C:\\Program Files\\nodejs;${env:PATH}"
+          }
+        }
+      },
+      "args": [
+        "run",
+        "compile"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/vscode-agent-bridge"
+      },
+      "problemMatcher": [
+        "$tsc"
+      ],
+      "group": "build"
+    }
+  ]
+}
