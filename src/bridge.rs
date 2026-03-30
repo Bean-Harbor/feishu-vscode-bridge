@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 
+use crate::direct_command;
 use crate::follow_up;
 use crate::intent_executor::execute_runnable_intent;
 use crate::plan_dispatch;
-use crate::plan::{ExecutionOutcome, PlanProgress, PlanSession};
+use crate::plan::ExecutionOutcome;
+use crate::session;
+#[cfg(test)]
+use crate::plan::{PlanProgress, PlanSession};
+#[cfg(test)]
 use crate::reply;
-use crate::session::{self, StoredSession};
-use crate::vscode;
 use crate::{ApprovalPolicy, ExecutionMode, Intent, help_text, parse_intent};
 
 #[cfg(test)]
@@ -14,6 +17,9 @@ use crate::plan::ApprovalRequest;
 
 #[cfg(test)]
 use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredStep};
+
+#[cfg(test)]
+use crate::session::StoredSession;
 
 pub type IntentExecutor = fn(&Intent) -> ExecutionOutcome;
 
@@ -144,52 +150,25 @@ impl BridgeApp {
             Intent::Unknown(raw) => {
                 BridgeResponse::Text(format!("❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令"))
             }
-            other => self.execute_direct_command(session_key, trimmed_text, other),
+            other => direct_command::execute_direct_command(
+                session_key,
+                self.session_store_path.as_ref(),
+                self.executor,
+                trimmed_text,
+                other,
+            ),
         }
     }
 
     pub fn approval_policy(&self) -> &ApprovalPolicy {
         &self.approval_policy
     }
-
-    fn execute_direct_command(
-        &self,
-        session_key: &str,
-        task_text: &str,
-        intent: Intent,
-    ) -> BridgeResponse {
-        if let Intent::AskAgent { prompt } = &intent {
-            let result = vscode::ask_agent(session_key, prompt);
-            let reply = reply::format_agent_reply(task_text, &result);
-            let stored = session::stored_session_from_agent_result(task_text, &intent, &result, &reply);
-            let _ = self.persist_session(session_key, &stored);
-            return BridgeResponse::Text(reply);
-        }
-
-        if let Intent::ResetAgentSession = &intent {
-            let result = vscode::reset_agent_session(session_key);
-            let outcome = ExecutionOutcome {
-                success: result.success,
-                reply: result.to_reply("重置 Copilot 会话"),
-            };
-            let progress = session::progress_from_direct_execution(intent, outcome.clone());
-            let stored = self.build_stored_session(None, task_text, "直接执行", &progress);
-            let _ = self.persist_session(session_key, &stored);
-            return BridgeResponse::Text(outcome.reply);
-        }
-
-        let outcome = (self.executor)(&intent);
-        let reply = outcome.reply.clone();
-        let progress = session::progress_from_direct_execution(intent, outcome);
-        let stored = self.build_stored_session(None, task_text, "直接执行", &progress);
-        let _ = self.persist_session(session_key, &stored);
-        BridgeResponse::Text(reply)
-    }
-
+    #[cfg(test)]
     fn persist_session(&self, session_key: &str, session: &StoredSession) -> Result<(), String> {
         session::persist_session(self.session_store_path.as_ref(), session_key, session)
     }
 
+    #[cfg(test)]
     fn build_stored_session(
         &self,
         plan: Option<PlanSession>,
