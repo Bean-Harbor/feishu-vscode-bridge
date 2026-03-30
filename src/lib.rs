@@ -240,6 +240,8 @@ pub mod executor;
 pub mod bridge;
 pub mod feishu;
 pub mod plan;
+pub mod reply;
+pub mod session;
 pub mod vscode;
 
 /// 解析用户消息为意图

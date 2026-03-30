@@ -1,15 +1,19 @@
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 
-use crate::plan::{ExecutionOutcome, PlanProgress, PlanSession};
+use crate::plan::{ApprovalRequest, ExecutionOutcome, PlanProgress, PlanSession};
+use crate::reply;
+use crate::session::{self, StoredResult, StoredSession};
 use crate::vscode;
 use crate::{ApprovalPolicy, ExecutionMode, Intent, help_text, parse_intent};
+
+#[cfg(test)]
+use crate::session::{StoredDiff, StoredPatch, StoredStep};
 
 pub type IntentExecutor = fn(&Intent) -> ExecutionOutcome;
 
@@ -47,57 +51,10 @@ pub struct BridgeApp {
     executor: IntentExecutor,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct StoredSession {
-    plan: Option<PlanSession>,
-    current_task: Option<String>,
-    pending_steps: Vec<String>,
-    last_result: Option<StoredResult>,
-    last_action: Option<String>,
-    last_step: Option<StoredStep>,
-    last_file_path: Option<String>,
-    recent_file_paths: Vec<String>,
-    last_diff: Option<StoredDiff>,
-    last_patch: Option<StoredPatch>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredResult {
-    status: String,
-    summary: String,
-    success: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredStep {
-    description: String,
-    reply: String,
-    success: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredDiff {
-    description: String,
-    content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredPatch {
-    content: String,
-    file_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum SessionStoreFile {
-    Current(HashMap<String, StoredSession>),
-    Legacy(HashMap<String, PlanSession>),
-}
-
 impl Default for BridgeApp {
     fn default() -> Self {
         Self {
-            session_store_path: default_session_store_path(),
+            session_store_path: session::default_session_store_path(),
             approval_policy: ApprovalPolicy::from_env(),
             executor: execute_runnable_intent,
         }
@@ -174,11 +131,15 @@ impl BridgeApp {
         let progress = match mode {
             ExecutionMode::StepByStep => session.execute_next_with_policy(
                 self.executor,
-                |intent| self.approval_policy.requires_approval(intent),
+                |step_index, step_number, intent, run_all_after_approval| {
+                    self.build_approval_request(step_index, step_number, intent, run_all_after_approval)
+                },
             ),
             ExecutionMode::ContinueAll => session.execute_remaining_with_policy(
                 self.executor,
-                |intent| self.approval_policy.requires_approval(intent),
+                |step_index, step_number, intent, run_all_after_approval| {
+                    self.build_approval_request(step_index, step_number, intent, run_all_after_approval)
+                },
             ),
         };
         let stored = self.build_stored_session(
@@ -204,16 +165,16 @@ impl BridgeApp {
         };
 
         let Some(mut session) = stored.plan.take() else {
-            return BridgeResponse::Text(format_stored_session_summary(&stored));
+            return BridgeResponse::Text(reply::format_stored_session_summary(&stored));
         };
 
         let progress = if run_all {
-            session.execute_remaining_with_policy(self.executor, |intent| {
-                self.approval_policy.requires_approval(intent)
+            session.execute_remaining_with_policy(self.executor, |step_index, step_number, intent, run_all_after_approval| {
+                self.build_approval_request(step_index, step_number, intent, run_all_after_approval)
             })
         } else {
-            session.execute_next_with_policy(self.executor, |intent| {
-                self.approval_policy.requires_approval(intent)
+            session.execute_next_with_policy(self.executor, |step_index, step_number, intent, run_all_after_approval| {
+                self.build_approval_request(step_index, step_number, intent, run_all_after_approval)
             })
         };
         stored = self.build_stored_session(
@@ -235,15 +196,15 @@ impl BridgeApp {
         };
 
         let Some(mut session) = stored.plan.take() else {
-            return BridgeResponse::Text(format_stored_session_summary(&stored));
+            return BridgeResponse::Text(reply::format_stored_session_summary(&stored));
         };
 
         if !session.has_pending_approval() {
             return BridgeResponse::Text("⚠️ 当前没有待审批步骤。可以发送「继续」或「执行全部」推进计划。".to_string());
         }
 
-        let progress = session.approve_pending_with_policy(self.executor, |intent| {
-            self.approval_policy.requires_approval(intent)
+        let progress = session.approve_pending_with_policy(self.executor, |step_index, step_number, intent, run_all_after_approval| {
+            self.build_approval_request(step_index, step_number, intent, run_all_after_approval)
         });
         stored = self.build_stored_session(
             if progress.completed { None } else { Some(session.clone()) },
@@ -264,7 +225,7 @@ impl BridgeApp {
         };
 
         let Some(mut session) = stored.plan.take() else {
-            return BridgeResponse::Text(format_stored_session_summary(&stored));
+            return BridgeResponse::Text(reply::format_stored_session_summary(&stored));
         };
 
         if !session.reject_pending() {
@@ -274,7 +235,7 @@ impl BridgeApp {
         stored.plan = None;
         stored.pending_steps = Vec::new();
         stored.last_action = Some("拒绝".to_string());
-        stored.last_result = Some(StoredResult {
+        stored.last_result = Some(session::StoredResult {
             status: "已取消".to_string(),
             summary: "当前待审批任务已被拒绝并取消。".to_string(),
             success: false,
@@ -291,7 +252,7 @@ impl BridgeApp {
             return BridgeResponse::Text("⚠️ 当前没有可回看的任务记录。".to_string());
         };
 
-        BridgeResponse::Text(format_last_failure_reply(&stored))
+        BridgeResponse::Text(reply::format_last_failure_reply(&stored))
     }
 
     fn show_last_result(&self, session_key: &str) -> BridgeResponse {
@@ -299,7 +260,7 @@ impl BridgeApp {
             return BridgeResponse::Text("⚠️ 当前没有可回看的任务记录。".to_string());
         };
 
-        BridgeResponse::Text(format_last_result_reply(&stored))
+        BridgeResponse::Text(reply::format_last_result_reply(&stored))
     }
 
     fn continue_last_file(&self, session_key: &str) -> BridgeResponse {
@@ -330,7 +291,7 @@ impl BridgeApp {
         }
 
         blocks.push(result.to_reply(&format!("读取文件 {path}")));
-        BridgeResponse::Text(format_follow_up_reply("继续文件上下文", &stored, blocks))
+        BridgeResponse::Text(reply::format_follow_up_reply("继续文件上下文", &stored, blocks))
     }
 
     fn show_last_diff(&self, session_key: &str) -> BridgeResponse {
@@ -338,7 +299,7 @@ impl BridgeApp {
             return BridgeResponse::Text("⚠️ 当前没有可回看的任务记录。".to_string());
         };
 
-        BridgeResponse::Text(format_last_diff_reply(&stored))
+        BridgeResponse::Text(reply::format_last_diff_reply(&stored))
     }
 
     fn show_recent_files(&self, session_key: &str) -> BridgeResponse {
@@ -346,7 +307,7 @@ impl BridgeApp {
             return BridgeResponse::Text("⚠️ 当前没有可回看的任务记录。".to_string());
         };
 
-        BridgeResponse::Text(format_recent_files_reply(&stored))
+        BridgeResponse::Text(reply::format_recent_files_reply(&stored))
     }
 
     fn undo_last_patch(&self, session_key: &str) -> BridgeResponse {
@@ -364,7 +325,7 @@ impl BridgeApp {
         stored.current_task = Some("撤回刚才的补丁".to_string());
         stored.pending_steps.clear();
         stored.last_action = Some("撤回补丁".to_string());
-        stored.last_result = Some(StoredResult {
+        stored.last_result = Some(session::StoredResult {
             status: if result.success { "已完成".to_string() } else { "失败暂停".to_string() },
             summary: if result.success {
                 format!("最近一次补丁已撤回，共涉及 {} 个文件。", last_patch.file_paths.len())
@@ -373,16 +334,16 @@ impl BridgeApp {
             },
             success: result.success,
         });
-        stored.last_step = Some(StoredStep {
+        stored.last_step = Some(session::StoredStep {
             description: "撤回刚才的补丁".to_string(),
             reply: reply.clone(),
             success: result.success,
         });
         stored.last_file_path = last_patch.file_paths.first().cloned();
         stored.recent_file_paths = last_patch.file_paths.clone();
-        stored.last_diff = Some(StoredDiff {
+        stored.last_diff = Some(session::StoredDiff {
             description: "撤回刚才的补丁".to_string(),
-            content: truncate_session_text(&last_patch.content, 4000),
+            content: reply::truncate_session_text(&last_patch.content, 4000),
         });
         if result.success {
             stored.last_patch = None;
@@ -400,8 +361,8 @@ impl BridgeApp {
     ) -> BridgeResponse {
         if let Intent::AskAgent { prompt } = &intent {
             let result = vscode::ask_agent(session_key, prompt);
-            let reply = format_agent_reply(task_text, &result);
-            let stored = stored_session_from_agent_result(task_text, &intent, &result, &reply);
+            let reply = reply::format_agent_reply(task_text, &result);
+            let stored = session::stored_session_from_agent_result(task_text, &intent, &result, &reply);
             let _ = self.persist_session(session_key, &stored);
             return BridgeResponse::Text(reply);
         }
@@ -412,7 +373,7 @@ impl BridgeApp {
                 success: result.success,
                 reply: result.to_reply("重置 Copilot 会话"),
             };
-            let progress = progress_from_direct_execution(intent, outcome.clone());
+            let progress = session::progress_from_direct_execution(intent, outcome.clone());
             let stored = self.build_stored_session(None, task_text, "直接执行", &progress);
             let _ = self.persist_session(session_key, &stored);
             return BridgeResponse::Text(outcome.reply);
@@ -420,49 +381,75 @@ impl BridgeApp {
 
         let outcome = (self.executor)(&intent);
         let reply = outcome.reply.clone();
-        let progress = progress_from_direct_execution(intent, outcome);
+        let progress = session::progress_from_direct_execution(intent, outcome);
         let stored = self.build_stored_session(None, task_text, "直接执行", &progress);
         let _ = self.persist_session(session_key, &stored);
         BridgeResponse::Text(reply)
     }
 
-    fn load_session_store(&self) -> HashMap<String, StoredSession> {
-        let Some(path) = self.session_store_path.as_ref() else {
-            return HashMap::new();
-        };
-
-        match std::fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<SessionStoreFile>(&content) {
-                Ok(SessionStoreFile::Current(store)) => store,
-                Ok(SessionStoreFile::Legacy(store)) => store
-                    .into_iter()
-                    .map(|(key, session)| (key, stored_session_from_legacy(session)))
-                    .collect(),
-                Err(_) => HashMap::new(),
-            },
-            Err(_) => HashMap::new(),
+    fn build_approval_request(
+        &self,
+        step_index: usize,
+        step_number: usize,
+        intent: &Intent,
+        run_all_after_approval: bool,
+    ) -> Option<ApprovalRequest> {
+        if !self.approval_policy.requires_approval(intent) {
+            return None;
         }
-    }
 
-    fn save_session_store(&self, store: &HashMap<String, StoredSession>) -> Result<(), String> {
-        let Some(path) = self.session_store_path.as_ref() else {
-            return Err("无法定位会话存储目录".to_string());
+        let (reason, risk_summary) = match intent {
+            Intent::RunShell { .. } => (
+                "shell 命令默认需要人工确认。".to_string(),
+                "会在本地 shell 中执行命令，并可能修改工作区或系统状态。".to_string(),
+            ),
+            Intent::ApplyPatch { .. } => (
+                "补丁会直接修改工作区文件。".to_string(),
+                "会把补丁写入当前仓库中的一个或多个文件。".to_string(),
+            ),
+            Intent::WriteFile { path, .. } => (
+                format!("写入文件 {path} 前需要人工确认。"),
+                format!("会创建或覆盖文件 {path}。"),
+            ),
+            Intent::GitPushAll { .. } => (
+                "推送到远端仓库前需要人工确认。".to_string(),
+                "会提交当前改动并把提交推送到远端。".to_string(),
+            ),
+            Intent::GitPull { .. } => (
+                "拉取远端仓库前需要人工确认。".to_string(),
+                "会把远端变更合入本地工作区。".to_string(),
+            ),
+            Intent::InstallExtension { ext_id } => (
+                format!("安装扩展 {ext_id} 前需要人工确认。"),
+                format!("会在当前 VS Code 环境里安装扩展 {ext_id}。"),
+            ),
+            Intent::UninstallExtension { ext_id } => (
+                format!("卸载扩展 {ext_id} 前需要人工确认。"),
+                format!("会从当前 VS Code 环境里移除扩展 {ext_id}。"),
+            ),
+            _ => (
+                "该步骤已命中当前审批策略。".to_string(),
+                "执行前需要人工确认。".to_string(),
+            ),
         };
 
-        let content = serde_json::to_string_pretty(store)
-            .map_err(|err| format!("序列化计划会话失败: {err}"))?;
-        std::fs::write(path, content).map_err(|err| format!("写入计划会话失败: {err}"))
+        Some(ApprovalRequest {
+            step_index,
+            step_number,
+            intent: intent.clone(),
+            action_label: reply::describe_intent(intent),
+            reason,
+            risk_summary,
+            run_all_after_approval,
+        })
     }
 
     fn load_persisted_session(&self, session_key: &str) -> Option<StoredSession> {
-        let store = self.load_session_store();
-        store.get(session_key).cloned()
+        session::load_persisted_session(self.session_store_path.as_ref(), session_key)
     }
 
     fn persist_session(&self, session_key: &str, session: &StoredSession) -> Result<(), String> {
-        let mut store = self.load_session_store();
-        store.insert(session_key.to_string(), session.clone());
-        self.save_session_store(&store)
+        session::persist_session(self.session_store_path.as_ref(), session_key, session)
     }
 
     fn build_stored_session(
@@ -472,55 +459,7 @@ impl BridgeApp {
         action: &str,
         progress: &PlanProgress,
     ) -> StoredSession {
-        let recent_file_paths = collect_recent_file_paths(progress);
-
-        StoredSession {
-            pending_steps: plan
-                .as_ref()
-                .map(|session| {
-                    session
-                        .pending_steps()
-                        .iter()
-                        .map(describe_intent)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
-            last_action: Some(action.to_string()),
-            last_result: Some(stored_result_from_progress(progress)),
-            last_step: progress.executed.last().map(stored_step_from_execution),
-            last_file_path: recent_file_paths.first().cloned(),
-            recent_file_paths,
-            last_diff: progress
-                .executed
-                .iter()
-                .rev()
-                .find_map(stored_diff_from_execution),
-            last_patch: progress
-                .executed
-                .iter()
-                .rev()
-                .find_map(stored_patch_from_execution),
-            plan,
-        }
-    }
-}
-
-fn progress_from_direct_execution(intent: Intent, outcome: ExecutionOutcome) -> PlanProgress {
-    let success = outcome.success;
-
-    PlanProgress {
-        executed: vec![crate::plan::StepExecution {
-            step_number: 1,
-            intent,
-            outcome,
-        }],
-        total_steps: 1,
-        next_step: if success { 1 } else { 0 },
-        completed: success,
-        paused_on_failure: !success,
-        paused_on_approval: false,
-        approval_intent: None,
+        session::build_stored_session(plan, task_text, action, progress)
     }
 }
 
@@ -546,7 +485,14 @@ fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
         }
     } else if progress.paused_on_failure {
         let failed = plan_failed_step(progress)
-            .map(|step| format!("第 {} / {} 步失败：{}", step.step_number, progress.total_steps, describe_intent(&step.intent)))
+            .map(|step| {
+                format!(
+                    "第 {} / {} 步失败：{}",
+                    step.step_number,
+                    progress.total_steps,
+                    describe_intent(&step.intent)
+                )
+            })
             .unwrap_or_else(|| "计划执行失败并已暂停。".to_string());
         StoredResult {
             status: "失败暂停".to_string(),
@@ -560,449 +506,6 @@ fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
             success: true,
         }
     }
-}
-
-fn stored_session_from_legacy(session: PlanSession) -> StoredSession {
-    let recent_file_paths = session
-        .current_step()
-        .map(paths_for_intent)
-        .unwrap_or_default();
-
-    StoredSession {
-        pending_steps: session
-            .pending_steps()
-            .iter()
-            .map(describe_intent)
-            .collect(),
-        current_task: None,
-        last_result: None,
-        last_action: None,
-        last_step: None,
-        last_file_path: recent_file_paths.first().cloned(),
-        recent_file_paths,
-        last_diff: None,
-        last_patch: None,
-        plan: Some(session),
-    }
-}
-
-fn stored_step_from_execution(step: &crate::plan::StepExecution) -> StoredStep {
-    StoredStep {
-        description: describe_intent(&step.intent),
-        reply: step.outcome.reply.clone(),
-        success: step.outcome.success,
-    }
-}
-
-fn stored_diff_from_execution(step: &crate::plan::StepExecution) -> Option<StoredDiff> {
-    match &step.intent {
-        Intent::GitDiff { .. } | Intent::DiffFiles { .. } => Some(StoredDiff {
-            description: describe_intent(&step.intent),
-            content: step.outcome.reply.clone(),
-        }),
-        Intent::ApplyPatch { patch } if !patch.trim().is_empty() => Some(StoredDiff {
-            description: describe_intent(&step.intent),
-            content: truncate_session_text(patch.trim(), 4000),
-        }),
-        _ => None,
-    }
-}
-
-fn stored_patch_from_execution(step: &crate::plan::StepExecution) -> Option<StoredPatch> {
-    match &step.intent {
-        Intent::ApplyPatch { patch } if !patch.trim().is_empty() => Some(StoredPatch {
-            content: patch.trim().to_string(),
-            file_paths: paths_for_intent(&step.intent),
-        }),
-        _ => None,
-    }
-}
-
-fn paths_for_intent(intent: &Intent) -> Vec<String> {
-    match intent {
-        Intent::OpenFile { path, .. } => vec![path.clone()],
-        Intent::ReadFile { path, .. } => vec![path.clone()],
-        Intent::GitDiff { path } => path.clone().into_iter().collect(),
-        Intent::DiffFiles { file1, file2 } => {
-            let mut paths = vec![file1.clone()];
-            if file2 != file1 {
-                paths.push(file2.clone());
-            }
-            paths
-        }
-        Intent::ApplyPatch { patch } => vscode::extract_patch_paths(patch),
-        _ => Vec::new(),
-    }
-}
-
-fn collect_recent_file_paths(progress: &PlanProgress) -> Vec<String> {
-    let mut paths = Vec::new();
-
-    for step in progress.executed.iter().rev() {
-        for path in paths_for_intent(&step.intent) {
-            if !paths.iter().any(|existing| existing == &path) {
-                paths.push(path);
-            }
-        }
-    }
-
-    paths
-}
-
-fn truncate_session_text(text: &str, max_chars: usize) -> String {
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    if text.chars().count() > max_chars {
-        truncated.push_str("\n… (内容过长已截断)");
-    }
-    truncated
-}
-
-fn summarize_reply_snippet(reply: &str, max_lines: usize, max_chars: usize) -> Option<String> {
-    let lines = reply
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(max_lines)
-        .collect::<Vec<_>>();
-
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut summary = lines.join(" / ");
-    if summary.chars().count() > max_chars {
-        summary = summary.chars().take(max_chars).collect::<String>();
-        summary.push_str("...");
-    }
-
-    Some(summary)
-}
-
-fn format_agent_status(status: &str) -> String {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "answered" => "已回答".to_string(),
-        "working" => "处理中".to_string(),
-        "needs_tool" => "需要工具".to_string(),
-        "waiting_user" => "等待用户".to_string(),
-        "blocked" => "已阻塞".to_string(),
-        "completed" => "已完成".to_string(),
-        other if other.is_empty() => "已回答".to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn agent_result_summary(result: &vscode::AgentAskResult) -> String {
-    result
-        .summary
-        .clone()
-        .or_else(|| summarize_reply_snippet(&result.message, 3, 220))
-        .unwrap_or_else(|| "agent 已返回结果。".to_string())
-}
-
-fn format_agent_reply(task_text: &str, result: &vscode::AgentAskResult) -> String {
-    let mut blocks = vec!["🧭 Agent 任务更新".to_string()];
-
-    if let Some(session_id) = result.session_id.as_deref().filter(|value| !value.trim().is_empty()) {
-        blocks.push(format!("🆔 session: {}", session_id));
-    }
-
-    blocks.push(format!(
-        "🎯 当前任务: {}",
-        task_text.trim().trim_end_matches('\n')
-    ));
-    blocks.push(format!("📌 最近状态: {}", format_agent_status(&result.status)));
-    blocks.push(format!("🧾 上次动作: 问 Copilot  ({}ms)", result.duration_ms));
-
-    if let Some(action) = result.current_action.as_deref().filter(|value| !value.trim().is_empty()) {
-        blocks.push(format!("⚙️ 当前动作: {}", action.trim()));
-    }
-
-    let summary = agent_result_summary(result);
-    if !summary.trim().is_empty() {
-        blocks.push(format!("📌 结果摘要: {}", summary));
-    }
-
-    if !result.related_files.is_empty() {
-        blocks.push(format!("📄 相关文件: {}", result.related_files.join("、")));
-    }
-
-    if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
-        blocks.push(format!("➡️ 下一步建议: {}", next_action.trim()));
-    }
-
-    if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
-        blocks.push(format!("❌ 错误: {}", error.trim()));
-    }
-
-    blocks.push(format!("💬 Agent 回复:\n{}", result.message.trim()));
-    blocks.join("\n\n")
-}
-
-fn stored_session_from_agent_result(
-    task_text: &str,
-    intent: &Intent,
-    result: &vscode::AgentAskResult,
-    reply: &str,
-) -> StoredSession {
-    StoredSession {
-        plan: None,
-        current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
-        pending_steps: Vec::new(),
-        last_result: Some(StoredResult {
-            status: format_agent_status(&result.status),
-            summary: agent_result_summary(result),
-            success: result.success,
-        }),
-        last_action: Some("直接执行".to_string()),
-        last_step: Some(StoredStep {
-            description: describe_intent(intent),
-            reply: reply.to_string(),
-            success: result.success,
-        }),
-        last_file_path: result.related_files.first().cloned(),
-        recent_file_paths: result.related_files.clone(),
-        last_diff: None,
-        last_patch: None,
-    }
-}
-
-fn failure_next_step_hint(stored: &StoredSession) -> String {
-    if let Some(step) = stored.pending_steps.first() {
-        return format!("建议先处理失败点，再继续后面的步骤，例如先回到「{}」。", step);
-    }
-
-    if let Some(path) = stored
-        .recent_file_paths
-        .first()
-        .map(String::as_str)
-        .or(stored.last_file_path.as_deref())
-    {
-        return format!("建议先检查相关文件 {}，确认后再决定重试还是继续追问。", path);
-    }
-
-    "建议先看原始结果里的退出码或报错正文，再决定是重试、改文件还是调整命令。".to_string()
-}
-
-fn result_next_step_hint(stored: &StoredSession) -> String {
-    if let Some(path) = stored
-        .recent_file_paths
-        .first()
-        .map(String::as_str)
-        .or(stored.last_file_path.as_deref())
-    {
-        return format!("如果要继续这个上下文，可以直接继续处理 {}，或再追问最近 diff。", path);
-    }
-
-    if let Some(step) = stored.pending_steps.first() {
-        return format!("如果要继续推进任务，下一步可以先执行「{}」。", step);
-    }
-
-    "如果这就是你要的结果，可以继续追问 diff、文件上下文，或直接发下一条开发指令。".to_string()
-}
-
-fn continuation_next_step_hint(stored: &StoredSession) -> String {
-    if let Some(step) = stored.pending_steps.first() {
-        return format!("当前最直接的下一步是「{}」。", step);
-    }
-
-    if let Some(path) = stored
-        .recent_file_paths
-        .first()
-        .map(String::as_str)
-        .or(stored.last_file_path.as_deref())
-    {
-        if stored.last_diff.is_some() {
-            return format!("可以先回到 {}，结合最近 diff 继续判断是否还要改动。", path);
-        }
-
-        return format!("可以先回到 {}，继续围绕这个文件追问或修改。", path);
-    }
-
-    if stored.last_step.is_some() {
-        return "可以先追问上一步结果，再决定是否继续执行新命令。".to_string();
-    }
-
-    "可以直接发下一条开发指令，或先追问最近结果和文件上下文。".to_string()
-}
-
-fn format_stored_session_summary(stored: &StoredSession) -> String {
-    let Some(result) = stored.last_result.as_ref() else {
-        return "⚠️ 当前没有待继续的计划。".to_string();
-    };
-
-    let mut blocks = vec![format!("📌 任务结果: {}", result.summary)];
-
-    if let Some(last_step) = stored.last_step.as_ref() {
-        blocks.push(format!("🧾 最近一步: {}", last_step.description));
-        if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 2, 180) {
-            blocks.push(format!("🔎 最近结果摘要: {}", snippet));
-        }
-    }
-
-    if let Some(path) = stored
-        .recent_file_paths
-        .first()
-        .map(String::as_str)
-        .or(stored.last_file_path.as_deref())
-    {
-        blocks.push(format!("📄 当前聚焦文件: {}", path));
-    }
-
-    if stored.recent_file_paths.len() > 1 {
-        blocks.push(format!("🗂 最近文件队列: {}", stored.recent_file_paths.join("、")));
-    }
-
-    if let Some(last_diff) = stored.last_diff.as_ref() {
-        blocks.push(format!("🧩 最近 diff: {}", last_diff.description));
-        if let Some(snippet) = summarize_reply_snippet(&last_diff.content, 3, 220) {
-            blocks.push(format!("🔎 diff 摘要: {}", snippet));
-        }
-    }
-
-    if let Some(next_step) = stored.pending_steps.first() {
-        blocks.push(format!("⏭ 下一步: {}", next_step));
-        if stored.pending_steps.len() > 1 {
-            blocks.push(format!(
-                "📦 后续步骤: {}",
-                stored.pending_steps.iter().skip(1).take(3).cloned().collect::<Vec<_>>().join("；")
-            ));
-        }
-    }
-
-    blocks.push(format!("➡️ 下一步建议: {}", continuation_next_step_hint(stored)));
-
-    format_follow_up_reply("任务连续性回放", stored, blocks)
-}
-
-fn format_last_failure_reply(stored: &StoredSession) -> String {
-    let Some(last_result) = stored.last_result.as_ref() else {
-        return "⚠️ 当前没有可回看的失败记录。".to_string();
-    };
-
-    if last_result.success {
-        return format_follow_up_reply(
-            "失败原因回放",
-            stored,
-            vec![
-                "✅ 上一次任务没有失败。".to_string(),
-                format!("📌 最近结果: {}", last_result.summary),
-            ],
-        );
-    }
-
-    let mut blocks = vec![
-        format!("❌ 上次失败状态: {}", last_result.status),
-        format!("📌 失败摘要: {}", last_result.summary),
-    ];
-
-    if let Some(last_step) = stored.last_step.as_ref() {
-        blocks.push(format!("📍 卡住的位置: {}", last_step.description));
-        if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 3, 220) {
-            blocks.push(format!("🔎 关键报错: {}", snippet));
-        }
-        blocks.push(format!("🧾 失败步骤: {}", last_step.description));
-        blocks.push(format!("➡️ 下一步建议: {}", failure_next_step_hint(stored)));
-        blocks.push(format!("📤 原始结果:\n{}", last_step.reply));
-    } else {
-        blocks.push(format!("➡️ 下一步建议: {}", failure_next_step_hint(stored)));
-    }
-
-    format_follow_up_reply("失败原因回放", stored, blocks)
-}
-
-fn format_last_result_reply(stored: &StoredSession) -> String {
-    let Some(last_step) = stored.last_step.as_ref() else {
-        return format_stored_session_summary(stored);
-    };
-
-    let mut blocks = vec![format!(
-        "🧾 上一步结果: {}",
-        if last_step.success { "成功" } else { "失败" }
-    )];
-    blocks.push(format!(
-        "📎 导语: 上一步已经{}，这里先给你摘要，再附上原始结果。",
-        if last_step.success { "完成" } else { "返回失败结果" }
-    ));
-    blocks.push(format!("📌 上一步: {}", last_step.description));
-    if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 3, 220) {
-        blocks.push(format!("🔎 结果摘要: {}", snippet));
-    }
-    blocks.push(format!("➡️ 下一步建议: {}", result_next_step_hint(stored)));
-    blocks.push(format!("📤 原始结果:\n{}", last_step.reply));
-
-    if let Some(path) = stored.last_file_path.as_deref() {
-        blocks.push(format!("📄 相关文件: {}", path));
-    }
-    if stored.recent_file_paths.len() > 1 {
-        blocks.push(format!("🗂 最近文件列表: {}", stored.recent_file_paths.join("、")));
-    }
-
-    format_follow_up_reply("上一步结果回放", stored, blocks)
-}
-
-fn format_last_diff_reply(stored: &StoredSession) -> String {
-    let Some(last_diff) = stored.last_diff.as_ref() else {
-        return "⚠️ 最近一次任务里没有记录到 diff 或补丁内容。可以先发送「查看 diff」或「应用补丁 ...」。".to_string();
-    };
-
-    let mut blocks = vec![format!("🧩 最近一次 diff: {}", last_diff.description)];
-    if !stored.recent_file_paths.is_empty() {
-        blocks.push(format!("📄 相关文件: {}", stored.recent_file_paths.join("、")));
-    }
-    blocks.push(format!("📤 diff 内容:\n{}", last_diff.content));
-
-    format_follow_up_reply("最近 diff 回放", stored, blocks)
-}
-
-fn format_recent_files_reply(stored: &StoredSession) -> String {
-    if stored.recent_file_paths.is_empty() {
-        return "⚠️ 最近一次任务里没有记录到文件列表。可以先发送「读取 <文件>」、「查看 diff」或「应用补丁 ...」。".to_string();
-    }
-
-    let mut blocks = vec![format!("📚 最近改动文件列表（{}）", stored.recent_file_paths.len())];
-    blocks.extend(
-        stored
-            .recent_file_paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| format!("{}. {}", index + 1, path)),
-    );
-
-    format_follow_up_reply("最近文件回放", stored, blocks)
-}
-
-fn format_follow_up_reply(title: &str, stored: &StoredSession, detail_blocks: Vec<String>) -> String {
-    let mut blocks = vec![format!("🧭 {}", title)];
-    blocks.push(format!(
-        "🎯 当前任务: {}",
-        stored
-            .current_task
-            .as_deref()
-            .filter(|task| !task.is_empty())
-            .unwrap_or("(未记录任务描述)")
-    ));
-
-    if let Some(last_result) = stored.last_result.as_ref() {
-        blocks.push(format!("📌 最近状态: {}", last_result.status));
-    }
-
-    if let Some(last_action) = stored.last_action.as_deref().filter(|action| !action.is_empty()) {
-        blocks.push(format!("🧾 上次动作: {}", last_action));
-    }
-
-    blocks.extend(
-        detail_blocks
-            .into_iter()
-            .filter(|block| !block.trim().is_empty()),
-    );
-
-    blocks.join("\n\n")
-}
-
-fn default_session_store_path() -> Option<PathBuf> {
-    std::env::current_dir()
-        .ok()
-        .map(|dir| dir.join(".feishu-vscode-bridge-session.json"))
 }
 
 fn default_audit_log_path() -> Option<PathBuf> {
@@ -1061,7 +564,7 @@ pub fn new_audit_entry(
         command: command.to_string(),
         action_name: None,
         response_kind: response_kind(response).to_string(),
-        response_preview: truncate_session_text(render_bridge_response(response), 300),
+        response_preview: reply::truncate_session_text(render_bridge_response(response), 300),
         result_status: None,
         result_summary: None,
         success: error.is_none(),
@@ -1093,7 +596,7 @@ fn new_plan_action_audit_entry(
         command: action_name.to_string(),
         action_name: Some(action_name.to_string()),
         response_kind: response_kind(response).to_string(),
-        response_preview: truncate_session_text(render_bridge_response(response), 300),
+        response_preview: reply::truncate_session_text(render_bridge_response(response), 300),
         result_status: result.map(|item| item.status.clone()),
         result_summary: result.map(|item| item.summary.clone()).or_else(|| {
             progress.map(|item| stored_result_from_progress(item).summary)
@@ -1191,13 +694,15 @@ fn format_plan_reply(
         ));
     }
 
-    if let Some(approval_intent) = progress.approval_intent.as_ref() {
+    if let Some(approval_request) = progress.approval_request.as_ref() {
         lines.push(format!(
             "🔐 待审批步骤: 第 {} / {} 步 - {}",
-            progress.next_step + 1,
+            approval_request.step_number,
             progress.total_steps,
-            describe_intent(approval_intent)
+            approval_request.action_label
         ));
+        lines.push(format!("📝 审批原因: {}", approval_request.reason));
+        lines.push(format!("⚠️ 风险提示: {}", approval_request.risk_summary));
     }
 
     lines.push("📝 本次执行: ".to_string());
@@ -1398,16 +903,18 @@ fn build_plan_card(
         }));
     }
 
-    if let Some(approval_intent) = progress.approval_intent.as_ref() {
+    if let Some(approval_request) = progress.approval_request.as_ref() {
         elements.push(json!({
             "tag": "div",
             "text": {
                 "tag": "lark_md",
                 "content": format!(
-                    "**待审批步骤**\n第 {} / {} 步：{}",
-                    progress.next_step + 1,
+                    "**待审批步骤**\n第 {} / {} 步：{}\n\n**审批原因**\n{}\n\n**风险提示**\n{}",
+                    approval_request.step_number,
                     progress.total_steps,
-                    describe_intent(approval_intent)
+                    approval_request.action_label,
+                    approval_request.reason,
+                    approval_request.risk_summary
                 )
             }
         }));
@@ -2046,7 +1553,7 @@ mod tests {
             completed: true,
             paused_on_failure: false,
             paused_on_approval: false,
-            approval_intent: None,
+            approval_request: None,
         };
 
         let stored = stored_task("执行计划 $ pwd", "已完成", "计划已完成，共执行 1 步。");
@@ -2080,7 +1587,7 @@ mod tests {
             completed: false,
             paused_on_failure: true,
             paused_on_approval: false,
-            approval_intent: None,
+            approval_request: None,
         };
 
         let stored = stored_task("执行全部 $ false; $ pwd", "失败暂停", "第 2 / 3 步失败：执行命令 false");
@@ -2107,7 +1614,15 @@ mod tests {
             completed: false,
             paused_on_failure: false,
             paused_on_approval: true,
-            approval_intent: Some(shell_intent("pwd")),
+            approval_request: Some(ApprovalRequest {
+                step_index: 0,
+                step_number: 1,
+                intent: shell_intent("pwd"),
+                action_label: "执行命令 pwd".to_string(),
+                reason: "shell 命令默认需要人工确认。".to_string(),
+                risk_summary: "会在本地 shell 中执行命令，并可能修改工作区或系统状态。".to_string(),
+                run_all_after_approval: false,
+            }),
         };
 
         let stored = stored_task("执行计划 git pull", "待审批", "第 1 / 1 步等待批准。");
@@ -2342,7 +1857,7 @@ mod tests {
             completed: true,
             paused_on_failure: false,
             paused_on_approval: false,
-            approval_intent: None,
+            approval_request: None,
         };
 
         let stored = app.build_stored_session(None, "应用补丁", "执行计划", &progress);
@@ -2371,7 +1886,7 @@ mod tests {
             completed: true,
             paused_on_failure: false,
             paused_on_approval: false,
-            approval_intent: None,
+            approval_request: None,
         };
 
         let stored = app.build_stored_session(None, "应用补丁", "执行计划", &progress);
@@ -2449,7 +1964,7 @@ mod tests {
             completed: true,
             paused_on_failure: false,
             paused_on_approval: false,
-            approval_intent: None,
+            approval_request: None,
         };
         let stored = StoredSession {
             plan: None,

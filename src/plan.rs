@@ -2,10 +2,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::Intent;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingApproval {
-    step_index: usize,
-    run_all_after_approval: bool,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub step_index: usize,
+    pub step_number: usize,
+    pub intent: Intent,
+    pub action_label: String,
+    pub reason: String,
+    pub risk_summary: String,
+    pub run_all_after_approval: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -29,14 +34,14 @@ pub struct PlanProgress {
     pub completed: bool,
     pub paused_on_failure: bool,
     pub paused_on_approval: bool,
-    pub approval_intent: Option<Intent>,
+    pub approval_request: Option<ApprovalRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanSession {
     steps: Vec<Intent>,
     next_step: usize,
-    pending_approval: Option<PendingApproval>,
+    pending_approval: Option<ApprovalRequest>,
 }
 
 impl PlanSession {
@@ -84,13 +89,17 @@ impl PlanSession {
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
     {
-        self.execute_next_with_policy(&mut executor, |_| false)
+        self.execute_next_with_policy(&mut executor, |_, _, _, _| None)
     }
 
-    pub fn execute_next_with_policy<F, G>(&mut self, mut executor: F, mut requires_approval: G) -> PlanProgress
+    pub fn execute_next_with_policy<F, G>(
+        &mut self,
+        mut executor: F,
+        mut approval_request: G,
+    ) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
-        G: FnMut(&Intent) -> bool,
+        G: FnMut(usize, usize, &Intent, bool) -> Option<ApprovalRequest>,
     {
         if let Some(progress) = self.pending_approval_progress() {
             return progress;
@@ -104,44 +113,52 @@ impl PlanSession {
                 completed: true,
                 paused_on_failure: false,
                 paused_on_approval: false,
-                approval_intent: None,
+                approval_request: None,
             };
         }
 
-        self.execute_internal(1, false, None, &mut executor, &mut requires_approval)
+        self.execute_internal(1, false, None, &mut executor, &mut approval_request)
     }
 
     pub fn execute_remaining<F>(&mut self, mut executor: F) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
     {
-        self.execute_remaining_with_policy(&mut executor, |_| false)
+        self.execute_remaining_with_policy(&mut executor, |_, _, _, _| None)
     }
 
-    pub fn execute_remaining_with_policy<F, G>(&mut self, mut executor: F, mut requires_approval: G) -> PlanProgress
+    pub fn execute_remaining_with_policy<F, G>(
+        &mut self,
+        mut executor: F,
+        mut approval_request: G,
+    ) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
-        G: FnMut(&Intent) -> bool,
+        G: FnMut(usize, usize, &Intent, bool) -> Option<ApprovalRequest>,
     {
         if let Some(progress) = self.pending_approval_progress() {
             return progress;
         }
 
         let max_steps = self.remaining_steps();
-        self.execute_internal(max_steps, true, None, &mut executor, &mut requires_approval)
+        self.execute_internal(max_steps, true, None, &mut executor, &mut approval_request)
     }
 
     pub fn approve_pending<F>(&mut self, mut executor: F) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
     {
-        self.approve_pending_with_policy(&mut executor, |_| false)
+        self.approve_pending_with_policy(&mut executor, |_, _, _, _| None)
     }
 
-    pub fn approve_pending_with_policy<F, G>(&mut self, mut executor: F, mut requires_approval: G) -> PlanProgress
+    pub fn approve_pending_with_policy<F, G>(
+        &mut self,
+        mut executor: F,
+        mut approval_request: G,
+    ) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
-        G: FnMut(&Intent) -> bool,
+        G: FnMut(usize, usize, &Intent, bool) -> Option<ApprovalRequest>,
     {
         let Some(pending) = self.pending_approval.take() else {
             return self.pending_approval_progress().unwrap_or_else(|| PlanProgress {
@@ -151,7 +168,7 @@ impl PlanSession {
                 completed: self.is_complete(),
                 paused_on_failure: false,
                 paused_on_approval: false,
-                approval_intent: None,
+                approval_request: None,
             });
         };
 
@@ -166,7 +183,7 @@ impl PlanSession {
             pending.run_all_after_approval,
             Some(pending.step_index),
             &mut executor,
-            &mut requires_approval,
+            &mut approval_request,
         )
     }
 
@@ -175,8 +192,7 @@ impl PlanSession {
     }
 
     fn pending_approval_progress(&self) -> Option<PlanProgress> {
-        let pending = self.pending_approval.as_ref()?;
-        let approval_intent = self.steps.get(pending.step_index)?.clone();
+        let pending = self.pending_approval.as_ref()?.clone();
 
         Some(PlanProgress {
             executed: Vec::new(),
@@ -185,7 +201,7 @@ impl PlanSession {
             completed: false,
             paused_on_failure: false,
             paused_on_approval: true,
-            approval_intent: Some(approval_intent),
+            approval_request: Some(pending),
         })
     }
 
@@ -195,7 +211,7 @@ impl PlanSession {
         run_all_after_approval: bool,
         skip_approval_for_step: Option<usize>,
         executor: &mut F,
-        requires_approval: &mut dyn FnMut(&Intent) -> bool,
+        approval_request: &mut dyn FnMut(usize, usize, &Intent, bool) -> Option<ApprovalRequest>,
     ) -> PlanProgress
     where
         F: FnMut(&Intent) -> ExecutionOutcome,
@@ -204,7 +220,7 @@ impl PlanSession {
         let total_steps = self.total_steps();
         let mut paused_on_failure = false;
         let mut paused_on_approval = false;
-        let mut approval_intent = None;
+        let mut pending_request = None;
 
         for _ in 0..max_steps {
             if self.is_complete() {
@@ -214,14 +230,18 @@ impl PlanSession {
             let step_number = self.next_step + 1;
             let intent = self.steps[self.next_step].clone();
 
-            if requires_approval(&intent) && Some(self.next_step) != skip_approval_for_step {
-                self.pending_approval = Some(PendingApproval {
-                    step_index: self.next_step,
+            if Some(self.next_step) != skip_approval_for_step {
+                if let Some(request) = approval_request(
+                    self.next_step,
+                    step_number,
+                    &intent,
                     run_all_after_approval,
-                });
-                paused_on_approval = true;
-                approval_intent = Some(intent);
-                break;
+                ) {
+                    self.pending_approval = Some(request.clone());
+                    paused_on_approval = true;
+                    pending_request = Some(request);
+                    break;
+                }
             }
 
             let outcome = executor(&intent);
@@ -249,7 +269,7 @@ impl PlanSession {
             completed: self.is_complete() && !paused_on_approval,
             paused_on_failure,
             paused_on_approval,
-            approval_intent,
+            approval_request: pending_request,
         }
     }
 }
@@ -280,6 +300,7 @@ mod tests {
         assert!(!progress.completed);
         assert!(!progress.paused_on_failure);
         assert!(!progress.paused_on_approval);
+        assert!(progress.approval_request.is_none());
     }
 
     #[test]
@@ -307,6 +328,7 @@ mod tests {
         assert!(progress.paused_on_failure);
         assert!(!progress.completed);
         assert!(!progress.paused_on_approval);
+        assert!(progress.approval_request.is_none());
     }
 
     #[test]
@@ -320,13 +342,33 @@ mod tests {
                 success: true,
                 reply: "ok".to_string(),
             },
-            |intent| matches!(intent, Intent::RunShell { .. }),
+            |step_index, step_number, intent, run_all_after_approval| match intent {
+                Intent::RunShell { .. } => Some(ApprovalRequest {
+                    step_index,
+                    step_number,
+                    intent: intent.clone(),
+                    action_label: "执行命令 pwd".to_string(),
+                    reason: "shell 命令默认需要人工确认。".to_string(),
+                    risk_summary: "会在本地 shell 中执行命令。".to_string(),
+                    run_all_after_approval,
+                }),
+                _ => None,
+            },
         );
 
         assert!(progress.executed.is_empty());
         assert!(progress.paused_on_approval);
         assert!(!progress.paused_on_failure);
-        assert_eq!(progress.approval_intent, Some(Intent::RunShell { cmd: "pwd".to_string() }));
+        assert_eq!(progress.approval_request.as_ref().map(|request| request.step_number), Some(1));
+        assert_eq!(
+            progress
+                .approval_request
+                .as_ref()
+                .map(|request| request.intent.clone()),
+            Some(Intent::RunShell {
+                cmd: "pwd".to_string()
+            })
+        );
         assert!(session.has_pending_approval());
     }
 
@@ -341,7 +383,18 @@ mod tests {
                 success: true,
                 reply: "ok".to_string(),
             },
-            |intent| matches!(intent, Intent::RunShell { .. }),
+            |step_index, step_number, intent, run_all_after_approval| match intent {
+                Intent::RunShell { .. } => Some(ApprovalRequest {
+                    step_index,
+                    step_number,
+                    intent: intent.clone(),
+                    action_label: "执行命令 pwd".to_string(),
+                    reason: "shell 命令默认需要人工确认。".to_string(),
+                    risk_summary: "会在本地 shell 中执行命令。".to_string(),
+                    run_all_after_approval,
+                }),
+                _ => None,
+            },
         );
 
         let progress = session.approve_pending_with_policy(
@@ -349,12 +402,13 @@ mod tests {
                 success: true,
                 reply: "ok".to_string(),
             },
-            |intent| matches!(intent, Intent::RunShell { .. }),
+            |_, _, _, _| None,
         );
 
         assert_eq!(progress.executed.len(), 1);
         assert!(progress.completed);
         assert!(!progress.paused_on_approval);
+        assert!(progress.approval_request.is_none());
         assert!(!session.has_pending_approval());
     }
 }
