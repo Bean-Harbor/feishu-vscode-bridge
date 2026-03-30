@@ -7,11 +7,11 @@
 ## Product Target
 
 - 用户在飞书里获得接近 VS Code Copilot Chat agent 的连续工作体验，而不是只得到一次性问答
-- 优先打通“远程发问 -> VS Code 侧建立 agent 会话 -> 获取编辑器上下文 -> 模型回复 -> 需要时调用本地工具 -> 回飞书”的主链路
+- 优先打通“远程发起任务 -> VS Code 侧建立 agent 会话 -> 获取编辑器上下文 -> 模型判断下一步 -> 必要时调用本地工具 -> 回飞书”的主链路
 - 继续复用当前仓库已经完成的 Feishu 卡片、审批、计划执行、审计、会话持久化与本地工具执行能力
 - 明确区分两层能力：
-  - `ask bridge`：一次性提问与回答
-  - `agent bridge`：可持续推进任务、读写工作区、调用工具、恢复上下文
+  - `agent bootstrap`：当前已实现的入口层，负责把任务送进 agent 会话并建立基础上下文
+  - `agent bridge`：最终目标层，负责持续推进任务、读写工作区、调用工具、恢复上下文
 
 ## Implementation Base
 
@@ -50,14 +50,14 @@
 
 ### Objective
 
-先建立 remote agent bridge 的基础连接能力，让 VS Code 侧 companion extension 能作为本地 agent runtime 存在，并让 Rust bridge 能向它发起一次会话式提问。
+先建立 remote agent bridge 的基础连接能力，让 VS Code 侧 companion extension 能作为本地 agent runtime 存在，并让 Rust bridge 能把一个飞书任务送进 agent 会话。
 
 ### Scope
 
 - 新增 VS Code companion extension 工程
 - 提供本地 bridge server
   - 接收来自 Rust / Feishu bridge 的会话请求
-  - 暴露健康检查与基础 ask 接口
+  - 暴露健康检查与基础 agent bootstrap 接口
 - 使用 VS Code Language Model API / Copilot model 发起请求
 - 维护最小 session store
   - `session_id`
@@ -79,13 +79,13 @@
 - Rust bridge 把消息转给 extension
 - extension 建立 / 复用 `session_id`
 - extension 读取 active editor context
-- extension 调用 Copilot model，返回文本答案
-- Rust bridge 把回复回给飞书
+- extension 调用 Copilot model，返回第一阶段判断或答案
+- Rust bridge 把阶段结果回给飞书
 
 ### Acceptance Criteria
 
 - 本地 extension 可被激活并启动 bridge server
-- 能处理至少 1 条 ask-style 会话请求
+- 能处理至少 1 条 agent bootstrap 请求
 - 能返回来自 Copilot / LM API 的模型回答
 - 会话 ID 在多次请求之间可复用
 - `cargo test` 仍通过；extension 能完成本地 smoke
@@ -94,7 +94,7 @@
 
 ### Objective
 
-把 ask-style 单次调用升级成真正的 bridge session，让飞书里的连续追问能映射到 VS Code extension 侧的同一会话历史。
+把当前 bootstrap 调用升级成真正的 bridge session，让飞书里的连续任务推进能映射到 VS Code extension 侧的同一会话历史。
 
 ### Scope
 
@@ -108,15 +108,15 @@
 
 ### Why Second
 
-- 这是从 `ask bridge` 迈向 `agent bridge` 的分水岭
-- 没有稳定 session，后续的 agent 编排只能退化成一问一答
+- 这是从 `agent bootstrap` 迈向 `agent bridge` 的分水岭
+- 没有稳定 session，后续的 agent 编排只能退化成连续问答
 
 ### Expected User Flows
 
 - 飞书发送：`这个报错先别改，告诉我根因`
 - 接着发送：`那最小修复方案呢`
 - 接着发送：`先只改测试，不动主逻辑`
-- extension 会在同一 session 下持续理解上下文，而不是每次当成新问题
+- extension 会在同一 session 下持续理解上下文与任务约束，而不是每次当成新问题
 
 ### Acceptance Criteria
 
@@ -216,14 +216,14 @@
 ### Acceptance Criteria
 
 - 新用户按文档可在一台机器上完成 setup
-- 能完成 1 条 ask-style smoke 和 1 条 agent-style smoke
+- 能完成 1 条 agent bootstrap smoke 和 1 条 agent loop smoke
 
 ## Suggested Build Order
 
 1. M0 已完成：Feishu 命令桥、会话、卡片、审批、审计、工作区工具
 2. A0.1 新增 companion extension 工程骨架
 3. A0.2 在 extension 内启动本地 bridge server
-4. A0.3 用 Copilot / LM API 跑通单次 ask 请求
+4. A0.3 用 Copilot / LM API 跑通单次 agent bootstrap 请求
 5. A1.1 建立 session 映射与历史复用
 6. A2.1 注入 active editor / selection / diagnostics
 7. A3.1 定义 extension <-> Rust tool protocol
@@ -240,4 +240,4 @@
 
 ## How To Resume Later
 
-后续如果上下文丢失，直接把当前仓库视为“命令桥已完成，agent bridge 未开始”的状态继续推进。第一优先级不是再给 Rust 增加更多零散命令，而是完成 A0：落 companion extension、建立本地 bridge server、打通一条 ask-style Copilot / LM 请求。A0 完成后，再继续 A1 session、A2 上下文、A3 工具回路。
+后续如果上下文丢失，直接把当前仓库视为“命令桥已完成，agent bridge 基础层已开始但完整 agent loop 未完成”的状态继续推进。第一优先级不是再给 Rust 增加更多零散命令，而是完成 A0：落 companion extension、建立本地 bridge server、打通一条 agent bootstrap Copilot / LM 请求。A0 完成后，再继续 A1 session、A2 上下文、A3 工具回路。

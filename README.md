@@ -1,25 +1,68 @@
 # Feishu VS Code Bridge
 
-A standalone open-source Rust project for bridging Feishu commands to local VS Code development actions.
+An open-source local agent bridge that currently ships its first public entry point as a VS Code companion extension plus a Feishu bridge runtime.
 
 This repository focuses on:
 
-- Shipping a standalone Feishu <-> VS Code Copilot bridge that users can try independently
+- Shipping the first usable public entry point of a local agent product
 - Enabling remote Copilot-assisted development from Feishu
-- Keeping scope centered on chat-to-editor workflow reliability, setup, and publishability
+- Proving a chat-to-local-agent workflow before expanding to more entry points
 
-It is not intended to expand into unrelated device-control or local-agent-control scope inside this repository unless that direction is explicitly revisited later.
-
-- Intent parsing for chat commands
-- Plan execution with step-by-step mode
-- Continue-all mode (`执行全部`) for one-shot execution
-- Safe pause-on-failure behavior
+This repository is the current VS Code + Feishu delivery surface of a broader local agent direction, not the final product boundary.
 
 ## Product Positioning
 
-- Current goal: publish a standalone bridge so users can experience Feishu remote connection to VS Code Copilot first
-- Current non-goal: adding unrelated device-control capabilities into this repository
+- Product core: local agent runtime, orchestration, skills, approvals, and memory
+- First entry point: VS Code extension
+- Second entry point: Feishu
+- Future entry points: desktop app, menu bar, browser bridge, and system-level operations
+- First release packaging goal: ship a user-facing installer instead of exposing raw binaries, scripts, and config files
+- Platform priority: Windows and macOS must both be planned as first-class install targets because the core daily-user workflow already spans both systems
+- Current goal: release the fastest credible MVP through the VS Code extension plus Feishu bridge path, then validate real user demand before expanding the product surface
+- Current non-goal: treating the VS Code extension as the final product definition
 
+## Product Architecture
+
+- Product body: local runtime plus orchestration layer
+- Interface layer: VS Code companion extension, Feishu bridge, and future clients
+- Safety layer: approvals, audit log, scoped execution, and session isolation
+- Memory layer: persisted session state, recent context, and future reusable skills/memory primitives
+- Expansion path: once the core runtime is stable, additional entry points can reuse the same local agent foundation instead of rebuilding behavior per client
+
+## Distribution Strategy
+
+- User-facing form: one installer per platform, not a loose collection of binaries, scripts, `.env` files, and manual steps
+- Windows target form: signed `Setup.exe`
+- macOS target form: signed `.dmg` carrying a setup app, with optional later move to `.pkg` only if background-service registration needs it
+- Internal packaged components: local runtime binary, setup UI, configuration template, logs directory bootstrap, and VS Code companion extension install path
+- Installation principle: users should experience one guided install flow even if the product is internally composed of multiple components
+
+## Installer Responsibilities
+
+- Detect whether VS Code is installed
+- Guide the user to install VS Code if it is missing
+- Install or update the VS Code companion extension through a controlled path such as Marketplace or bundled `.vsix`
+- Collect and persist Feishu configuration
+- Validate local prerequisites and show a short recovery path on failure
+- Start or register the local runtime in a way appropriate for the platform
+
+## Platform Packaging Plan
+
+- Windows: `Setup.exe` installs the runtime, performs first-run configuration, installs or upgrades the companion extension, and creates a Start Menu entry
+- macOS: `.dmg` installs a setup app that performs the same first-run flow, handles VS Code detection, guides extension install, and creates a predictable local runtime location
+- Platform parity requirement: the first public install experience cannot be Windows-only in product definition even if Windows is the first external beta channel
+- Release sequencing rule: if a capability is required in the day-to-day workflow on both Windows and macOS, it must be designed once and mapped to both installers before release
+
+## Current Installer Decisions
+
+- Windows installer technology: NSIS, because it is straightforward for a single `Setup.exe`, supports silent install, shortcuts, bundled payloads, and later auto-update friendly flows
+- macOS installer technology: signed `.dmg` built around a setup app, because the current product still behaves like an app-guided bootstrapper rather than a system package
+- Companion extension delivery: bundle a `.vsix` when available and fall back to Marketplace/open-install guidance when direct local install is unavailable
+
+Initial packaging script entry points:
+
+- Windows: `scripts/package-windows-installer.ps1`
+- macOS: `scripts/package-macos-installer.sh`
 
 ## Quick Start
 
@@ -58,6 +101,12 @@ Compatibility status:
 - macOS: uses native macOS dialog windows via `osascript`, including download-and-retry guidance for missing VS Code and terminal fallback when native dialogs are unavailable
 - Linux: code path implemented and checked in CI with `cargo check --bin setup-gui`
 
+Current installer status:
+
+- Windows: setup flow exists in code, but final packaged installer output is not yet wired into a release artifact
+- macOS: setup flow exists in code, but final `.dmg` packaging, signing, and first-run ergonomics still need to be completed
+- Current gap: the repository can be run by developers today, but the end-user installation surface still needs productized packaging on both primary platforms
+
 ## Current Scope
 
 - Core command parsing, plan execution, and bridge runtime engine (Rust)
@@ -70,12 +119,12 @@ Compatibility status:
 - Configurable default workspace path for Git operations
 - JSONL audit logging for Feishu inbound messages and card callbacks, including session key, sender, command, reply kind, and send outcome
 - Workspace read/search/test/change tools: `读取`, `列出`, `搜索`, `搜索符号`, `查找引用`, `查找实现`, `运行测试`, `运行指定测试`, `运行测试文件`, `写入文件`, `查看 diff`, `应用补丁`, `git log`, `git blame`
-- Experimental ask-style bridge command: `问 Copilot <问题>` forwards a prompt to the local companion extension under `vscode-agent-bridge/` and returns the model reply to Feishu
+- Early agent bootstrap commands: `问 Copilot <问题>` currently enters the first implemented agent path through the local companion extension under `vscode-agent-bridge/`, and `重置 Copilot 会话` clears the current Feishu session's extension-side bootstrap history so the next agent turn starts fresh
 - Patch rollback support via reverse apply of the latest remembered patch
 - Minimal CLI demo executor
 - Native desktop setup GUI for initial configuration
 
-Companion extension setup notes: see [vscode-agent-bridge/README.md](/Users/beanw/OpenSource/feishu-vscode-bridge/vscode-agent-bridge/README.md) for the local Node.js prerequisite, build steps, and extension-host launch flow for the remote agent bridge.
+Companion extension setup notes: see [vscode-agent-bridge/README.md](vscode-agent-bridge/README.md) for the local Node.js prerequisite, build steps, and extension-host launch flow for the remote agent bridge.
 
 ## Plan Commands
 
@@ -87,7 +136,9 @@ Ultra-short group notice: see `docs/feishu_group_notice.md` for a minimal pinned
 
 Live regression checklist: see `docs/feishu_live_regression_checklist.md` for a repeatable real-Feishu validation pass before or after shipping bridge changes.
 
-For the companion-extension launch flow used by the remote agent bridge, see [vscode-agent-bridge/README.md](/Users/beanw/OpenSource/feishu-vscode-bridge/vscode-agent-bridge/README.md).
+MVP release plan: see `docs/mvp_release_plan.md` for the current product framing, scope boundaries, and release sequence.
+
+For the companion-extension launch flow used by the remote agent bridge, see [vscode-agent-bridge/README.md](vscode-agent-bridge/README.md).
 
 - `执行计划 <命令1>; <命令2>`: execute exactly one step, then pause
 - `继续`: execute the next pending step, or retry the failed step
@@ -125,6 +176,7 @@ Workspace examples:
 运行测试
 运行测试 cargo test --lib
 问 Copilot parse_intent 这个函数是干什么的
+重置 Copilot 会话
 运行指定测试 parse_search
 运行测试文件 tests/approval_card_flow.rs
 写入文件 scratch/demo.txt
@@ -158,6 +210,8 @@ Session notes:
 - 飞书计划现在按 `chat_id + sender_id` 隔离，群聊里不同发送者不会共享同一份上下文
 - 会话会持久化 `current_task`、`pending_steps`、`last_result`、`last_action`
 - 会话还会持久化最近一步的原始结果、最近一次明确操作到的主文件、最近文件列表、最近一次 diff / patch 内容，以及最近一次可撤回的补丁
+- companion extension 侧当前会复用同一个飞书 session key，并保留最近追问、最近回答摘要、最近工作区文件；这仍是 agent 的基础层，不是最终的完整 agent loop，当前默认 30 分钟无活动后自然过期
+- 可直接发送 `重置 Copilot 会话` 主动清空当前飞书会话对应的 extension bootstrap 历史，避免连续追问串入旧上下文
 - 飞书监听还会默认追加写入 `.feishu-vscode-bridge-audit.jsonl`，用于审计消息、卡片回调和回复结果；可通过 `BRIDGE_AUDIT_LOG_PATH` 覆盖路径
 - 飞书当前只自动处理纯文本 `text` 和纯文本富文本 `post`；如果消息是图片、附件、语音、媒体，或富文本里夹带图片/附件，机器人会直接回复降级提示，要求把命令、日志、补丁或截图关键信息转成文字后再发
 - `apply_patch` 会从 unified diff 头里推断一个最近文件列表，所以多文件补丁后也能继续追问文件上下文

@@ -10,12 +10,16 @@
 
 #[cfg(not(target_os = "macos"))]
 use eframe::egui;
+use feishu_vscode_bridge::vscode::AGENT_BRIDGE_PORT_ENV;
+use std::io::Read;
 #[cfg(target_os = "macos")]
 use std::io::{self, Write};
+use std::net::TcpStream;
 #[cfg(not(target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 // ──────────────────────────── 数据模型 ────────────────────────────
 
@@ -32,6 +36,13 @@ enum Step {
 enum VscodeStatus {
     Detected(String),
     NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupTaskStatus {
+    ok: bool,
+    label: String,
+    detail: String,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -53,9 +64,16 @@ struct SetupWizard {
     app_id: String,
     app_secret: String,
     config_saved: bool,
+    extension_status: Option<SetupTaskStatus>,
+    health_check_status: Option<SetupTaskStatus>,
     save_error: Option<String>,
     action_message: Option<String>,
 }
+
+const COMPANION_EXTENSION_ID: &str = "bean-harbor.feishu-vscode-agent-bridge";
+const DEFAULT_AGENT_BRIDGE_PORT: u16 = 8765;
+const HEALTH_CHECK_ATTEMPTS: usize = 12;
+const HEALTH_CHECK_INTERVAL_MS: u64 = 1000;
 
 fn save_env_file(app_id: &str, app_secret: &str) -> Result<(), String> {
     let existing = std::fs::read_to_string(".env").unwrap_or_default();
@@ -118,6 +136,255 @@ fn merge_env_content(existing: &str, app_id: &str, app_secret: &str) -> String {
         content.push('\n');
     }
     content
+}
+
+fn vscode_cli_candidates() -> Vec<String> {
+    let mut candidates = vec!["code".to_string()];
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.push(format!(
+                "{local}\\Programs\\Microsoft VS Code\\bin\\code.cmd"
+            ));
+            candidates.push(format!(
+                "{local}\\Programs\\Microsoft VS Code\\Code.exe"
+            ));
+        }
+        candidates.push(r"C:\Program Files\Microsoft VS Code\bin\code.cmd".to_string());
+        candidates.push(r"C:\Program Files\Microsoft VS Code\Code.exe".to_string());
+        candidates.push(r"C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd".to_string());
+        candidates.push(r"C:\Program Files (x86)\Microsoft VS Code\Code.exe".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code".to_string(),
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(format!(
+                "{home}/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        candidates.push("/usr/bin/code".to_string());
+        candidates.push("/usr/local/bin/code".to_string());
+        candidates.push("/snap/bin/code".to_string());
+    }
+
+    candidates
+}
+
+fn run_vscode_cli(args: &[&str]) -> Result<std::process::Output, String> {
+    let mut last_spawn_error = None;
+
+    for candidate in vscode_cli_candidates() {
+        match Command::new(&candidate).args(args).output() {
+            Ok(output) => return Ok(output),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_spawn_error = Some(format!("{candidate}: {err}"));
+            }
+            Err(err) => {
+                return Err(format!("无法执行 VS Code CLI `{candidate}`：{err}"));
+            }
+        }
+    }
+
+    Err(last_spawn_error.unwrap_or_else(|| "未找到可用的 VS Code CLI。".to_string()))
+}
+
+fn format_command_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "命令已执行，但没有返回输出。".to_string()
+    }
+}
+
+fn workspace_dir_any() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    std::env::current_dir().map_err(|e| format!("无法获取当前目录：{e}"))
+}
+
+fn locate_bundled_vsix() -> Option<PathBuf> {
+    let workspace = workspace_dir_any().ok()?;
+    let candidates = [
+        workspace.join("feishu-agent-bridge.vsix"),
+        workspace.join("dist/feishu-agent-bridge.vsix"),
+        workspace.join("vscode-agent-bridge/feishu-agent-bridge.vsix"),
+        workspace.join("vscode-agent-bridge/dist/feishu-agent-bridge.vsix"),
+        workspace.join("feishu-vscode-agent-bridge.vsix"),
+        workspace.join("dist/feishu-vscode-agent-bridge.vsix"),
+        workspace.join("vscode-agent-bridge/feishu-vscode-agent-bridge.vsix"),
+        workspace.join("vscode-agent-bridge/dist/feishu-vscode-agent-bridge.vsix"),
+    ];
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn install_companion_extension() -> SetupTaskStatus {
+    let mut args = vec!["--install-extension"];
+    let install_target;
+    let detail_prefix;
+
+    if let Some(vsix_path) = locate_bundled_vsix() {
+        install_target = vsix_path.display().to_string();
+        detail_prefix = "已使用 bundled .vsix 安装 companion extension";
+    } else {
+        install_target = COMPANION_EXTENSION_ID.to_string();
+        detail_prefix = "未找到本地 .vsix，已回退到 Marketplace 扩展安装";
+    }
+
+    args.push(install_target.as_str());
+    args.push("--force");
+
+    match run_vscode_cli(&args) {
+        Ok(output) if output.status.success() => SetupTaskStatus {
+            ok: true,
+            label: "Companion extension 已安装".to_string(),
+            detail: format!("{detail_prefix}。{}", format_command_output(&output)),
+        },
+        Ok(output) => SetupTaskStatus {
+            ok: false,
+            label: "Companion extension 安装失败".to_string(),
+            detail: format_command_output(&output),
+        },
+        Err(err) => SetupTaskStatus {
+            ok: false,
+            label: "Companion extension 安装失败".to_string(),
+            detail: err,
+        },
+    }
+}
+
+fn agent_bridge_port() -> u16 {
+    std::env::var(AGENT_BRIDGE_PORT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_AGENT_BRIDGE_PORT)
+}
+
+fn probe_agent_bridge_health(port: u16) -> Result<(), String> {
+    let address = format!("127.0.0.1:{port}");
+    let timeout = Duration::from_secs(2);
+    let socket = address
+        .parse()
+        .map_err(|err| format!("health check 地址无效：{err}"))?;
+
+    let mut stream = TcpStream::connect_timeout(&socket, timeout)
+        .map_err(|err| format!("无法连接到本地 agent bridge：{err}"))?;
+
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("无法设置 health check 读取超时：{err}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("无法设置 health check 写入超时：{err}"))?;
+
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .map_err(|err| format!("无法发送 health check 请求：{err}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("无法读取 health check 响应：{err}"))?;
+
+    if response.contains("200") && response.contains("\"status\":\"ok\"") {
+        Ok(())
+    } else {
+        Err(format!("health check 响应异常：{}", response.trim()))
+    }
+}
+
+fn launch_vscode_workspace_and_check_health() -> SetupTaskStatus {
+    let dir = match workspace_dir_any() {
+        Ok(dir) => dir,
+        Err(err) => {
+            return SetupTaskStatus {
+                ok: false,
+                label: "本地 bridge 健康检查失败".to_string(),
+                detail: err,
+            };
+        }
+    };
+
+    let workspace_arg = dir.display().to_string();
+    match run_vscode_cli(&[workspace_arg.as_str()]) {
+        Ok(output) if !output.status.success() => {
+            return SetupTaskStatus {
+                ok: false,
+                label: "本地 bridge 健康检查失败".to_string(),
+                detail: format!("无法打开 VS Code 工作区。{}", format_command_output(&output)),
+            };
+        }
+        Err(err) => {
+            return SetupTaskStatus {
+                ok: false,
+                label: "本地 bridge 健康检查失败".to_string(),
+                detail: format!("无法打开 VS Code 工作区：{err}"),
+            };
+        }
+        Ok(_) => {}
+    }
+
+    let port = agent_bridge_port();
+    for _ in 0..HEALTH_CHECK_ATTEMPTS {
+        match probe_agent_bridge_health(port) {
+            Ok(()) => {
+                return SetupTaskStatus {
+                    ok: true,
+                    label: "本地 bridge 健康检查通过".to_string(),
+                    detail: format!(
+                        "已在 http://127.0.0.1:{port}/health 收到 OK 响应，说明 companion extension 已启动本地服务。"
+                    ),
+                };
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)),
+        }
+    }
+
+    SetupTaskStatus {
+        ok: false,
+        label: "本地 bridge 健康检查失败".to_string(),
+        detail: format!(
+            "VS Code 已尝试打开工作区，但在 {} 秒内没有等到 http://127.0.0.1:{port}/health 返回 OK。请确认 extension 已启用、VS Code 已完成激活。",
+            HEALTH_CHECK_ATTEMPTS
+        ),
+    }
+}
+
+fn run_post_setup_tasks() -> (SetupTaskStatus, SetupTaskStatus) {
+    let extension_status = install_companion_extension();
+    let health_check_status = launch_vscode_workspace_and_check_health();
+    (extension_status, health_check_status)
+}
+
+fn summarize_completion_message(
+    extension_status: &SetupTaskStatus,
+    health_check_status: &SetupTaskStatus,
+) -> String {
+    format!(
+        "配置已保存到项目根目录的 .env 文件。\n\n扩展安装：{}\n{}\n\n健康检查：{}\n{}",
+        extension_status.label,
+        extension_status.detail,
+        health_check_status.label,
+        health_check_status.detail,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -291,10 +558,11 @@ fn run_macos_native_setup() -> Result<(), String> {
         macos_prompt_required("飞书配置", "请输入飞书 App Secret：", "App Secret", true)?;
 
     save_env_file_with_retry(&app_id, &app_secret)?;
+    let (extension_status, health_check_status) = run_post_setup_tasks();
 
     macos_show_info(
         "配置完成",
-        "配置已保存到项目根目录的 .env 文件。\n\n下一步可运行：cargo run --bin bridge-cli -- listen",
+        &summarize_completion_message(&extension_status, &health_check_status),
     )?;
 
     Ok(())
@@ -339,9 +607,14 @@ fn run_terminal_setup() -> Result<(), String> {
     }
 
     save_env_file(&app_id, &app_secret)?;
+    let (extension_status, health_check_status) = run_post_setup_tasks();
 
     println!("\n配置已保存到项目根目录的 .env 文件。");
-    println!("下一步可运行：cargo run --bin bridge-cli -- listen");
+    println!("扩展安装：{}", extension_status.label);
+    println!("{}", extension_status.detail);
+    println!();
+    println!("健康检查：{}", health_check_status.label);
+    println!("{}", health_check_status.detail);
     Ok(())
 }
 
@@ -354,6 +627,8 @@ impl Default for SetupWizard {
             app_id: String::new(),
             app_secret: String::new(),
             config_saved: false,
+            extension_status: None,
+            health_check_status: None,
             save_error: None,
             action_message: None,
         }
@@ -363,8 +638,8 @@ impl Default for SetupWizard {
 // ──────────────────────────── VS Code 检测 ────────────────────────────
 
 fn detect_vscode() -> VscodeStatus {
-    // 1. 尝试从 PATH 运行 `code --version`
-    if let Ok(out) = Command::new("code").arg("--version").output() {
+    // 1. 尝试从 CLI 检测版本
+    if let Ok(out) = run_vscode_cli(&["--version"]) {
         if out.status.success() {
             let ver = String::from_utf8_lossy(&out.stdout)
                 .lines()
@@ -422,25 +697,20 @@ fn detect_vscode() -> VscodeStatus {
 /// 返回当前工作区根目录（Cargo 项目根或 cwd）。
 #[cfg(not(target_os = "macos"))]
 fn workspace_dir() -> Result<PathBuf, String> {
-    // 优先取 CARGO_MANIFEST_DIR（cargo run 时设置），否则用 cwd
-    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let path = PathBuf::from(dir);
-        if path.is_dir() {
-            return Ok(path);
-        }
-    }
-    std::env::current_dir().map_err(|e| format!("无法获取当前目录：{e}"))
+    workspace_dir_any()
 }
 
 /// 用 VS Code 打开工作区目录。
 #[cfg(not(target_os = "macos"))]
 fn launch_vscode_for_workspace() -> Result<(), String> {
     let dir = workspace_dir()?;
-    Command::new("code")
-        .arg(dir.as_os_str())
-        .spawn()
-        .map_err(|e| format!("无法启动 VS Code：{e}"))?;
-    Ok(())
+    let workspace = dir.display().to_string();
+    let output = run_vscode_cli(&[workspace.as_str()])?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("无法启动 VS Code：{}", format_command_output(&output)))
+    }
 }
 
 /// 用系统文件管理器打开工作区目录。
@@ -636,7 +906,7 @@ impl SetupWizard {
                 ui.label("1. 检测本机是否已安装 VS Code");
                 ui.label("2. 若已安装，继续填写飞书应用凭证");
                 ui.label("3. 填写飞书 App ID 与 App Secret");
-                ui.label("4. 自动生成项目根目录下的 .env 配置文件");
+                ui.label("4. 自动生成 .env、安装 companion extension、执行最小健康检查");
             });
 
         if let Some(path) = workspace {
@@ -865,17 +1135,43 @@ impl SetupWizard {
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("接下来可以做什么").strong());
                 ui.add_space(8.0);
-                ui.label("1. 进入项目目录，确认 .env 内容");
-                ui.label("2. 使用 VS Code 打开项目继续开发或调试");
-                ui.label("3. 运行下面的命令启动 bridge-cli");
+                ui.label("1. 先看下面的扩展安装和健康检查结果");
+                ui.label("2. 如果失败，可以直接重试安装或重试自检");
+                ui.label("3. 仍然异常时，再手动打开项目继续排查");
             });
 
         ui.add_space(14.0);
-        ui.label("启动命令");
-        ui.code("cargo run --bin bridge-cli -- listen");
+        if let Some(status) = &self.extension_status {
+            let color = if status.ok {
+                egui::Color32::from_rgb(50, 168, 82)
+            } else {
+                egui::Color32::from_rgb(196, 55, 55)
+            };
+            ui.colored_label(color, &status.label);
+            ui.label(&status.detail);
+            ui.add_space(10.0);
+        }
+
+        if let Some(status) = &self.health_check_status {
+            let color = if status.ok {
+                egui::Color32::from_rgb(50, 168, 82)
+            } else {
+                egui::Color32::from_rgb(196, 55, 55)
+            };
+            ui.colored_label(color, &status.label);
+            ui.label(&status.detail);
+            ui.add_space(10.0);
+        }
+
         ui.add_space(14.0);
 
         ui.horizontal_wrapped(|ui| {
+            if ui.button("重新安装 extension").clicked() {
+                self.extension_status = Some(install_companion_extension());
+            }
+            if ui.button("重新执行健康检查").clicked() {
+                self.health_check_status = Some(launch_vscode_workspace_and_check_health());
+            }
             if ui.button("用 VS Code 打开当前项目").clicked() {
                 self.set_action_result(
                     launch_vscode_for_workspace(),
@@ -898,8 +1194,12 @@ impl SetupWizard {
     }
 
     // ── 保存配置到 .env ──
-    fn save_config(&self) -> Result<(), String> {
-        save_env_file(&self.app_id, &self.app_secret)
+    fn save_config(&mut self) -> Result<(), String> {
+        save_env_file(&self.app_id, &self.app_secret)?;
+        let (extension_status, health_check_status) = run_post_setup_tasks();
+        self.extension_status = Some(extension_status);
+        self.health_check_status = Some(health_check_status);
+        Ok(())
     }
 }
 

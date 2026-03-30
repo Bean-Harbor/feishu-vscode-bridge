@@ -219,6 +219,7 @@ pub enum Intent {
     RunTestFile { path: String },
     WriteFile { path: String, content: String },
     AskAgent { prompt: String },
+    ResetAgentSession,
 
     // Git 操作
     GitStatus { repo: Option<String> },
@@ -454,6 +455,9 @@ fn parse_single_intent(text: &str, lower: &str) -> Intent {
     }
 
     // ── 询问 Copilot / Agent ──
+    if let Some(intent) = parse_agent_reset_intent(lower) {
+        return intent;
+    }
     if let Some(intent) = parse_agent_ask_intent(text, lower) {
         return intent;
     }
@@ -676,6 +680,7 @@ impl Intent {
                     | Intent::RunTestFile { .. }
                     | Intent::WriteFile { .. }
                     | Intent::AskAgent { .. }
+                    | Intent::ResetAgentSession
                 | Intent::GitStatus { .. }
                 | Intent::GitPull { .. }
                 | Intent::GitPushAll { .. }
@@ -890,6 +895,22 @@ fn parse_agent_ask_intent(text: &str, lower: &str) -> Option<Intent> {
     })
 }
 
+fn parse_agent_reset_intent(lower: &str) -> Option<Intent> {
+    if matches!(
+        lower,
+        "重置 copilot 会话"
+            | "重置copilot会话"
+            | "重置 agent 会话"
+            | "重置agent会话"
+            | "reset copilot session"
+            | "reset agent session"
+    ) {
+        return Some(Intent::ResetAgentSession);
+    }
+
+    None
+}
+
 fn parse_git_log_args(s: &str) -> (Option<usize>, Option<String>) {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -984,6 +1005,7 @@ pub fn help_text() -> &'static str {
     运行测试文件 <路径>      — 按测试文件执行测试
     写入文件 <路径>\n<内容>  — 创建或覆盖文件（需审批）
     问 Copilot <问题>        — 通过 companion extension 发起一次 ask-style agent 会话
+    重置 Copilot 会话        — 清空当前飞书会话对应的 extension ask 历史
     应用补丁 <unified diff>  — 将补丁应用到当前工作区
 
 ▸ Git
@@ -1150,6 +1172,12 @@ mod tests {
                 prompt: "explain parse_intent".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parse_reset_agent_session() {
+        assert_eq!(parse_intent("重置 Copilot 会话"), Intent::ResetAgentSession);
+        assert_eq!(parse_intent("reset agent session"), Intent::ResetAgentSession);
     }
 
     #[test]

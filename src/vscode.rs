@@ -19,12 +19,57 @@ pub const AGENT_BRIDGE_PORT_ENV: &str = "BRIDGE_AGENT_BRIDGE_PORT";
 const DEFAULT_AGENT_BRIDGE_PORT: u16 = 8765;
 
 #[derive(Deserialize)]
+struct AgentTaskStateResponse {
+    status: Option<String>,
+    #[serde(rename = "currentAction")]
+    current_action: Option<String>,
+    #[serde(rename = "resultSummary")]
+    result_summary: Option<String>,
+    #[serde(rename = "nextAction")]
+    next_action: Option<String>,
+    #[serde(rename = "relatedFiles", default)]
+    related_files: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct AgentAskResponse {
     #[serde(rename = "sessionId")]
     session_id: String,
-    reply: String,
+    reply: Option<String>,
+    message: Option<String>,
     summary: Option<String>,
-    context: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "currentAction")]
+    current_action: Option<String>,
+    #[serde(rename = "nextAction")]
+    next_action: Option<String>,
+    #[serde(rename = "relatedFiles", default)]
+    related_files: Vec<String>,
+    #[serde(rename = "taskState")]
+    task_state: Option<AgentTaskStateResponse>,
+}
+
+#[derive(Deserialize)]
+struct AgentResetResponse {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    reset: bool,
+    #[serde(rename = "remainingSessions")]
+    remaining_sessions: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentAskResult {
+    pub success: bool,
+    pub session_id: Option<String>,
+    pub status: String,
+    pub message: String,
+    pub summary: Option<String>,
+    pub current_action: Option<String>,
+    pub next_action: Option<String>,
+    pub related_files: Vec<String>,
+    pub duration_ms: u64,
+    pub error: Option<String>,
 }
 
 /// 打开文件（可指定行号）
@@ -63,9 +108,9 @@ pub fn diff_files(file1: &str, file2: &str) -> CmdResult {
     run_cmd("code", &["--diff", file1, file2], 10)
 }
 
-pub fn ask_agent(session_id: &str, prompt: &str) -> CmdResult {
+pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
     let start = Instant::now();
-    let result = (|| -> Result<String, String> {
+    let result = (|| -> Result<AgentAskResult, String> {
         let trimmed_prompt = prompt.trim();
         if trimmed_prompt.is_empty() {
             return Err("提问内容不能为空。".to_string());
@@ -84,14 +129,105 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> CmdResult {
             .into_json()
             .map_err(|err| format!("解析 agent bridge 响应失败: {err}"))?;
 
-        let mut lines = vec![format!("session: {}", payload.session_id)];
-        if let Some(summary) = payload.summary.as_deref().filter(|value| !value.trim().is_empty()) {
-            lines.push(format!("摘要: {}", summary.trim()));
-        }
-        lines.push(String::new());
-        lines.push(payload.reply.trim().to_string());
+        let task_state = payload.task_state;
+        let message = payload
+            .message
+            .or(payload.reply)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "agent bridge 没有返回 message。".to_string())?;
 
-        Ok(lines.join("\n"))
+        let status = task_state
+            .as_ref()
+            .and_then(|state| state.status.clone())
+            .or(payload.status)
+            .unwrap_or_else(|| "answered".to_string());
+
+        let summary = task_state
+            .as_ref()
+            .and_then(|state| state.result_summary.clone())
+            .or(payload.summary)
+            .filter(|value| !value.trim().is_empty());
+
+        let current_action = task_state
+            .as_ref()
+            .and_then(|state| state.current_action.clone())
+            .or(payload.current_action)
+            .filter(|value| !value.trim().is_empty());
+
+        let next_action = task_state
+            .as_ref()
+            .and_then(|state| state.next_action.clone())
+            .or(payload.next_action)
+            .filter(|value| !value.trim().is_empty());
+
+        let related_files = task_state
+            .as_ref()
+            .map(|state| state.related_files.clone())
+            .filter(|files| !files.is_empty())
+            .unwrap_or(payload.related_files);
+
+        Ok(AgentAskResult {
+            success: true,
+            session_id: Some(payload.session_id),
+            status,
+            message,
+            summary,
+            current_action,
+            next_action,
+            related_files,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        })
+    })();
+
+    match result {
+        Ok(reply) => reply,
+        Err(err) => AgentAskResult {
+            success: false,
+            session_id: Some(session_id.trim().to_string()).filter(|value| !value.is_empty()),
+            status: "blocked".to_string(),
+            message: err.clone(),
+            summary: Some(err.clone()),
+            current_action: Some("向本地 agent bridge 发起请求失败".to_string()),
+            next_action: Some("确认 VS Code companion extension 已启动，并检查本地 bridge 健康状态。".to_string()),
+            related_files: Vec::new(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: Some(err),
+        },
+    }
+}
+
+pub fn reset_agent_session(session_id: &str) -> CmdResult {
+    let start = Instant::now();
+    let result = (|| -> Result<String, String> {
+        let trimmed_session_id = session_id.trim();
+        if trimmed_session_id.is_empty() {
+            return Err("sessionId 不能为空。".to_string());
+        }
+
+        let endpoint = format!("{}/v1/chat/reset", agent_bridge_base_url()?);
+        let response = ureq::post(&endpoint)
+            .set("Content-Type", "application/json")
+            .send_json(ureq::json!({
+                "sessionId": trimmed_session_id,
+            }))
+            .map_err(|err| format_agent_bridge_error(err, &endpoint))?;
+
+        let payload: AgentResetResponse = response
+            .into_json()
+            .map_err(|err| format!("解析 agent bridge reset 响应失败: {err}"))?;
+
+        let status = if payload.reset {
+            "已重置当前 Copilot 会话历史。"
+        } else {
+            "当前没有可重置的 Copilot 会话历史。"
+        };
+
+        Ok(format!(
+            "session: {}\n{}\n剩余本地会话数: {}",
+            payload.session_id, status, payload.remaining_sessions
+        ))
     })();
 
     into_cmd_result(result, start.elapsed().as_millis() as u64)

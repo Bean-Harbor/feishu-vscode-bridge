@@ -400,9 +400,17 @@ impl BridgeApp {
     ) -> BridgeResponse {
         if let Intent::AskAgent { prompt } = &intent {
             let result = vscode::ask_agent(session_key, prompt);
+            let reply = format_agent_reply(task_text, &result);
+            let stored = stored_session_from_agent_result(task_text, &intent, &result, &reply);
+            let _ = self.persist_session(session_key, &stored);
+            return BridgeResponse::Text(reply);
+        }
+
+        if let Intent::ResetAgentSession = &intent {
+            let result = vscode::reset_agent_session(session_key);
             let outcome = ExecutionOutcome {
                 success: result.success,
-                reply: result.to_reply("问 Copilot"),
+                reply: result.to_reply("重置 Copilot 会话"),
             };
             let progress = progress_from_direct_execution(intent, outcome.clone());
             let stored = self.build_stored_session(None, task_text, "直接执行", &progress);
@@ -668,6 +676,94 @@ fn summarize_reply_snippet(reply: &str, max_lines: usize, max_chars: usize) -> O
     }
 
     Some(summary)
+}
+
+fn format_agent_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "answered" => "已回答".to_string(),
+        "working" => "处理中".to_string(),
+        "needs_tool" => "需要工具".to_string(),
+        "waiting_user" => "等待用户".to_string(),
+        "blocked" => "已阻塞".to_string(),
+        "completed" => "已完成".to_string(),
+        other if other.is_empty() => "已回答".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn agent_result_summary(result: &vscode::AgentAskResult) -> String {
+    result
+        .summary
+        .clone()
+        .or_else(|| summarize_reply_snippet(&result.message, 3, 220))
+        .unwrap_or_else(|| "agent 已返回结果。".to_string())
+}
+
+fn format_agent_reply(task_text: &str, result: &vscode::AgentAskResult) -> String {
+    let mut blocks = vec!["🧭 Agent 任务更新".to_string()];
+
+    if let Some(session_id) = result.session_id.as_deref().filter(|value| !value.trim().is_empty()) {
+        blocks.push(format!("🆔 session: {}", session_id));
+    }
+
+    blocks.push(format!(
+        "🎯 当前任务: {}",
+        task_text.trim().trim_end_matches('\n')
+    ));
+    blocks.push(format!("📌 最近状态: {}", format_agent_status(&result.status)));
+    blocks.push(format!("🧾 上次动作: 问 Copilot  ({}ms)", result.duration_ms));
+
+    if let Some(action) = result.current_action.as_deref().filter(|value| !value.trim().is_empty()) {
+        blocks.push(format!("⚙️ 当前动作: {}", action.trim()));
+    }
+
+    let summary = agent_result_summary(result);
+    if !summary.trim().is_empty() {
+        blocks.push(format!("📌 结果摘要: {}", summary));
+    }
+
+    if !result.related_files.is_empty() {
+        blocks.push(format!("📄 相关文件: {}", result.related_files.join("、")));
+    }
+
+    if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
+        blocks.push(format!("➡️ 下一步建议: {}", next_action.trim()));
+    }
+
+    if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
+        blocks.push(format!("❌ 错误: {}", error.trim()));
+    }
+
+    blocks.push(format!("💬 Agent 回复:\n{}", result.message.trim()));
+    blocks.join("\n\n")
+}
+
+fn stored_session_from_agent_result(
+    task_text: &str,
+    intent: &Intent,
+    result: &vscode::AgentAskResult,
+    reply: &str,
+) -> StoredSession {
+    StoredSession {
+        plan: None,
+        current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
+        pending_steps: Vec::new(),
+        last_result: Some(StoredResult {
+            status: format_agent_status(&result.status),
+            summary: agent_result_summary(result),
+            success: result.success,
+        }),
+        last_action: Some("直接执行".to_string()),
+        last_step: Some(StoredStep {
+            description: describe_intent(intent),
+            reply: reply.to_string(),
+            success: result.success,
+        }),
+        last_file_path: result.related_files.first().cloned(),
+        recent_file_paths: result.related_files.clone(),
+        last_diff: None,
+        last_patch: None,
+    }
 }
 
 fn failure_next_step_hint(stored: &StoredSession) -> String {
@@ -1557,6 +1653,7 @@ fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::ResetAgentSession => "重置 Copilot 会话".to_string(),
         Intent::GitStatus { repo } => match repo {
             Some(repo) => format!("查看仓库状态 {repo}"),
             None => "查看当前仓库状态".to_string(),
@@ -1860,6 +1957,10 @@ fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
         Intent::AskAgent { .. } => ExecutionOutcome {
             success: false,
             reply: "⚠️ 问 Copilot 目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::ResetAgentSession => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 重置 Copilot 会话目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
         },
         Intent::Help => ExecutionOutcome {
             success: true,

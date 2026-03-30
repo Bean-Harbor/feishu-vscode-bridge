@@ -663,6 +663,7 @@ fn unsupported_post_tag_label(tag: &str) -> Option<&'static str> {
 fn sanitize_message_text(text: &str) -> String {
     text.lines()
         .map(|line| {
+            let line = strip_leading_list_marker(line.trim());
             line.split_whitespace()
                 .filter(|word| !word.starts_with('@'))
                 .collect::<Vec<_>>()
@@ -671,6 +672,36 @@ fn sanitize_message_text(text: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn strip_leading_list_marker(line: &str) -> &str {
+    let trimmed = line.trim_start();
+
+    for bullet in ["-", "*", "•", "·"] {
+        if let Some(rest) = trimmed.strip_prefix(bullet) {
+            let rest = rest.trim_start();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+
+    let digit_count = trimmed.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return trimmed;
+    }
+
+    let rest = &trimmed[digit_count..];
+    for suffix in [".", ")", "、"] {
+        if let Some(rest) = rest.strip_prefix(suffix) {
+            let rest = rest.trim_start();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+
+    trimmed
 }
 
 #[cfg(test)]
@@ -775,12 +806,38 @@ mod tests {
                     let event = FeishuClient::parse_event_payload(payload).unwrap();
                     match event {
                         FeishuEvent::Message(message) => {
-                            assert_eq!(message.text, "1. 执行全部 读取 src/lib.rs 1-20; $ false");
-                                                        assert!(message.unsupported_reason.is_none());
+                            assert_eq!(message.text, "执行全部 读取 src/lib.rs 1-20; $ false");
+                            assert!(message.unsupported_reason.is_none());
                         }
                         _ => panic!("expected message event"),
                     }
                 }
+
+        #[test]
+        fn parse_numbered_text_message_payload() {
+                let payload = r#"{
+                    "schema": "2.0",
+                    "header": { "event_id": "evt_4b", "event_type": "im.message.receive_v1" },
+                    "event": {
+                        "sender": { "sender_id": { "open_id": "ou_123" } },
+                        "message": {
+                            "chat_id": "oc_123",
+                            "chat_type": "p2p",
+                            "message_id": "om_126b",
+                            "content": "{\"text\":\"1. 重置 Copilot 会话\"}"
+                        }
+                    }
+                }"#;
+
+                let event = FeishuClient::parse_event_payload(payload).unwrap();
+                match event {
+                        FeishuEvent::Message(message) => {
+                                assert_eq!(message.text, "重置 Copilot 会话");
+                                assert!(message.unsupported_reason.is_none());
+                        }
+                        _ => panic!("expected message event"),
+                }
+        }
 
         #[test]
         fn parse_image_message_payload_as_unsupported() {

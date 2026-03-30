@@ -6,10 +6,42 @@ type AskRequest = {
     prompt: string;
 };
 
+type ResetRequest = {
+    sessionId: string;
+};
+
 type SessionState = {
     messages: vscode.LanguageModelChatMessage[];
     lastResponseSummary?: string;
+    recentUserPrompts: string[];
+    recentWorkspaceFiles: string[];
     updatedAt: number;
+};
+
+type AgentStatus = 'answered' | 'working' | 'needs_tool' | 'waiting_user' | 'blocked' | 'completed';
+
+type AgentTaskState = {
+    status: AgentStatus;
+    currentAction: string;
+    resultSummary: string;
+    nextAction: string;
+    relatedFiles: string[];
+    toolCall: string | null;
+    toolResultSummary: string | null;
+};
+
+type AskResponse = {
+    sessionId: string;
+    status: AgentStatus;
+    message: string;
+    summary: string;
+    currentAction: string;
+    nextAction: string;
+    relatedFiles: string[];
+    toolCall: string | null;
+    toolResultSummary: string | null;
+    taskState: AgentTaskState;
+    context: string;
 };
 
 type BridgeContext = {
@@ -20,10 +52,15 @@ type BridgeContext = {
 
 const HEALTH_PATH = '/health';
 const ASK_PATH = '/v1/chat/ask';
+const RESET_PATH = '/v1/chat/reset';
 const MAX_SUMMARY_LENGTH = 200;
 const MAX_WORKSPACE_SNIPPETS = 3;
 const MAX_FILE_BYTES = 512 * 1024;
 const MAX_SURROUNDING_LINES = 4;
+const MAX_SESSION_MESSAGES = 12;
+const MAX_RECENT_USER_PROMPTS = 3;
+const MAX_RECENT_WORKSPACE_FILES = 3;
+const SESSION_TTL_MS = 30 * 60 * 1000;
 const WORKSPACE_FILE_GLOB = '**/*.{rs,ts,tsx,js,jsx,py,toml}';
 const WORKSPACE_EXCLUDE_GLOB = '**/{.git,node_modules,target,out,dist,build,.next,coverage}/**';
 const BOOTSTRAP_WORKSPACE_ENV = 'BRIDGE_AGENT_BOOTSTRAP_WORKSPACE';
@@ -134,6 +171,8 @@ async function startBridgeServer(bridge: BridgeContext): Promise<void> {
     const port = getConfiguredPort();
     const server = http.createServer(async (req, res) => {
         try {
+            pruneExpiredSessions(bridge);
+
             if (!req.url) {
                 respondJson(res, 400, { error: 'missing url' });
                 return;
@@ -155,6 +194,13 @@ async function startBridgeServer(bridge: BridgeContext): Promise<void> {
                 return;
             }
 
+            if (req.method === 'POST' && req.url === RESET_PATH) {
+                const payload = await readJsonBody<ResetRequest>(req);
+                const result = handleReset(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
             respondJson(res, 404, { error: 'not found' });
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -172,7 +218,9 @@ async function startBridgeServer(bridge: BridgeContext): Promise<void> {
     bridge.output.appendLine(`Agent bridge listening on http://127.0.0.1:${port}`);
 }
 
-async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<Record<string, unknown>> {
+async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<AskResponse> {
+    pruneExpiredSessions(bridge);
+
     const sessionId = payload.sessionId?.trim();
     const prompt = payload.prompt?.trim();
     if (!sessionId) {
@@ -185,7 +233,8 @@ async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<Re
     const session = bridge.sessions.get(sessionId) ?? createSession();
     const contextSummary = collectEditorContext();
     const workspaceContext = await collectWorkspaceContext(prompt);
-    const promptContext = [contextSummary, workspaceContext]
+    const sessionSummary = buildSessionSummary(session);
+    const promptContext = [sessionSummary, contextSummary, workspaceContext.summary]
         .filter((value) => value && value.trim().length > 0)
         .join('\n\n');
     const userPrompt = promptContext
@@ -214,22 +263,55 @@ async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<Re
             throw new Error('Model returned an empty response.');
         }
 
+        const summary = summarize(text);
+        const taskState = buildAnsweredTaskState(prompt, summary, workspaceContext.files);
+
         session.messages.push(vscode.LanguageModelChatMessage.Assistant(text));
-        session.lastResponseSummary = summarize(text);
+        session.lastResponseSummary = summary;
+        rememberRecentPrompt(session, prompt);
+        rememberRecentWorkspaceFiles(session, workspaceContext.files);
+        trimSessionMessages(session);
         session.updatedAt = Date.now();
         bridge.sessions.set(sessionId, session);
 
         return {
             sessionId,
-            reply: text,
-            summary: session.lastResponseSummary,
-            context: [contextSummary, workspaceContext]
+            status: taskState.status,
+            message: text,
+            summary,
+            currentAction: taskState.currentAction,
+            nextAction: taskState.nextAction,
+            relatedFiles: taskState.relatedFiles,
+            toolCall: taskState.toolCall,
+            toolResultSummary: taskState.toolResultSummary,
+            taskState,
+            context: [sessionSummary, contextSummary, workspaceContext.summary]
                 .filter((value) => value && value.trim().length > 0)
                 .join('\n\n'),
         };
     } finally {
         tokenSource.dispose();
     }
+}
+
+function handleReset(bridge: BridgeContext, payload: ResetRequest): Record<string, unknown> {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+
+    const reset = bridge.sessions.delete(sessionId);
+    if (reset) {
+        bridge.output.appendLine(`Reset agent bridge session: ${sessionId}`);
+    }
+
+    return {
+        sessionId,
+        reset,
+        remainingSessions: bridge.sessions.size,
+    };
 }
 
 function collectEditorContext(): string {
@@ -260,19 +342,35 @@ function createSession(): SessionState {
                 'You are the VS Code side of a Feishu remote agent bridge. Answer as a pragmatic coding agent. Prefer concrete explanations grounded in retrieved workspace snippets. If snippets are insufficient, say what is missing instead of guessing.',
             ),
         ],
+        recentUserPrompts: [],
+        recentWorkspaceFiles: [],
         updatedAt: Date.now(),
     };
 }
 
-async function collectWorkspaceContext(prompt: string): Promise<string> {
+function buildAnsweredTaskState(prompt: string, summary: string, relatedFiles: string[]): AgentTaskState {
+    return {
+        status: 'answered',
+        currentAction: relatedFiles.length > 0
+            ? '已结合当前工作区和最近上下文生成回答'
+            : '已基于当前会话上下文生成回答',
+        resultSummary: summary,
+        nextAction: `可以继续追问、要求读取更多代码，或直接基于当前结果推进任务：${prompt.trim()}`,
+        relatedFiles,
+        toolCall: null,
+        toolResultSummary: null,
+    };
+}
+
+async function collectWorkspaceContext(prompt: string): Promise<{ summary: string; files: string[] }> {
     const folders = vscode.workspace.workspaceFolders ?? [];
     if (folders.length === 0) {
-        return '';
+        return { summary: '', files: [] };
     }
 
     const searchTerms = extractSearchTerms(prompt);
     if (searchTerms.length === 0) {
-        return '';
+        return { summary: '', files: [] };
     }
 
     const files = await vscode.workspace.findFiles(WORKSPACE_FILE_GLOB, WORKSPACE_EXCLUDE_GLOB, 200);
@@ -324,10 +422,13 @@ async function collectWorkspaceContext(prompt: string): Promise<string> {
 
     const snippets = selectBestSnippets(candidates);
     if (snippets.length === 0) {
-        return '';
+        return { summary: '', files: [] };
     }
 
-    return `Retrieved workspace context:\n${snippets.join('\n\n')}`;
+    return {
+        summary: `Retrieved workspace context:\n${snippets.map(formatWorkspaceSnippet).join('\n\n')}`,
+        files: snippets.map((snippet) => snippet.relativePath),
+    };
 }
 
 function shouldSkipWorkspaceFile(relativePath: string): boolean {
@@ -398,10 +499,10 @@ function scoreWorkspaceSnippet(relativePath: string, matchedLine: string, term: 
     return score;
 }
 
-function selectBestSnippets(candidates: SnippetCandidate[]): string[] {
+function selectBestSnippets(candidates: SnippetCandidate[]): SnippetCandidate[] {
     const sorted = [...candidates].sort((left, right) => right.score - left.score);
     const seenPaths = new Set<string>();
-    const snippets: string[] = [];
+    const snippets: SnippetCandidate[] = [];
 
     for (const candidate of sorted) {
         if (seenPaths.has(candidate.relativePath)) {
@@ -409,13 +510,89 @@ function selectBestSnippets(candidates: SnippetCandidate[]): string[] {
         }
 
         seenPaths.add(candidate.relativePath);
-        snippets.push(`Workspace snippet for ${candidate.term} in ${candidate.relativePath}:\n${candidate.excerpt}`);
+        snippets.push(candidate);
         if (snippets.length >= MAX_WORKSPACE_SNIPPETS) {
             break;
         }
     }
 
     return snippets;
+}
+
+function formatWorkspaceSnippet(candidate: SnippetCandidate): string {
+    return `Workspace snippet for ${candidate.term} in ${candidate.relativePath}:\n${candidate.excerpt}`;
+}
+
+function buildSessionSummary(session: SessionState): string {
+    const parts: string[] = [];
+
+    if (session.recentUserPrompts.length > 0) {
+        parts.push(`Recent user requests:\n${session.recentUserPrompts.map((prompt) => `- ${prompt}`).join('\n')}`);
+    }
+
+    if (session.lastResponseSummary) {
+        parts.push(`Last assistant summary:\n${session.lastResponseSummary}`);
+    }
+
+    if (session.recentWorkspaceFiles.length > 0) {
+        parts.push(`Recent workspace files:\n${session.recentWorkspaceFiles.map((file) => `- ${file}`).join('\n')}`);
+    }
+
+    if (parts.length === 0) {
+        return '';
+    }
+
+    return `Session bridge context:\n${parts.join('\n\n')}`;
+}
+
+function rememberRecentPrompt(session: SessionState, prompt: string): void {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+        return;
+    }
+
+    session.recentUserPrompts = [trimmed, ...session.recentUserPrompts.filter((entry) => entry !== trimmed)]
+        .slice(0, MAX_RECENT_USER_PROMPTS);
+}
+
+function rememberRecentWorkspaceFiles(session: SessionState, files: string[]): void {
+    if (files.length === 0) {
+        return;
+    }
+
+    const merged = [...files, ...session.recentWorkspaceFiles];
+    const deduped: string[] = [];
+
+    for (const file of merged) {
+        if (!deduped.includes(file)) {
+            deduped.push(file);
+        }
+        if (deduped.length >= MAX_RECENT_WORKSPACE_FILES) {
+            break;
+        }
+    }
+
+    session.recentWorkspaceFiles = deduped;
+}
+
+function trimSessionMessages(session: SessionState): void {
+    if (session.messages.length <= MAX_SESSION_MESSAGES + 1) {
+        return;
+    }
+
+    const [systemMessage, ...rest] = session.messages;
+    session.messages = [systemMessage, ...rest.slice(-MAX_SESSION_MESSAGES)];
+}
+
+function pruneExpiredSessions(bridge: BridgeContext): void {
+    const now = Date.now();
+
+    for (const [sessionId, session] of bridge.sessions.entries()) {
+        if (now - session.updatedAt > SESSION_TTL_MS) {
+            bridge.sessions.delete(sessionId);
+            bridge.output.appendLine(`Expired agent bridge session: ${sessionId}`);
+        }
+    }
 }
 
 function escapeForRegExp(value: string): string {

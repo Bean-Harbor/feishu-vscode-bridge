@@ -14,6 +14,9 @@
 - Tightened workspace-snippet retrieval to prefer real source definitions over README, runtime session files, audit logs, and test-only noise, after the first grounded Feishu reply still surfaced low-value context around `parse_intent`
 - Simplified the Feishu-visible ask response shape by removing raw retrieved-context dumps from the Rust reply formatter, so the bridge can return `session`, `摘要`, and the model answer without flooding Feishu with internal retrieval context
 - Verified the improved grounded ask path in real Feishu: the bridge reply now references `src/lib.rs` and the `parse_intent` definition instead of failing with `无法识别指令` or claiming no workspace context was available
+- Started A1 session-bridge hardening: the companion extension now keeps a compact session summary of recent asks, recent reply summary, and recent workspace files, injects that summary into later ask turns, expires idle sessions after 30 minutes, and exposes a reset endpoint consumed by the new `重置 Copilot 会话` bridge command
+- During live validation, the first rebuilt ask request failed with `value.trim is not a function`; root cause was that the extension still treated the structured `workspaceContext` object as a string in two places, which was then fixed and revalidated against a fresh extension host on port `8766`
+- Follow-up Feishu validation exposed another real-message compatibility gap: rich-text `post` commands sent as numbered items such as `1. 问 Copilot ...` and `1. 重置 Copilot 会话` were being preserved literally and therefore missed intent parsing; the Feishu ingress sanitizer now strips common leading list markers before dispatch
 
 ### Files Updated
 
@@ -21,6 +24,12 @@
 - `.vscode/launch.json` — passed bootstrap workspace information into the Extension Development Host so the companion extension can attach the repository automatically during local ask-bridge smoke runs
 - `vscode-agent-bridge/src/extension.ts` — added workspace bootstrap, local workspace-snippet retrieval, source-snippet ranking/filtering, and tighter ask-grounding behavior for `问 Copilot`
 - `src/vscode.rs` — trimmed the Feishu-visible ask reply format so raw debug retrieval context is no longer echoed back to the user
+- `src/lib.rs` — added parsing, help text, and regression coverage for `重置 Copilot 会话` / `reset agent session`
+- `src/vscode.rs` — added local companion-extension session reset support for the ask bridge
+- `src/bridge.rs` — wired `重置 Copilot 会话` into direct execution using the current Feishu session key
+- `vscode-agent-bridge/src/extension.ts` — added session-summary injection, idle-session expiry, and `/v1/chat/reset` handling for the companion extension
+- `vscode-agent-bridge/src/extension.ts` — fixed the live ask-path regression by using `workspaceContext.summary` consistently instead of calling string methods on the full workspace-context object
+- `src/feishu.rs` — normalized inbound Feishu text by stripping leading numbered/bulleted list markers like `1.`, `1)`, `1、`, `-`, `*`, and `•`, and added regression coverage for numbered `text` and `post` messages
 - `docs/work_log.md` — recorded the Windows extension-host startup fixes and the first end-to-end grounded ask-style Feishu validation
 
 ### Verification
@@ -30,6 +39,10 @@
 - Extension Development Host smoke: confirmed `Feishu Agent Bridge` output shows `Agent bridge listening on http://127.0.0.1:8765`
 - Windows listener verification: confirmed only one fresh isolated `bridge-cli.exe` listener remained after clearing stale processes, preventing old binaries from intercepting Feishu traffic
 - Live Feishu validation: `问 Copilot parse_intent 这个函数是干什么的` first succeeded through the local companion extension, then succeeded again with workspace-aware grounding after the development-host workspace bootstrap was fixed
+- VS Code diagnostics reported no static errors in `vscode-agent-bridge/src/extension.ts` after adding session-summary injection, session expiry, and reset endpoint support; full `npm run compile` was not available on this machine because `npm` is missing
+- `cargo test parse_ask_agent_chinese parse_ask_agent_english parse_reset_agent_session`
+- Live local bridge validation with the rebuilt companion extension on port `8766`: `问 Copilot parse_intent 这个函数是干什么的` returned a grounded answer, and `重置 Copilot 会话` then reported `已重置当前 Copilot 会话历史。`
+- `cargo test parse_flat_post_message_payload && cargo test parse_numbered_text_message_payload && cargo test parse_post_message_payload && cargo test parse_message_event_payload`
 
 ## 2026-03-29
 
