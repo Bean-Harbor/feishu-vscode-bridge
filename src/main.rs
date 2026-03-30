@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
+use feishu_vscode_bridge::audit::{append_audit_entry, feishu_session_key, new_audit_entry};
 use feishu_vscode_bridge::bridge::{
-    BridgeApp, BridgeResponse, append_audit_entry, feishu_session_key, new_audit_entry,
-    render_bridge_response, response_kind,
+    BridgeApp, BridgeResponse, render_bridge_response, response_kind,
 };
 use feishu_vscode_bridge::feishu::{FeishuClient, FeishuEvent, ReplyTarget};
 use feishu_vscode_bridge::MessageDedup;

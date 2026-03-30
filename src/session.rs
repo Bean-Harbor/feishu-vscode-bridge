@@ -183,7 +183,7 @@ pub fn stored_session_from_agent_result(
     }
 }
 
-fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
+pub(crate) fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
     if progress.completed {
         StoredResult {
             status: "已完成".to_string(),
