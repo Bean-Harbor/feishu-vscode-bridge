@@ -237,6 +237,7 @@ pub enum Intent {
 }
 
 pub mod executor;
+pub mod follow_up;
 pub mod intent_executor;
 pub mod plan_dispatch;
 pub mod audit;
