@@ -17,6 +17,22 @@
 - Started A1 session-bridge hardening: the companion extension now keeps a compact session summary of recent asks, recent reply summary, and recent workspace files, injects that summary into later ask turns, expires idle sessions after 30 minutes, and exposes a reset endpoint consumed by the new `重置 Copilot 会话` bridge command
 - During live validation, the first rebuilt ask request failed with `value.trim is not a function`; root cause was that the extension still treated the structured `workspaceContext` object as a string in two places, which was then fixed and revalidated against a fresh extension host on port `8766`
 - Follow-up Feishu validation exposed another real-message compatibility gap: rich-text `post` commands sent as numbered items such as `1. 问 Copilot ...` and `1. 重置 Copilot 会话` were being preserved literally and therefore missed intent parsing; the Feishu ingress sanitizer now strips common leading list markers before dispatch
+- Recorded a dedicated HarborBeacon-style runtime migration plan and then used it to start splitting `bridge.rs` into narrower runtime modules instead of continuing to mix persistence, reply formatting, approval context, and card rendering in one file
+- Extracted persisted runtime session shaping into `src/session.rs`, including stored result / diff / patch / recent-file helpers, direct-execution progress shaping, and session-store load/save helpers reused by the bridge runtime
+- Extracted Feishu-facing text reply formatting and intent-description helpers into `src/reply.rs`, so follow-up summaries, direct command replies, and ask/result replay text are no longer embedded directly in `src/bridge.rs`
+- Reworked plan approval handling in `src/plan.rs` from a thin `approval_intent` marker into a structured `ApprovalRequest`, so blocked steps now carry explicit action label, approval reason, risk summary, and run-all intent for resume flows
+- Rewired `src/bridge.rs` to consume the new `session` and `reply` layers, added a dedicated approval-request builder in the bridge layer, and cleaned out duplicated legacy helper logic left behind by the extraction
+- Completed a second runtime-split pass by moving plan / approval / completion card rendering into `src/card.rs`, leaving `src/bridge.rs` substantially closer to a dispatch/orchestration layer
+- Updated approval and plan-card output so approval reason and risk summary are rendered consistently in both text replies and Feishu cards during continue / execute-all / approve flows
+- Synced three finished work batches to GitHub during the day: `b19b078` (`Add agent bootstrap session reset and installer scaffolding`), `971574a` (`Extract runtime session reply modules and approval context`), and `5208ce3` (`Extract runtime plan card rendering module`)
+- Closed the day with a clean working tree after verifying the latest extraction and pushing `5208ce3` to `origin/main`
+
+### Files Added
+
+- `docs/harborbeacon_runtime_migration_plan.md` — recorded the runtime migration phases and extraction order for later HarborBeacon-style refactors
+- `src/session.rs` — extracted stored-session structures, persistence helpers, and direct-execution state shaping out of the bridge runtime
+- `src/reply.rs` — extracted follow-up replies, result/failure summaries, and intent-description helpers used by direct and plan replies
+- `src/card.rs` — extracted plan / approval / completion Feishu card rendering and follow-up action generation from `src/bridge.rs`
 
 ### Files Updated
 
@@ -31,6 +47,10 @@
 - `vscode-agent-bridge/src/extension.ts` — fixed the live ask-path regression by using `workspaceContext.summary` consistently instead of calling string methods on the full workspace-context object
 - `src/feishu.rs` — normalized inbound Feishu text by stripping leading numbered/bulleted list markers like `1.`, `1)`, `1、`, `-`, `*`, and `•`, and added regression coverage for numbered `text` and `post` messages
 - `docs/work_log.md` — recorded the Windows extension-host startup fixes and the first end-to-end grounded ask-style Feishu validation
+- `src/plan.rs` — replaced thin approval markers with structured `ApprovalRequest` data and updated plan-execution flows to build approval context explicitly
+- `src/bridge.rs` — rewired runtime orchestration to delegate session persistence, reply formatting, and card rendering into the new `session`, `reply`, and `card` modules
+- `src/lib.rs` — exported the new runtime modules so the bridge crate exposes `session`, `reply`, and `card` as separate layers
+- `docs/work_log.md` — appended the late-day runtime split, approval-context migration, and card-rendering extraction work
 
 ### Verification
 
@@ -43,6 +63,16 @@
 - `cargo test parse_ask_agent_chinese parse_ask_agent_english parse_reset_agent_session`
 - Live local bridge validation with the rebuilt companion extension on port `8766`: `问 Copilot parse_intent 这个函数是干什么的` returned a grounded answer, and `重置 Copilot 会话` then reported `已重置当前 Copilot 会话历史。`
 - `cargo test parse_flat_post_message_payload && cargo test parse_numbered_text_message_payload && cargo test parse_post_message_payload && cargo test parse_message_event_payload`
+- VS Code diagnostics check for `src/bridge.rs`, `src/plan.rs`, `src/lib.rs`, `src/session.rs`, `src/reply.rs`, and later `src/card.rs` after each extraction pass; no new static errors remained in the refactored files
+- `cargo test completion_reply_returns_completion_card && cargo test paused_reply_contains_failed_step_details && cargo test approval_reply_contains_approve_actions && cargo test completion_card_includes_follow_up_actions_when_context_exists && cargo test execute_next_pauses_for_approval && cargo test approve_pending_executes_gated_step`
+- End-of-day `git status --short`, confirming the repository is clean after pushing `5208ce3` to `origin/main`
+
+### Tomorrow To Do
+
+- Extract audit-log creation and append helpers out of `src/bridge.rs`, so the remaining bridge layer keeps narrowing toward dispatch and orchestration only
+- Re-check `src/bridge.rs` responsibilities after the audit split and decide the next extraction boundary, with session continuity and plan coordination kept in bridge only if still justified
+- Run targeted Rust regressions again after the next extraction, prioritizing approval-flow, card-rendering, and persisted-session continuity tests
+- If the audit split is stable, sync the next refactor tranche to GitHub the same day instead of letting local runtime-architecture changes pile up
 
 ## 2026-03-29
 
