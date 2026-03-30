@@ -238,6 +238,7 @@ pub enum Intent {
 
 pub mod executor;
 pub mod bridge;
+pub mod card;
 pub mod feishu;
 pub mod plan;
 pub mod reply;
