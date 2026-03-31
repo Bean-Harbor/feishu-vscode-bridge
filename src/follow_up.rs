@@ -1,30 +1,28 @@
-use std::path::PathBuf;
-
-use crate::bridge::BridgeResponse;
+use crate::bridge::{BridgeContext, BridgeResponse};
 use crate::reply;
 use crate::session::{self, StoredDiff, StoredResult, StoredStep};
 use crate::vscode;
 
 const NO_SESSION_TEXT: &str = "⚠️ 当前没有可回看的任务记录。";
 
-pub fn explain_last_failure(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn explain_last_failure(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
     BridgeResponse::Text(reply::format_last_failure_reply(&stored))
 }
 
-pub fn show_last_result(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn show_last_result(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
     BridgeResponse::Text(reply::format_last_result_reply(&stored))
 }
 
-pub fn continue_last_file(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn continue_last_file(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -54,24 +52,24 @@ pub fn continue_last_file(session_key: &str, session_store_path: Option<&PathBuf
     BridgeResponse::Text(reply::format_follow_up_reply("继续文件上下文", &stored, blocks))
 }
 
-pub fn show_last_diff(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn show_last_diff(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
     BridgeResponse::Text(reply::format_last_diff_reply(&stored))
 }
 
-pub fn show_recent_files(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn show_recent_files(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
     BridgeResponse::Text(reply::format_recent_files_reply(&stored))
 }
 
-pub fn undo_last_patch(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -113,6 +111,6 @@ pub fn undo_last_patch(session_key: &str, session_store_path: Option<&PathBuf>) 
         stored.last_patch = None;
     }
 
-    let _ = session::persist_session(session_store_path, session_key, &stored);
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
     BridgeResponse::Text(reply)
 }

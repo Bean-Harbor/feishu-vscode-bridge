@@ -6,22 +6,41 @@ use crate::intent_executor::execute_runnable_intent;
 use crate::plan_dispatch;
 use crate::plan::ExecutionOutcome;
 use crate::session;
-#[cfg(test)]
-use crate::plan::{PlanProgress, PlanSession};
-#[cfg(test)]
-use crate::reply;
 use crate::{ApprovalPolicy, ExecutionMode, Intent, help_text, parse_intent};
 
-#[cfg(test)]
-use crate::plan::ApprovalRequest;
-
-#[cfg(test)]
-use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredStep};
-
-#[cfg(test)]
-use crate::session::StoredSession;
-
 pub type IntentExecutor = fn(&Intent) -> ExecutionOutcome;
+
+pub struct BridgeContext<'a> {
+    session_store_path: Option<&'a PathBuf>,
+    approval_policy: &'a ApprovalPolicy,
+    executor: IntentExecutor,
+}
+
+impl<'a> BridgeContext<'a> {
+    pub fn new(
+        session_store_path: Option<&'a PathBuf>,
+        approval_policy: &'a ApprovalPolicy,
+        executor: IntentExecutor,
+    ) -> Self {
+        Self {
+            session_store_path,
+            approval_policy,
+            executor,
+        }
+    }
+
+    pub fn session_store_path(&self) -> Option<&'a PathBuf> {
+        self.session_store_path
+    }
+
+    pub fn approval_policy(&self) -> &'a ApprovalPolicy {
+        self.approval_policy
+    }
+
+    pub fn executor(&self) -> IntentExecutor {
+        self.executor
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum BridgeResponse {
@@ -72,13 +91,12 @@ impl BridgeApp {
     pub fn dispatch(&self, text: &str, session_key: &str) -> BridgeResponse {
         let intent = parse_intent(text);
         let trimmed_text = text.trim();
+        let context = self.context();
 
         if self.approval_policy.requires_approval(&intent) {
             return plan_dispatch::start_plan(
+                &context,
                 session_key,
-                self.session_store_path.as_ref(),
-                &self.approval_policy,
-                self.executor,
                 trimmed_text,
                 vec![intent],
                 ExecutionMode::StepByStep,
@@ -87,96 +105,61 @@ impl BridgeApp {
 
         match intent {
             Intent::RunPlan { steps, mode } => plan_dispatch::start_plan(
+                &context,
                 session_key,
-                self.session_store_path.as_ref(),
-                &self.approval_policy,
-                self.executor,
                 trimmed_text,
                 steps,
                 mode,
             ),
             Intent::ContinuePlan => plan_dispatch::resume_plan(
+                &context,
                 session_key,
-                self.session_store_path.as_ref(),
-                &self.approval_policy,
-                self.executor,
                 false,
                 "继续",
             ),
             Intent::RetryFailedStep => plan_dispatch::resume_plan(
+                &context,
                 session_key,
-                self.session_store_path.as_ref(),
-                &self.approval_policy,
-                self.executor,
                 false,
                 "重新执行失败步骤",
             ),
             Intent::ExecuteAll => plan_dispatch::resume_plan(
+                &context,
                 session_key,
-                self.session_store_path.as_ref(),
-                &self.approval_policy,
-                self.executor,
                 true,
                 "执行全部",
             ),
-            Intent::ApprovePending => plan_dispatch::approve_plan(
-                session_key,
-                self.session_store_path.as_ref(),
-                &self.approval_policy,
-                self.executor,
-            ),
-            Intent::RejectPending => {
-                plan_dispatch::reject_plan(session_key, self.session_store_path.as_ref())
-            }
-            Intent::ExplainLastFailure => {
-                follow_up::explain_last_failure(session_key, self.session_store_path.as_ref())
-            }
-            Intent::ShowLastResult => {
-                follow_up::show_last_result(session_key, self.session_store_path.as_ref())
-            }
-            Intent::ContinueLastFile => {
-                follow_up::continue_last_file(session_key, self.session_store_path.as_ref())
-            }
-            Intent::ShowLastDiff => {
-                follow_up::show_last_diff(session_key, self.session_store_path.as_ref())
-            }
-            Intent::ShowRecentFiles => {
-                follow_up::show_recent_files(session_key, self.session_store_path.as_ref())
-            }
-            Intent::UndoLastPatch => {
-                follow_up::undo_last_patch(session_key, self.session_store_path.as_ref())
-            }
+            Intent::ApprovePending => plan_dispatch::approve_plan(&context, session_key),
+            Intent::RejectPending => plan_dispatch::reject_plan(&context, session_key),
+            Intent::ExplainLastFailure => follow_up::explain_last_failure(&context, session_key),
+            Intent::ShowLastResult => follow_up::show_last_result(&context, session_key),
+            Intent::ContinueLastFile => follow_up::continue_last_file(&context, session_key),
+            Intent::ShowLastDiff => follow_up::show_last_diff(&context, session_key),
+            Intent::ShowRecentFiles => follow_up::show_recent_files(&context, session_key),
+            Intent::UndoLastPatch => follow_up::undo_last_patch(&context, session_key),
             Intent::Help => BridgeResponse::Text(help_text().to_string()),
             Intent::Unknown(raw) => {
                 BridgeResponse::Text(format!("❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令"))
             }
             other => direct_command::execute_direct_command(
+                &context,
                 session_key,
-                self.session_store_path.as_ref(),
-                self.executor,
                 trimmed_text,
                 other,
             ),
         }
     }
 
-    pub fn approval_policy(&self) -> &ApprovalPolicy {
-        &self.approval_policy
-    }
-    #[cfg(test)]
-    fn persist_session(&self, session_key: &str, session: &StoredSession) -> Result<(), String> {
-        session::persist_session(self.session_store_path.as_ref(), session_key, session)
+    fn context(&self) -> BridgeContext<'_> {
+        BridgeContext::new(
+            self.session_store_path.as_ref(),
+            &self.approval_policy,
+            self.executor,
+        )
     }
 
-    #[cfg(test)]
-    fn build_stored_session(
-        &self,
-        plan: Option<PlanSession>,
-        task_text: &str,
-        action: &str,
-        progress: &PlanProgress,
-    ) -> StoredSession {
-        session::build_stored_session(plan, task_text, action, progress)
+    pub fn approval_policy(&self) -> &ApprovalPolicy {
+        &self.approval_policy
     }
 }
 
@@ -199,6 +182,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::plan::{ApprovalRequest, PlanProgress};
+    use crate::reply;
+    use crate::session::{self, StoredDiff, StoredPatch, StoredResult, StoredSession, StoredStep};
 
     fn stored_task(task: &str, status: &str, summary: &str) -> StoredSession {
         StoredSession {
@@ -365,7 +352,7 @@ mod tests {
             last_patch: None,
         };
 
-        app.persist_session(session_key, &stored).unwrap();
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
 
         match app.dispatch("刚才为什么失败", session_key) {
             BridgeResponse::Text(text) => {
@@ -410,7 +397,7 @@ mod tests {
             last_patch: None,
         };
 
-        app.persist_session(session_key, &stored).unwrap();
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
 
         match app.dispatch("把上一步结果发我", session_key) {
             BridgeResponse::Text(text) => {
@@ -458,7 +445,7 @@ mod tests {
             last_patch: None,
         };
 
-        app.persist_session(session_key, &stored).unwrap();
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
 
         match app.dispatch("继续改刚才那个文件", session_key) {
             BridgeResponse::Text(text) => {
@@ -503,7 +490,7 @@ mod tests {
             last_patch: None,
         };
 
-        app.persist_session(session_key, &stored).unwrap();
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
 
         match app.dispatch("继续刚才的任务", session_key) {
             BridgeResponse::Text(text) => {
@@ -539,7 +526,6 @@ mod tests {
 
     #[test]
     fn build_stored_session_remembers_file_from_apply_patch() {
-        let app = BridgeApp::new(None, ApprovalPolicy::default());
         let progress = PlanProgress {
             executed: vec![crate::plan::StepExecution {
                 step_number: 1,
@@ -559,7 +545,7 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = app.build_stored_session(None, "应用补丁", "执行计划", &progress);
+        let stored = session::build_stored_session(None, "应用补丁", "执行计划", &progress);
 
         assert_eq!(stored.last_file_path, Some("src/demo.rs".to_string()));
         assert_eq!(stored.recent_file_paths, vec!["src/demo.rs".to_string()]);
@@ -568,7 +554,6 @@ mod tests {
 
     #[test]
     fn build_stored_session_remembers_all_files_from_apply_patch() {
-        let app = BridgeApp::new(None, ApprovalPolicy::default());
         let progress = PlanProgress {
             executed: vec![crate::plan::StepExecution {
                 step_number: 1,
@@ -588,7 +573,7 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = app.build_stored_session(None, "应用补丁", "执行计划", &progress);
+        let stored = session::build_stored_session(None, "应用补丁", "执行计划", &progress);
 
         assert_eq!(
             stored.recent_file_paths,
@@ -630,7 +615,7 @@ mod tests {
             }),
         };
 
-        app.persist_session(session_key, &stored).unwrap();
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
 
         match app.dispatch("把刚才的 diff 发我", session_key) {
             BridgeResponse::Text(text) => {
@@ -728,7 +713,7 @@ mod tests {
             last_patch: None,
         };
 
-        app.persist_session(session_key, &stored).unwrap();
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
 
         match app.dispatch("把刚才改动的文件列表发我", session_key) {
             BridgeResponse::Text(text) => {

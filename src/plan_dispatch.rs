@@ -1,18 +1,14 @@
-use std::path::PathBuf;
-
 use crate::audit;
-use crate::bridge::BridgeResponse;
+use crate::bridge::{BridgeContext, BridgeResponse};
 use crate::card;
-use crate::plan::{ApprovalRequest, ExecutionOutcome, PlanSession};
+use crate::plan::{ApprovalRequest, PlanSession};
 use crate::reply;
 use crate::session::{self, StoredSession};
 use crate::{ApprovalPolicy, ExecutionMode, Intent};
 
 pub fn start_plan(
+    context: &BridgeContext<'_>,
     session_key: &str,
-    session_store_path: Option<&PathBuf>,
-    approval_policy: &ApprovalPolicy,
-    executor: fn(&Intent) -> ExecutionOutcome,
     task_text: &str,
     steps: Vec<Intent>,
     mode: ExecutionMode,
@@ -20,10 +16,10 @@ pub fn start_plan(
     let mut session = PlanSession::new(steps);
     let progress = match mode {
         ExecutionMode::StepByStep => session.execute_next_with_policy(
-            executor,
+            context.executor(),
             |step_index, step_number, intent, run_all_after_approval| {
                 build_approval_request(
-                    approval_policy,
+                    context.approval_policy(),
                     step_index,
                     step_number,
                     intent,
@@ -32,10 +28,10 @@ pub fn start_plan(
             },
         ),
         ExecutionMode::ContinueAll => session.execute_remaining_with_policy(
-            executor,
+            context.executor(),
             |step_index, step_number, intent, run_all_after_approval| {
                 build_approval_request(
-                    approval_policy,
+                    context.approval_policy(),
                     step_index,
                     step_number,
                     intent,
@@ -57,23 +53,21 @@ pub fn start_plan(
     let reply = card::format_plan_reply(
         &progress,
         matches!(mode, ExecutionMode::ContinueAll),
-        approval_policy,
+        context.approval_policy(),
         &stored,
     );
-    let _ = session::persist_session(session_store_path, session_key, &stored);
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
 
     reply
 }
 
 pub fn resume_plan(
+    context: &BridgeContext<'_>,
     session_key: &str,
-    session_store_path: Option<&PathBuf>,
-    approval_policy: &ApprovalPolicy,
-    executor: fn(&Intent) -> ExecutionOutcome,
     run_all: bool,
     action_name: &str,
 ) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(session_store_path, session_key) else {
+    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text("⚠️ 当前没有待继续的计划。\n\n发送「执行计划 <命令1>; <命令2>」创建逐步计划，或发送「执行全部 <命令1>; <命令2>」连续执行。".to_string());
     };
 
@@ -82,9 +76,9 @@ pub fn resume_plan(
     };
 
     let progress = if run_all {
-        session.execute_remaining_with_policy(executor, |step_index, step_number, intent, run_all_after_approval| {
+        session.execute_remaining_with_policy(context.executor(), |step_index, step_number, intent, run_all_after_approval| {
             build_approval_request(
-                approval_policy,
+                context.approval_policy(),
                 step_index,
                 step_number,
                 intent,
@@ -92,9 +86,9 @@ pub fn resume_plan(
             )
         })
     } else {
-        session.execute_next_with_policy(executor, |step_index, step_number, intent, run_all_after_approval| {
+        session.execute_next_with_policy(context.executor(), |step_index, step_number, intent, run_all_after_approval| {
             build_approval_request(
-                approval_policy,
+                context.approval_policy(),
                 step_index,
                 step_number,
                 intent,
@@ -112,20 +106,18 @@ pub fn resume_plan(
         action_name,
         &progress,
     );
-    let reply = card::format_plan_reply(&progress, run_all, approval_policy, &stored);
-    let _ = session::persist_session(session_store_path, session_key, &stored);
+    let reply = card::format_plan_reply(&progress, run_all, context.approval_policy(), &stored);
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
     audit::append_plan_action_audit(session_key, action_name, &reply, &stored, Some(&progress));
 
     reply
 }
 
 pub fn approve_plan(
+    context: &BridgeContext<'_>,
     session_key: &str,
-    session_store_path: Option<&PathBuf>,
-    approval_policy: &ApprovalPolicy,
-    executor: fn(&Intent) -> ExecutionOutcome,
 ) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(session_store_path, session_key) else {
+    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text("⚠️ 当前没有待审批的计划。".to_string());
     };
 
@@ -137,9 +129,9 @@ pub fn approve_plan(
         return BridgeResponse::Text("⚠️ 当前没有待审批步骤。可以发送「继续」或「执行全部」推进计划。".to_string());
     }
 
-    let progress = session.approve_pending_with_policy(executor, |step_index, step_number, intent, run_all_after_approval| {
+    let progress = session.approve_pending_with_policy(context.executor(), |step_index, step_number, intent, run_all_after_approval| {
         build_approval_request(
-            approval_policy,
+            context.approval_policy(),
             step_index,
             step_number,
             intent,
@@ -156,15 +148,15 @@ pub fn approve_plan(
         "批准",
         &progress,
     );
-    let reply = card::format_plan_reply(&progress, false, approval_policy, &stored);
-    let _ = session::persist_session(session_store_path, session_key, &stored);
+    let reply = card::format_plan_reply(&progress, false, context.approval_policy(), &stored);
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
     audit::append_plan_action_audit(session_key, "批准", &reply, &stored, Some(&progress));
 
     reply
 }
 
-pub fn reject_plan(session_key: &str, session_store_path: Option<&PathBuf>) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(session_store_path, session_key) else {
+pub fn reject_plan(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
         return BridgeResponse::Text("⚠️ 当前没有待审批的计划。".to_string());
     };
 
@@ -185,7 +177,7 @@ pub fn reject_plan(session_key: &str, session_store_path: Option<&PathBuf>) -> B
         success: false,
     });
     stored.last_step = None;
-    let _ = session::persist_session(session_store_path, session_key, &stored);
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
     let reply = BridgeResponse::Text("🛑 已拒绝当前待审批步骤，当前计划已取消。".to_string());
     audit::append_plan_action_audit(session_key, "拒绝", &reply, &stored, None);
     reply
