@@ -12,9 +12,10 @@
 - Fixed the macOS bootstrap gap without `npm`: copied the prebuilt companion extension into `~/.vscode/extensions`, confirmed VS Code now recognizes `bean-harbor.feishu-vscode-agent-bridge@0.0.1`, and restored `http://127.0.0.1:8765/health`
 - Confirmed the remaining ask-path issue is no longer extension startup but workspace binding: the active `8765` server was attached to a VS Code window without repository context, so raw `/v1/chat/ask` responses lacked a `Workspace:` line in `context`
 - Added a dedicated POSIX helper `scripts/start-extension-dev-host.sh` so future sessions can start an isolated extension-development host with explicit `BRIDGE_AGENT_BRIDGE_PORT` and `BRIDGE_AGENT_BOOTSTRAP_WORKSPACE` instead of repeating ad hoc startup experiments
+- Fixed the remaining workspace-binding regression in the companion extension: windows without any opened workspace now skip bridge auto-start, which prevents an empty VS Code window from grabbing `8765` and returning ask responses with no `Workspace:` context
 - Reduced the current MVP release picture to a simpler status split:
      - 已完成：Feishu listener auth/WebSocket path, Rust bridge command/follow-up continuity, setup wizard health-check flow, Windows/macOS packaging scripts, bundled `.vsix` first plus Marketplace fallback logic
-     - 阻塞：workspace-aware ask grounding still depends on the extension being bound to the correct VS Code window; a generic `8765` server can come from an empty window and return no repository context
+     - 阻塞：isolated `8766` extension-development host startup still needs a cleaner repeatable path on this macOS host when launched outside the regular installed-extension flow
      - 可延后：further bridge-internal extraction beyond the current dispatcher split, richer card UX for agent state, and full tool-loop work beyond the first read/search loop
 
 ### Files Updated
@@ -38,6 +39,7 @@
 - `http://127.0.0.1:8765/health` now returns `{"status":"ok","port":8765,"sessions":0}` on this macOS host
 - `target/debug/bridge-cli '问 Copilot parse_intent 这个函数是干什么的'` now completes through the extension/model path, proving bootstrap is restored even though workspace grounding still depends on the bound window context
 - Git diff summary confirmed the two POSIX helper scripts need executable-mode metadata for the repository copy used by docs and regression runs
+- After restarting VS Code on the repository window, `http://127.0.0.1:8765/v1/chat/ask` again returns grounded answers with `Workspace: /Users/Bean/Documents/trae_projects/feishu-vscode-bridge` plus retrieved snippets for `parse_intent`, confirming the no-workspace auto-start guard fixes the binding issue on the regular installed-extension path
 
 ## 2026-03-30
 

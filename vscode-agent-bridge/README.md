@@ -53,7 +53,7 @@ Use this shortest path before debugging Rust-side code:
 4. Start the Rust listener with `./scripts/start-live-listener.sh`.
   - If the shell reports `permission denied`, run `bash ./scripts/start-live-listener.sh` or refresh the repository copy so the executable bit is preserved.
 5. If the listener reaches Feishu authentication but `/health` is still unavailable, treat the current blocker as extension bootstrap or activation, not Feishu credentials.
-6. If `/health` is up but `context` has no `Workspace:` line, assume the bound server belongs to a VS Code window without the repository opened; prefer the isolated dev-host helper on port `8766` instead of repeatedly probing the same `8765` instance.
+6. If `/health` is up but `context` has no `Workspace:` line, assume the bound server belongs to a VS Code window without the repository opened. The extension now skips auto-start in no-workspace windows, so closing and reopening VS Code on the repository should let the correct window claim `8765`.
 
 ## Rust Bridge Integration
 

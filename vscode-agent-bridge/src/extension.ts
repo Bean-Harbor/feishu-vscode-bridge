@@ -111,8 +111,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 
     if (vscode.workspace.getConfiguration('feishuVscodeBridge').get<boolean>('agentBridge.autoStart', true)) {
+        if (!hasBridgeWorkspaceContext()) {
+            bridge.output.appendLine('Skipping agent bridge auto-start because this window has no workspace context.');
+            return;
+        }
         await startBridgeServer(bridge);
     }
+}
+
+function hasBridgeWorkspaceContext(): boolean {
+    if ((vscode.workspace.workspaceFolders?.length ?? 0) > 0) {
+        return true;
+    }
+
+    return Boolean(process.env[BOOTSTRAP_WORKSPACE_ENV]?.trim());
 }
 
 async function ensureBootstrapWorkspace(bridge: BridgeContext): Promise<boolean> {
