@@ -237,6 +237,7 @@ pub enum Intent {
 }
 
 pub mod executor;
+pub mod bridge_context;
 pub mod direct_command;
 pub mod follow_up;
 pub mod intent_executor;

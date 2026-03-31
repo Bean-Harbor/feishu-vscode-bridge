@@ -452,3 +452,67 @@ fn describe_intent(intent: &Intent) -> String {
         Intent::Unknown(raw) => format!("未识别命令 {raw}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_stored_session_remembers_file_from_apply_patch() {
+        let progress = PlanProgress {
+            executed: vec![StepExecution {
+                step_number: 1,
+                intent: Intent::ApplyPatch {
+                    patch: "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                },
+                outcome: ExecutionOutcome {
+                    success: true,
+                    reply: "patched".to_string(),
+                },
+            }],
+            total_steps: 1,
+            next_step: 1,
+            completed: true,
+            paused_on_failure: false,
+            paused_on_approval: false,
+            approval_request: None,
+        };
+
+        let stored = build_stored_session(None, "应用补丁", "执行计划", &progress);
+
+        assert_eq!(stored.last_file_path, Some("src/demo.rs".to_string()));
+        assert_eq!(stored.recent_file_paths, vec!["src/demo.rs".to_string()]);
+        assert!(stored.last_patch.is_some());
+    }
+
+    #[test]
+    fn build_stored_session_remembers_all_files_from_apply_patch() {
+        let progress = PlanProgress {
+            executed: vec![StepExecution {
+                step_number: 1,
+                intent: Intent::ApplyPatch {
+                    patch: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/src/bridge.rs b/src/bridge.rs\n--- a/src/bridge.rs\n+++ b/src/bridge.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                },
+                outcome: ExecutionOutcome {
+                    success: true,
+                    reply: "patched".to_string(),
+                },
+            }],
+            total_steps: 1,
+            next_step: 1,
+            completed: true,
+            paused_on_failure: false,
+            paused_on_approval: false,
+            approval_request: None,
+        };
+
+        let stored = build_stored_session(None, "应用补丁", "执行计划", &progress);
+
+        assert_eq!(
+            stored.recent_file_paths,
+            vec!["src/bridge.rs".to_string(), "src/lib.rs".to_string()]
+        );
+        assert!(stored.last_diff.as_ref().is_some_and(|diff| diff.content.contains("diff --git a/src/lib.rs")));
+        assert!(stored.last_patch.as_ref().is_some_and(|patch| patch.file_paths == vec!["src/bridge.rs".to_string(), "src/lib.rs".to_string()]));
+    }
+}

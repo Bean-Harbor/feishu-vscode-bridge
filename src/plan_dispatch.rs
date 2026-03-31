@@ -1,5 +1,6 @@
 use crate::audit;
-use crate::bridge::{BridgeContext, BridgeResponse};
+use crate::bridge::BridgeResponse;
+use crate::bridge_context::BridgeContext;
 use crate::card;
 use crate::plan::{ApprovalRequest, PlanSession};
 use crate::reply;

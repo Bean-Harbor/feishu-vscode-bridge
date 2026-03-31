@@ -544,3 +544,201 @@ fn build_follow_up_actions(stored: &StoredSession) -> Vec<serde_json::Value> {
 
     actions
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::plan::{ApprovalRequest, ExecutionOutcome};
+    use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredSession};
+    use crate::Intent;
+
+    fn shell_intent(cmd: &str) -> Intent {
+        Intent::RunShell {
+            cmd: cmd.to_string(),
+        }
+    }
+
+    fn stored_task(task: &str, status: &str, summary: &str) -> StoredSession {
+        StoredSession {
+            plan: None,
+            current_task: Some(task.to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: status.to_string(),
+                summary: summary.to_string(),
+                success: true,
+            }),
+            last_action: Some("执行计划".to_string()),
+            last_step: None,
+            last_file_path: None,
+            recent_file_paths: Vec::new(),
+            last_diff: None,
+            last_patch: None,
+        }
+    }
+
+    #[test]
+    fn completion_reply_returns_completion_card() {
+        let progress = PlanProgress {
+            executed: vec![crate::plan::StepExecution {
+                step_number: 1,
+                intent: shell_intent("pwd"),
+                outcome: ExecutionOutcome {
+                    success: true,
+                    reply: "ok".to_string(),
+                },
+            }],
+            total_steps: 1,
+            next_step: 1,
+            completed: true,
+            paused_on_failure: false,
+            paused_on_approval: false,
+            approval_request: None,
+        };
+
+        let stored = stored_task("执行计划 $ pwd", "已完成", "计划已完成，共执行 1 步。");
+
+        match format_plan_reply(&progress, false, &ApprovalPolicy::default(), &stored) {
+            BridgeResponse::Card { fallback_text, card } => {
+                assert!(fallback_text.contains("状态: 已完成"));
+                assert_eq!(card["header"]["title"]["content"], "已完成");
+                assert!(card.to_string().contains("当前任务"));
+                assert!(card.to_string().contains("执行计划 $ pwd"));
+                assert!(card.to_string().contains("最近结果"));
+                assert!(card["elements"].as_array().unwrap().iter().all(|element| element["tag"] != "action"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn paused_reply_contains_failed_step_details() {
+        let progress = PlanProgress {
+            executed: vec![crate::plan::StepExecution {
+                step_number: 2,
+                intent: shell_intent("false"),
+                outcome: ExecutionOutcome {
+                    success: false,
+                    reply: "failed".to_string(),
+                },
+            }],
+            total_steps: 3,
+            next_step: 1,
+            completed: false,
+            paused_on_failure: true,
+            paused_on_approval: false,
+            approval_request: None,
+        };
+
+        let stored = stored_task("执行全部 $ false; $ pwd", "失败暂停", "第 2 / 3 步失败：执行命令 false");
+
+        match format_plan_reply(&progress, true, &ApprovalPolicy::default(), &stored) {
+            BridgeResponse::Card { fallback_text, card } => {
+                assert!(fallback_text.contains("失败步骤: 第 2 / 3 步"));
+                assert_eq!(card["header"]["title"]["content"], "已暂停");
+                assert!(card.to_string().contains("执行全部 $ false; $ pwd"));
+                assert!(card.to_string().contains("失败暂停: 第 2 / 3 步失败"));
+                assert!(card.to_string().contains("失败步骤"));
+                assert!(card.to_string().contains("重试这步"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn approval_reply_contains_approve_actions() {
+        let progress = PlanProgress {
+            executed: Vec::new(),
+            total_steps: 1,
+            next_step: 0,
+            completed: false,
+            paused_on_failure: false,
+            paused_on_approval: true,
+            approval_request: Some(ApprovalRequest {
+                step_index: 0,
+                step_number: 1,
+                intent: shell_intent("pwd"),
+                action_label: "执行命令 pwd".to_string(),
+                reason: "shell 命令默认需要人工确认。".to_string(),
+                risk_summary: "会在本地 shell 中执行命令，并可能修改工作区或系统状态。".to_string(),
+                run_all_after_approval: false,
+            }),
+        };
+
+        let stored = stored_task("执行计划 git pull", "待审批", "第 1 / 1 步等待批准。");
+
+        match format_plan_reply(&progress, false, &ApprovalPolicy::default(), &stored) {
+            BridgeResponse::Card { fallback_text, card } => {
+                assert!(fallback_text.contains("待审批步骤"));
+                assert_eq!(card["header"]["title"]["content"], "等你确认");
+                assert!(card.to_string().contains("执行计划 git pull"));
+                assert!(card.to_string().contains("待审批: 第 1 / 1 步等待批准。"));
+                assert!(card.to_string().contains("确认继续"));
+                assert!(card.to_string().contains("取消这步"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn completion_card_includes_follow_up_actions_when_context_exists() {
+        let progress = PlanProgress {
+            executed: vec![crate::plan::StepExecution {
+                step_number: 1,
+                intent: Intent::ApplyPatch {
+                    patch: "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                },
+                outcome: ExecutionOutcome {
+                    success: true,
+                    reply: "ok".to_string(),
+                },
+            }],
+            total_steps: 1,
+            next_step: 1,
+            completed: true,
+            paused_on_failure: false,
+            paused_on_approval: false,
+            approval_request: None,
+        };
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("应用补丁 demo".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已完成".to_string(),
+                summary: "补丁已应用。".to_string(),
+                success: true,
+            }),
+            last_action: Some("执行计划".to_string()),
+            last_step: Some(crate::session::StoredStep {
+                description: "应用补丁到当前工作区".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/demo.rs".to_string()),
+            recent_file_paths: vec!["src/demo.rs".to_string()],
+            last_diff: Some(StoredDiff {
+                description: "应用补丁到当前工作区".to_string(),
+                content: "diff --git a/src/demo.rs b/src/demo.rs".to_string(),
+            }),
+            last_patch: Some(StoredPatch {
+                content: "diff --git a/src/demo.rs b/src/demo.rs".to_string(),
+                file_paths: vec!["src/demo.rs".to_string()],
+            }),
+        };
+
+        match format_plan_reply(&progress, false, &ApprovalPolicy::default(), &stored) {
+            BridgeResponse::Card { card, .. } => {
+                let card_text = card.to_string();
+                assert!(card_text.contains("看上一步"));
+                assert!(card_text.contains("继续这个文件"));
+                assert!(card_text.contains("看 diff"));
+                assert!(card_text.contains("看文件列表"));
+                assert!(card_text.contains("撤回补丁"));
+                assert!(card_text.contains("继续问"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+}

@@ -1,4 +1,5 @@
-use crate::bridge::{BridgeContext, BridgeResponse};
+use crate::bridge::BridgeResponse;
+use crate::bridge_context::BridgeContext;
 use crate::reply;
 use crate::session::{self, StoredDiff, StoredResult, StoredStep};
 use crate::vscode;
@@ -113,4 +114,246 @@ pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> Bridge
 
     let _ = session::persist_session(context.session_store_path(), session_key, &stored);
     BridgeResponse::Text(reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::bridge::BridgeApp;
+    use crate::session::{StoredPatch, StoredSession};
+    use crate::ApprovalPolicy;
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "feishu-vscode-bridge-follow-up-tests-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn explain_last_failure_returns_last_step_detail() {
+        let session_path = unique_temp_path("failure");
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+        let session_key = "cli";
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("执行计划 $ false; $ pwd".to_string()),
+            pending_steps: vec!["执行命令 pwd".to_string()],
+            last_result: Some(StoredResult {
+                status: "失败暂停".to_string(),
+                summary: "第 1 / 2 步失败：执行命令 false".to_string(),
+                success: false,
+            }),
+            last_action: Some("继续".to_string()),
+            last_step: Some(StoredStep {
+                description: "执行命令 false".to_string(),
+                reply: "❌ $ false  (1ms)\n(exit code 1)".to_string(),
+                success: false,
+            }),
+            last_file_path: None,
+            recent_file_paths: Vec::new(),
+            last_diff: None,
+            last_patch: None,
+        };
+
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
+
+        match app.dispatch("刚才为什么失败", session_key) {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 失败原因回放"));
+                assert!(text.contains("🎯 当前任务: 执行计划 $ false; $ pwd"));
+                assert!(text.contains("上次失败状态: 失败暂停"));
+                assert!(text.contains("卡住的位置: 执行命令 false"));
+                assert!(text.contains("关键报错:"));
+                assert!(text.contains("下一步建议:"));
+                assert!(text.contains("执行命令 false"));
+                assert!(text.contains("$ false"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text failure explanation"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn show_last_result_returns_last_step_and_file() {
+        let session_path = unique_temp_path("last-result");
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+        let session_key = "cli";
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("读取 src/lib.rs 1-20".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已完成".to_string(),
+                summary: "计划已完成，共执行 1 步。".to_string(),
+                success: true,
+            }),
+            last_action: Some("执行计划".to_string()),
+            last_step: Some(StoredStep {
+                description: "读取文件 src/lib.rs:1-20".to_string(),
+                reply: "✅ 读取文件 src/lib.rs  (1ms)".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/lib.rs".to_string()),
+            recent_file_paths: vec!["src/lib.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
+
+        match app.dispatch("把上一步结果发我", session_key) {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 上一步结果回放"));
+                assert!(text.contains("📌 最近状态: 已完成"));
+                assert!(text.contains("上一步结果: 成功"));
+                assert!(text.contains("导语: 上一步已经完成"));
+                assert!(text.contains("结果摘要:"));
+                assert!(text.contains("下一步建议:"));
+                assert!(text.contains("读取文件 src/lib.rs:1-20"));
+                assert!(text.contains("相关文件: src/lib.rs"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text last-result reply"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn continue_last_file_reads_the_file() {
+        let session_path = unique_temp_path("last-file-session");
+        let file_path = unique_temp_path("last-file-target");
+        fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+        let session_key = "cli";
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("继续修改 demo 文件".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已完成".to_string(),
+                summary: "最近一次读取成功。".to_string(),
+                success: true,
+            }),
+            last_action: Some("执行计划".to_string()),
+            last_step: Some(StoredStep {
+                description: "读取文件 demo.txt".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some(file_path.to_string_lossy().to_string()),
+            recent_file_paths: vec![file_path.to_string_lossy().to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
+
+        match app.dispatch("继续改刚才那个文件", session_key) {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 继续文件上下文"));
+                assert!(text.contains("继续处理刚才的文件"));
+                assert!(text.contains(file_path.to_string_lossy().as_ref()));
+                assert!(text.contains("alpha"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text file continuation reply"),
+        }
+
+        let _ = fs::remove_file(session_path);
+        let _ = fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn show_last_diff_returns_patch_content() {
+        let session_path = unique_temp_path("last-diff");
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+        let session_key = "cli";
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("应用补丁 demo".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已完成".to_string(),
+                summary: "补丁已应用。".to_string(),
+                success: true,
+            }),
+            last_action: Some("执行计划".to_string()),
+            last_step: Some(StoredStep {
+                description: "应用补丁到当前工作区".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/demo.rs".to_string()),
+            recent_file_paths: vec!["src/demo.rs".to_string()],
+            last_diff: Some(StoredDiff {
+                description: "应用补丁到当前工作区".to_string(),
+                content: "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs".to_string(),
+            }),
+            last_patch: Some(StoredPatch {
+                content: "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs".to_string(),
+                file_paths: vec!["src/demo.rs".to_string()],
+            }),
+        };
+
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
+
+        match app.dispatch("把刚才的 diff 发我", session_key) {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 最近 diff 回放"));
+                assert!(text.contains("最近一次 diff"));
+                assert!(text.contains("src/demo.rs"));
+                assert!(text.contains("diff --git a/src/demo.rs b/src/demo.rs"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text last-diff reply"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn show_recent_files_returns_recent_file_list() {
+        let session_path = unique_temp_path("recent-files");
+        let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
+        let session_key = "cli";
+        let stored = StoredSession {
+            plan: None,
+            current_task: Some("应用补丁 demo".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已完成".to_string(),
+                summary: "补丁已应用。".to_string(),
+                success: true,
+            }),
+            last_action: Some("执行计划".to_string()),
+            last_step: None,
+            last_file_path: Some("src/a.rs".to_string()),
+            recent_file_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        session::persist_session(Some(&session_path), session_key, &stored).unwrap();
+
+        match app.dispatch("把刚才改动的文件列表发我", session_key) {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("🧭 最近文件回放"));
+                assert!(text.contains("最近改动文件列表"));
+                assert!(text.contains("1. src/a.rs"));
+                assert!(text.contains("2. src/b.rs"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text recent-files reply"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
 }
