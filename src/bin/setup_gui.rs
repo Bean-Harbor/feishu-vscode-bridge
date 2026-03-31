@@ -324,7 +324,7 @@ fn launch_vscode_workspace_and_check_health() -> SetupTaskStatus {
     };
 
     let workspace_arg = dir.display().to_string();
-    match run_vscode_cli(&[workspace_arg.as_str()]) {
+    match run_vscode_cli(&["--add", workspace_arg.as_str()]) {
         Ok(output) if !output.status.success() => {
             return SetupTaskStatus {
                 ok: false,
@@ -700,12 +700,12 @@ fn workspace_dir() -> Result<PathBuf, String> {
     workspace_dir_any()
 }
 
-/// 用 VS Code 打开工作区目录。
+/// 用 VS Code 将工作区目录追加到当前窗口，避免直接打开文件夹导致当前会话被替换。
 #[cfg(not(target_os = "macos"))]
 fn launch_vscode_for_workspace() -> Result<(), String> {
     let dir = workspace_dir()?;
     let workspace = dir.display().to_string();
-    let output = run_vscode_cli(&[workspace.as_str()])?;
+    let output = run_vscode_cli(&["--add", workspace.as_str()])?;
     if output.status.success() {
         Ok(())
     } else {

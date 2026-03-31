@@ -79,7 +79,7 @@ pub fn open_file(path: &str, line: Option<u32>) -> CmdResult {
             let target = format!("{path}:{line}");
             run_cmd("code", &["--goto", &target], 10)
         }
-        None => run_cmd("code", &[path], 10),
+        None => run_cmd("code", &["--reuse-window", path], 10),
     }
 }
 
@@ -100,7 +100,7 @@ pub fn list_extensions() -> CmdResult {
 
 /// 在当前工作区打开一个文件夹
 pub fn open_folder(path: &str) -> CmdResult {
-    run_cmd("code", &[path], 10)
+    run_cmd("code", &["--add", path], 10)
 }
 
 /// 用 VS Code 执行 diff

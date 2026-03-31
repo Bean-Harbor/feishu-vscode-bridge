@@ -51,4 +51,4 @@ echo "Using workspace: $workspace_path"
 echo "Using agent bridge port: $port"
 echo "Using VS Code CLI: $code_cli"
 
-exec "$code_cli" --new-window "$workspace_path" --extensionDevelopmentPath="$repo_root/vscode-agent-bridge"
+exec "$code_cli" --new-window --add "$workspace_path" --extensionDevelopmentPath="$repo_root/vscode-agent-bridge"
