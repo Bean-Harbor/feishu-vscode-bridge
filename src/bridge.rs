@@ -62,61 +62,61 @@ impl BridgeApp {
         let trimmed_text = text.trim();
         let context = self.context();
 
-        if self.approval_policy.requires_approval(&intent) {
-            return plan_dispatch::start_plan(
-                &context,
-                session_key,
-                trimmed_text,
-                vec![intent],
-                ExecutionMode::StepByStep,
-            );
+        self.dispatch_intent(&context, session_key, trimmed_text, intent)
+    }
+
+    fn dispatch_intent(
+        &self,
+        context: &BridgeContext<'_>,
+        session_key: &str,
+        task_text: &str,
+        intent: Intent,
+    ) -> BridgeResponse {
+        if let Some(response) = self.dispatch_required_approval(context, session_key, task_text, &intent) {
+            return response;
         }
 
         match intent {
-            Intent::RunPlan { steps, mode } => plan_dispatch::start_plan(
-                &context,
-                session_key,
-                trimmed_text,
-                steps,
-                mode,
-            ),
-            Intent::ContinuePlan => plan_dispatch::resume_plan(
-                &context,
-                session_key,
-                false,
-                "继续",
-            ),
-            Intent::RetryFailedStep => plan_dispatch::resume_plan(
-                &context,
-                session_key,
-                false,
-                "重新执行失败步骤",
-            ),
-            Intent::ExecuteAll => plan_dispatch::resume_plan(
-                &context,
-                session_key,
-                true,
-                "执行全部",
-            ),
-            Intent::ApprovePending => plan_dispatch::approve_plan(&context, session_key),
-            Intent::RejectPending => plan_dispatch::reject_plan(&context, session_key),
-            Intent::ExplainLastFailure => follow_up::explain_last_failure(&context, session_key),
-            Intent::ShowLastResult => follow_up::show_last_result(&context, session_key),
-            Intent::ContinueLastFile => follow_up::continue_last_file(&context, session_key),
-            Intent::ShowLastDiff => follow_up::show_last_diff(&context, session_key),
-            Intent::ShowRecentFiles => follow_up::show_recent_files(&context, session_key),
-            Intent::UndoLastPatch => follow_up::undo_last_patch(&context, session_key),
+            Intent::RunPlan { steps, mode } => {
+                plan_dispatch::start_plan(context, session_key, task_text, steps, mode)
+            }
+            Intent::ContinuePlan
+            | Intent::RetryFailedStep
+            | Intent::ExecuteAll
+            | Intent::ApprovePending
+            | Intent::RejectPending => dispatch_plan_action(context, session_key, intent),
+            Intent::ExplainLastFailure
+            | Intent::ShowLastResult
+            | Intent::ContinueLastFile
+            | Intent::ShowLastDiff
+            | Intent::ShowRecentFiles
+            | Intent::UndoLastPatch => dispatch_follow_up_action(context, session_key, intent),
             Intent::Help => BridgeResponse::Text(help_text().to_string()),
             Intent::Unknown(raw) => {
                 BridgeResponse::Text(format!("❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令"))
             }
-            other => direct_command::execute_direct_command(
-                &context,
-                session_key,
-                trimmed_text,
-                other,
-            ),
+            other => direct_command::execute_direct_command(context, session_key, task_text, other),
         }
+    }
+
+    fn dispatch_required_approval(
+        &self,
+        context: &BridgeContext<'_>,
+        session_key: &str,
+        task_text: &str,
+        intent: &Intent,
+    ) -> Option<BridgeResponse> {
+        if !self.approval_policy.requires_approval(intent) {
+            return None;
+        }
+
+        Some(plan_dispatch::start_plan(
+            context,
+            session_key,
+            task_text,
+            vec![intent.clone()],
+            ExecutionMode::StepByStep,
+        ))
     }
 
     fn context(&self) -> BridgeContext<'_> {
@@ -129,6 +129,39 @@ impl BridgeApp {
 
     pub fn approval_policy(&self) -> &ApprovalPolicy {
         &self.approval_policy
+    }
+}
+
+fn dispatch_plan_action(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    intent: Intent,
+) -> BridgeResponse {
+    match intent {
+        Intent::ContinuePlan => plan_dispatch::resume_plan(context, session_key, false, "继续"),
+        Intent::RetryFailedStep => {
+            plan_dispatch::resume_plan(context, session_key, false, "重新执行失败步骤")
+        }
+        Intent::ExecuteAll => plan_dispatch::resume_plan(context, session_key, true, "执行全部"),
+        Intent::ApprovePending => plan_dispatch::approve_plan(context, session_key),
+        Intent::RejectPending => plan_dispatch::reject_plan(context, session_key),
+        _ => unreachable!("non-plan action routed to dispatch_plan_action"),
+    }
+}
+
+fn dispatch_follow_up_action(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    intent: Intent,
+) -> BridgeResponse {
+    match intent {
+        Intent::ExplainLastFailure => follow_up::explain_last_failure(context, session_key),
+        Intent::ShowLastResult => follow_up::show_last_result(context, session_key),
+        Intent::ContinueLastFile => follow_up::continue_last_file(context, session_key),
+        Intent::ShowLastDiff => follow_up::show_last_diff(context, session_key),
+        Intent::ShowRecentFiles => follow_up::show_recent_files(context, session_key),
+        Intent::UndoLastPatch => follow_up::undo_last_patch(context, session_key),
+        _ => unreachable!("non-follow-up action routed to dispatch_follow_up_action"),
     }
 }
 
@@ -150,24 +183,13 @@ pub fn response_kind(response: &BridgeResponse) -> &'static str {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::session::{self, StoredDiff, StoredResult, StoredSession, StoredStep};
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "feishu-vscode-bridge-bridge-tests-{name}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
+    use crate::test_support::unique_temp_path;
 
     #[test]
     fn continue_plan_without_pending_plan_returns_continuity_summary() {
-        let session_path = unique_temp_path("continue-summary");
+        let session_path = unique_temp_path("bridge", "continue-summary");
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
@@ -215,7 +237,7 @@ mod tests {
 
     #[test]
     fn continue_plan_without_session_returns_warning() {
-        let session_path = unique_temp_path("continue-missing");
+        let session_path = unique_temp_path("bridge", "continue-missing");
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
 
         match app.dispatch("继续刚才的任务", "cli") {

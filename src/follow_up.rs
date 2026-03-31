@@ -120,27 +120,15 @@ pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> Bridge
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::bridge::BridgeApp;
     use crate::session::{StoredPatch, StoredSession};
+    use crate::test_support::unique_temp_path;
     use crate::ApprovalPolicy;
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "feishu-vscode-bridge-follow-up-tests-{name}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
 
     #[test]
     fn explain_last_failure_returns_last_step_detail() {
-        let session_path = unique_temp_path("failure");
+        let session_path = unique_temp_path("follow-up", "failure");
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
@@ -185,7 +173,7 @@ mod tests {
 
     #[test]
     fn show_last_result_returns_last_step_and_file() {
-        let session_path = unique_temp_path("last-result");
+        let session_path = unique_temp_path("follow-up", "last-result");
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
@@ -230,8 +218,8 @@ mod tests {
 
     #[test]
     fn continue_last_file_reads_the_file() {
-        let session_path = unique_temp_path("last-file-session");
-        let file_path = unique_temp_path("last-file-target");
+        let session_path = unique_temp_path("follow-up", "last-file-session");
+        let file_path = unique_temp_path("follow-up", "last-file-target");
         fs::write(&file_path, "alpha\nbeta\n").unwrap();
 
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
@@ -275,7 +263,7 @@ mod tests {
 
     #[test]
     fn show_last_diff_returns_patch_content() {
-        let session_path = unique_temp_path("last-diff");
+        let session_path = unique_temp_path("follow-up", "last-diff");
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
@@ -322,7 +310,7 @@ mod tests {
 
     #[test]
     fn show_recent_files_returns_recent_file_list() {
-        let session_path = unique_temp_path("recent-files");
+        let session_path = unique_temp_path("follow-up", "recent-files");
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {

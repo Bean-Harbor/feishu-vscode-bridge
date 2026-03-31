@@ -44,27 +44,15 @@ pub fn execute_direct_command(
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::bridge::BridgeApp;
+    use crate::test_support::unique_temp_path;
     use crate::ApprovalPolicy;
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "feishu-vscode-bridge-direct-command-tests-{name}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
 
     #[test]
     fn direct_command_persists_session_context() {
-        let session_path = unique_temp_path("direct-session");
-        let file_path = unique_temp_path("direct-file");
+        let session_path = unique_temp_path("direct-command", "direct-session");
+        let file_path = unique_temp_path("direct-command", "direct-file");
         fs::write(&file_path, "alpha\nbeta\n").unwrap();
 
         fn fake_executor(intent: &Intent) -> ExecutionOutcome {

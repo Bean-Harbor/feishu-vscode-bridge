@@ -251,6 +251,9 @@ pub mod reply;
 pub mod session;
 pub mod vscode;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// 解析用户消息为意图
 pub fn parse_intent(text: &str) -> Intent {
     let text = text.trim();

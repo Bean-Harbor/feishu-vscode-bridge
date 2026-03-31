@@ -160,17 +160,7 @@ pub(crate) fn append_audit_entry_to_path(path: &Path, entry: &AuditEntry) -> Res
 mod tests {
     use super::*;
     use std::fs;
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "feishu-vscode-bridge-audit-tests-{name}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
+    use crate::test_support::unique_temp_path;
 
     #[test]
     fn feishu_session_key_isolates_senders_in_same_chat() {
@@ -219,7 +209,7 @@ mod tests {
 
     #[test]
     fn append_audit_entry_writes_jsonl_record() {
-        let audit_path = unique_temp_path("audit-log");
+        let audit_path = unique_temp_path("audit", "audit-log");
         let entry = AuditEntry {
             timestamp_ms: 123,
             source: "message".to_string(),
