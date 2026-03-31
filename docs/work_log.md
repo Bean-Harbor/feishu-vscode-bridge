@@ -13,6 +13,7 @@
 - Confirmed the remaining ask-path issue is no longer extension startup but workspace binding: the active `8765` server was attached to a VS Code window without repository context, so raw `/v1/chat/ask` responses lacked a `Workspace:` line in `context`
 - Added a dedicated POSIX helper `scripts/start-extension-dev-host.sh` so future sessions can start an isolated extension-development host with explicit `BRIDGE_AGENT_BRIDGE_PORT` and `BRIDGE_AGENT_BOOTSTRAP_WORKSPACE` instead of repeating ad hoc startup experiments
 - Fixed the remaining workspace-binding regression in the companion extension: windows without any opened workspace now skip bridge auto-start, which prevents an empty VS Code window from grabbing `8765` and returning ask responses with no `Workspace:` context
+- Synced the VS Code workspace-open safety fix to GitHub as `4a1c083` (`Use add semantics for VS Code workspace opens`), covering the POSIX dev-host helper, Rust-side VS Code workspace/file open helpers, and setup-GUI workspace launch paths so they stop replacing the active VS Code session
 - Reduced the current MVP release picture to a simpler status split:
      - 已完成：Feishu listener auth/WebSocket path, Rust bridge command/follow-up continuity, setup wizard health-check flow, Windows/macOS packaging scripts, bundled `.vsix` first plus Marketplace fallback logic
      - 阻塞：isolated `8766` extension-development host startup still needs a cleaner repeatable path on this macOS host when launched outside the regular installed-extension flow
@@ -40,6 +41,13 @@
 - `target/debug/bridge-cli '问 Copilot parse_intent 这个函数是干什么的'` now completes through the extension/model path, proving bootstrap is restored even though workspace grounding still depends on the bound window context
 - Git diff summary confirmed the two POSIX helper scripts need executable-mode metadata for the repository copy used by docs and regression runs
 - After restarting VS Code on the repository window, `http://127.0.0.1:8765/v1/chat/ask` again returns grounded answers with `Workspace: /Users/Bean/Documents/trae_projects/feishu-vscode-bridge` plus retrieved snippets for `parse_intent`, confirming the no-workspace auto-start guard fixes the binding issue on the regular installed-extension path
+- Revalidated the VS Code CLI workspace-open regression on macOS with a live bridge session: both `./scripts/start-extension-dev-host.sh --port 8766` and a direct `code --add /Users/Bean/Documents/trae_projects/feishu-vscode-bridge` preserved the existing `8765` listener and the same bridge `sessionId`, so the new `--add` semantics no longer replace the active VS Code window/session. The remaining gap is narrower: the isolated `8766` dev-host still does not start listening, but it also no longer disrupts the active grounded `8765` path.
+
+### Next Session Focus
+
+- Resume from a Windows terminal with the workspace-open regression already closed by `4a1c083`; the remaining active investigation is why the isolated `8766` Extension Development Host still fails to bind/listen even though it no longer kills the active grounded `8765` bridge session
+- Start by replaying the now-safe dev-host path and collecting activation evidence on Windows: `scripts/start-extension-dev-host.sh` equivalent behavior, `Feishu Agent Bridge` output channel / extension-host logs, and whether `BRIDGE_AGENT_BRIDGE_PORT=8766` is observed by the extension at activation time
+- Keep `8765` as the known-good baseline during that work: use `/health`, listener PID checks, and the same `sessionId` continuity probe to confirm any new experiments do not regress the main grounded ask path while narrowing the `8766` startup failure
 
 ## 2026-03-30
 
