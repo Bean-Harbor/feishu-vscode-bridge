@@ -1,5 +1,44 @@
 # Work Log
 
+## 2026-03-31
+
+### Summary
+
+- Stopped further bridge-only modular extraction and switched the next slice back to MVP readiness, using the release plan, agent MVP execution plan, live Feishu checklist, startup scripts, packaging scripts, and setup wizard code as the source of truth
+- Reconfirmed the real Feishu listener path on macOS from the repository helper entrypoint by running `bash ./scripts/start-live-listener.sh --skip-build`, which reached both `✅ 飞书认证成功` and `✅ WebSocket 已连接，等待飞书消息...`
+- Reconfirmed that the current local blocker for the ask-style MVP path is the VS Code companion extension bootstrap, not Feishu credentials: probing `http://127.0.0.1:8765/health` returned connection refused while the listener itself authenticated successfully
+- Verified the local `.env` still contains both `FEISHU_APP_ID` and `FEISHU_APP_SECRET`, so the current gap is not missing configuration keys
+- Identified a concrete repo-level install/regression paper cut: the documented POSIX helper entrypoints `scripts/start-live-listener.sh` and `scripts/package-macos-installer.sh` were tracked without executable mode, so `./scripts/...` failed with `permission denied` until invoked through `bash`
+- Fixed the macOS bootstrap gap without `npm`: copied the prebuilt companion extension into `~/.vscode/extensions`, confirmed VS Code now recognizes `bean-harbor.feishu-vscode-agent-bridge@0.0.1`, and restored `http://127.0.0.1:8765/health`
+- Confirmed the remaining ask-path issue is no longer extension startup but workspace binding: the active `8765` server was attached to a VS Code window without repository context, so raw `/v1/chat/ask` responses lacked a `Workspace:` line in `context`
+- Added a dedicated POSIX helper `scripts/start-extension-dev-host.sh` so future sessions can start an isolated extension-development host with explicit `BRIDGE_AGENT_BRIDGE_PORT` and `BRIDGE_AGENT_BOOTSTRAP_WORKSPACE` instead of repeating ad hoc startup experiments
+- Reduced the current MVP release picture to a simpler status split:
+     - 已完成：Feishu listener auth/WebSocket path, Rust bridge command/follow-up continuity, setup wizard health-check flow, Windows/macOS packaging scripts, bundled `.vsix` first plus Marketplace fallback logic
+     - 阻塞：workspace-aware ask grounding still depends on the extension being bound to the correct VS Code window; a generic `8765` server can come from an empty window and return no repository context
+     - 可延后：further bridge-internal extraction beyond the current dispatcher split, richer card UX for agent state, and full tool-loop work beyond the first read/search loop
+
+### Files Updated
+
+- `docs/work_log.md` — recorded the MVP readiness audit, local live-listener probe, extension-health blocker, and the shell-script executable-mode issue
+- `vscode-agent-bridge/README.md` — added a shortest-path diagnostic section for companion extension health and listener startup
+- `scripts/start-live-listener.sh` — marked for executable mode in Git so the documented POSIX startup command can run as written
+- `scripts/package-macos-installer.sh` — marked for executable mode in Git so the documented macOS packaging path can run as written
+- `scripts/start-extension-dev-host.sh` — added a repeatable POSIX helper for launching an isolated extension development host with explicit workspace and port binding
+
+### Verification
+
+- `python3` local health probe against `http://127.0.0.1:8765/health` returned `Connection refused`
+- Safe `.env` key-shape probe confirmed `FEISHU_APP_ID` and `FEISHU_APP_SECRET` entries exist locally without exposing their values
+- `bash ./scripts/start-live-listener.sh --skip-build` reached:
+     - `✅ 飞书认证成功`
+     - `✅ WebSocket 已连接，等待飞书消息...`
+- `./scripts/start-live-listener.sh --print-only` now runs directly through the documented POSIX entrypoint and prints the expected workspace / approval / target-dir launch plan
+- `./scripts/package-macos-installer.sh debug` now runs directly through the documented POSIX entrypoint and produced `dist/macos/FeishuBridgeSetup.dmg`
+- Copied `vscode-agent-bridge/` into `~/.vscode/extensions/bean-harbor.feishu-vscode-agent-bridge-0.0.1` and confirmed VS Code lists `bean-harbor.feishu-vscode-agent-bridge@0.0.1`
+- `http://127.0.0.1:8765/health` now returns `{"status":"ok","port":8765,"sessions":0}` on this macOS host
+- `target/debug/bridge-cli '问 Copilot parse_intent 这个函数是干什么的'` now completes through the extension/model path, proving bootstrap is restored even though workspace grounding still depends on the bound window context
+- Git diff summary confirmed the two POSIX helper scripts need executable-mode metadata for the repository copy used by docs and regression runs
+
 ## 2026-03-30
 
 ### Summary

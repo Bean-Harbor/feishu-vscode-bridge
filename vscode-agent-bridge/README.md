@@ -42,6 +42,19 @@ The repository now includes:
 - `.vscode/launch.json` — launches the Extension Development Host against `vscode-agent-bridge/`
 - `.vscode/tasks.json` — builds the companion extension before launch
 
+## Quick Diagnostic Path
+
+Use this shortest path before debugging Rust-side code:
+
+1. Launch the Extension Development Host with `Run Feishu Agent Bridge Extension`.
+  - On hosts without `npm` but with an existing compiled `out/extension.js`, you can also use `./scripts/start-extension-dev-host.sh --port 8766` to start an isolated dev host against the repository checkout.
+2. Check the `Feishu Agent Bridge` output channel and confirm it logs the local server port.
+3. Verify `http://127.0.0.1:8765/health` returns OK, or let `setup-gui` run the same health check after installing the extension.
+4. Start the Rust listener with `./scripts/start-live-listener.sh`.
+  - If the shell reports `permission denied`, run `bash ./scripts/start-live-listener.sh` or refresh the repository copy so the executable bit is preserved.
+5. If the listener reaches Feishu authentication but `/health` is still unavailable, treat the current blocker as extension bootstrap or activation, not Feishu credentials.
+6. If `/health` is up but `context` has no `Workspace:` line, assume the bound server belongs to a VS Code window without the repository opened; prefer the isolated dev-host helper on port `8766` instead of repeatedly probing the same `8765` instance.
+
 ## Rust Bridge Integration
 
 The Rust bridge talks to this extension over a local HTTP endpoint.
