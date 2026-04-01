@@ -1,5 +1,33 @@
 # Work Log
 
+## 2026-04-01
+
+### Summary
+
+- Synced the local Windows workspace forward to `origin/main` so this machine matches the latest GitHub state produced on the other development host
+- Re-read the current work log and MVP planning docs before continuing, then realigned the immediate focus around the grounded `8765` ask path instead of treating the isolated `8766` dev-host path as active blocker work
+- Updated repo documentation to make that priority explicit: `8765` remains the supported bridge baseline, while `8766` stays available only as an optional Mac-side isolation helper when a dedicated experiment is needed
+- Ended the day without starting new implementation work so the next session can resume directly from the agent MVP mainline instead of inheriting another half-finished branch of investigation
+
+### Files Updated
+
+- `docs/work_log.md` — recorded today’s sync, documentation cleanup, and the decision to keep `8765` as the only supported ask baseline
+- `vscode-agent-bridge/README.md` — clarified that `scripts/start-extension-dev-host.sh --port 8766` is an optional experimental helper, not the main supported startup path
+
+### Verification
+
+- `git fetch origin --prune`
+- `git pull --ff-only origin main`
+- `git log --oneline --decorate -5`
+- Reviewed `docs/work_log.md`, `docs/agent_mvp_execution_plan.md`, and `docs/mvp_release_plan.md` after sync to confirm the current repo direction before closing the day
+- `git status --short` before sync showed only the two documentation edits above
+
+### Next Session Focus
+
+- Resume from the grounded `8765` bridge path and continue the agent MVP mainline
+- Prioritize task state, structured agent responses, and the first read-only tool loop over any further `8766` dev-host cleanup
+- Keep `8766` available only for isolated Mac-side experiments when it is specifically useful and low-cost
+
 ## 2026-03-31
 
 ### Summary
@@ -16,7 +44,7 @@
 - Synced the VS Code workspace-open safety fix to GitHub as `4a1c083` (`Use add semantics for VS Code workspace opens`), covering the POSIX dev-host helper, Rust-side VS Code workspace/file open helpers, and setup-GUI workspace launch paths so they stop replacing the active VS Code session
 - Reduced the current MVP release picture to a simpler status split:
      - 已完成：Feishu listener auth/WebSocket path, Rust bridge command/follow-up continuity, setup wizard health-check flow, Windows/macOS packaging scripts, bundled `.vsix` first plus Marketplace fallback logic
-     - 阻塞：isolated `8766` extension-development host startup still needs a cleaner repeatable path on this macOS host when launched outside the regular installed-extension flow
+     - 主线：keep `8765` as the supported ask path; the isolated `8766` extension-development host remains an optional Mac-side experiment and is no longer treated as an MVP blocker
      - 可延后：further bridge-internal extraction beyond the current dispatcher split, richer card UX for agent state, and full tool-loop work beyond the first read/search loop
 
 ### Files Updated
@@ -45,9 +73,9 @@
 
 ### Next Session Focus
 
-- Resume from a Windows terminal with the workspace-open regression already closed by `4a1c083`; the remaining active investigation is why the isolated `8766` Extension Development Host still fails to bind/listen even though it no longer kills the active grounded `8765` bridge session
-- Start by replaying the now-safe dev-host path and collecting activation evidence on Windows: `scripts/start-extension-dev-host.sh` equivalent behavior, `Feishu Agent Bridge` output channel / extension-host logs, and whether `BRIDGE_AGENT_BRIDGE_PORT=8766` is observed by the extension at activation time
-- Keep `8765` as the known-good baseline during that work: use `/health`, listener PID checks, and the same `sessionId` continuity probe to confirm any new experiments do not regress the main grounded ask path while narrowing the `8766` startup failure
+- Resume from the grounded `8765` path as the only supported ask baseline and continue the agent MVP work on top of that stable route
+- Use `scripts/start-extension-dev-host.sh` and port `8766` only as a non-blocking isolation helper when a Mac-side experiment is specifically needed; do not spend primary debugging time on making that path production-clean
+- Keep `/health`, listener PID checks, and `sessionId` continuity probes centered on `8765` so new work does not regress the main grounded ask path
 
 ## 2026-03-30
 

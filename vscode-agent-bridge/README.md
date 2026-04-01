@@ -47,7 +47,7 @@ The repository now includes:
 Use this shortest path before debugging Rust-side code:
 
 1. Launch the Extension Development Host with `Run Feishu Agent Bridge Extension`.
-  - On hosts without `npm` but with an existing compiled `out/extension.js`, you can also use `./scripts/start-extension-dev-host.sh --port 8766` to start an isolated dev host against the repository checkout.
+  - On hosts without `npm` but with an existing compiled `out/extension.js`, you can use `./scripts/start-extension-dev-host.sh --port 8766` as an isolated Mac-side experiment against the repository checkout, but the supported mainline path remains the regular `8765` bridge.
 2. Check the `Feishu Agent Bridge` output channel and confirm it logs the local server port.
 3. Verify `http://127.0.0.1:8765/health` returns OK, or let `setup-gui` run the same health check after installing the extension.
 4. Start the Rust listener with `./scripts/start-live-listener.sh`.
