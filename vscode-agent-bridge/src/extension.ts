@@ -10,11 +10,40 @@ type ResetRequest = {
     sessionId: string;
 };
 
+type AgentToolName = 'read_file' | 'search_text';
+
+type AgentToolCall = {
+    name: AgentToolName;
+    args: Record<string, unknown>;
+    summary: string;
+};
+
+type ToolResultPayload = {
+    success: boolean;
+    output: string;
+    summary: string;
+    relatedFiles: string[];
+};
+
+type ToolResultRequest = {
+    sessionId: string;
+    toolRequest: AgentToolCall;
+    toolResult: ToolResultPayload;
+};
+
+type PendingToolRequest = {
+    prompt: string;
+    toolRequest: AgentToolCall;
+    requestedAt: number;
+};
+
 type SessionState = {
     messages: vscode.LanguageModelChatMessage[];
     lastResponseSummary?: string;
     recentUserPrompts: string[];
     recentWorkspaceFiles: string[];
+    currentTask?: string;
+    pendingToolRequest?: PendingToolRequest;
     updatedAt: number;
 };
 
@@ -40,6 +69,7 @@ type AskResponse = {
     relatedFiles: string[];
     toolCall: string | null;
     toolResultSummary: string | null;
+    toolRequest: AgentToolCall | null;
     taskState: AgentTaskState;
     context: string;
 };
@@ -53,6 +83,7 @@ type BridgeContext = {
 const HEALTH_PATH = '/health';
 const ASK_PATH = '/v1/chat/ask';
 const RESET_PATH = '/v1/chat/reset';
+const TOOL_RESULT_PATH = '/v1/chat/tool-result';
 const MAX_SUMMARY_LENGTH = 200;
 const MAX_WORKSPACE_SNIPPETS = 3;
 const MAX_FILE_BYTES = 512 * 1024;
@@ -61,6 +92,7 @@ const MAX_SESSION_MESSAGES = 12;
 const MAX_RECENT_USER_PROMPTS = 3;
 const MAX_RECENT_WORKSPACE_FILES = 3;
 const SESSION_TTL_MS = 30 * 60 * 1000;
+const MAX_TOOL_RESULT_CHARS = 12_000;
 const WORKSPACE_FILE_GLOB = '**/*.{rs,ts,tsx,js,jsx,py,toml}';
 const WORKSPACE_EXCLUDE_GLOB = '**/{.git,node_modules,target,out,dist,build,.next,coverage}/**';
 const BOOTSTRAP_WORKSPACE_ENV = 'BRIDGE_AGENT_BOOTSTRAP_WORKSPACE';
@@ -213,6 +245,13 @@ async function startBridgeServer(bridge: BridgeContext): Promise<void> {
                 return;
             }
 
+            if (req.method === 'POST' && req.url === TOOL_RESULT_PATH) {
+                const payload = await readJsonBody<ToolResultRequest>(req);
+                const result = await handleToolResult(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
             respondJson(res, 404, { error: 'not found' });
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -254,56 +293,162 @@ async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<As
         : prompt;
 
     session.messages.push(vscode.LanguageModelChatMessage.User(userPrompt));
+    session.currentTask = prompt;
 
-    const [model] = await vscode.lm.selectChatModels({
-        vendor: vscode.workspace.getConfiguration('feishuVscodeBridge').get<string>('agentBridge.vendor', 'copilot'),
-    });
+    const model = await selectChatModel();
+    const plannerDecision = await decideAgentAction(model, prompt, promptContext, workspaceContext.files);
 
-    if (!model) {
-        throw new Error('No compatible chat model is available. Ensure GitHub Copilot Chat or another LM provider is active in VS Code.');
-    }
+    rememberRecentPrompt(session, prompt);
+    rememberRecentWorkspaceFiles(session, workspaceContext.files);
+    session.updatedAt = Date.now();
 
-    const tokenSource = new vscode.CancellationTokenSource();
-    try {
-        const response = await model.sendRequest(session.messages, {}, tokenSource.token);
-        let text = '';
-        for await (const fragment of response.text) {
-            text += fragment;
-        }
-
-        if (!text.trim()) {
-            throw new Error('Model returned an empty response.');
-        }
-
-        const summary = summarize(text);
-        const taskState = buildAnsweredTaskState(prompt, summary, workspaceContext.files);
-
-        session.messages.push(vscode.LanguageModelChatMessage.Assistant(text));
-        session.lastResponseSummary = summary;
-        rememberRecentPrompt(session, prompt);
-        rememberRecentWorkspaceFiles(session, workspaceContext.files);
+    if (plannerDecision?.status === 'needs_tool' && plannerDecision.toolRequest) {
+        session.pendingToolRequest = {
+            prompt,
+            toolRequest: plannerDecision.toolRequest,
+            requestedAt: Date.now(),
+        };
         trimSessionMessages(session);
-        session.updatedAt = Date.now();
         bridge.sessions.set(sessionId, session);
+
+        const relatedFiles = dedupeStrings([
+            ...plannerDecision.relatedFiles,
+            ...workspaceContext.files,
+            ...extractRelatedFilesFromToolRequest(plannerDecision.toolRequest),
+        ]);
+        const taskState = buildToolRequestTaskState(plannerDecision, relatedFiles);
 
         return {
             sessionId,
             status: taskState.status,
-            message: text,
-            summary,
+            message: plannerDecision.message,
+            summary: plannerDecision.summary,
             currentAction: taskState.currentAction,
             nextAction: taskState.nextAction,
             relatedFiles: taskState.relatedFiles,
             toolCall: taskState.toolCall,
             toolResultSummary: taskState.toolResultSummary,
+            toolRequest: plannerDecision.toolRequest,
             taskState,
             context: [sessionSummary, contextSummary, workspaceContext.summary]
                 .filter((value) => value && value.trim().length > 0)
                 .join('\n\n'),
         };
-    } finally {
-        tokenSource.dispose();
     }
+
+    const text = await sendModelRequest(model, session.messages);
+    const summary = summarize(text);
+    const taskState = buildAnsweredTaskState(prompt, summary, workspaceContext.files);
+
+    session.pendingToolRequest = undefined;
+    session.messages.push(vscode.LanguageModelChatMessage.Assistant(text));
+    session.lastResponseSummary = summary;
+    trimSessionMessages(session);
+    bridge.sessions.set(sessionId, session);
+
+    return {
+        sessionId,
+        status: taskState.status,
+        message: text,
+        summary,
+        currentAction: taskState.currentAction,
+        nextAction: taskState.nextAction,
+        relatedFiles: taskState.relatedFiles,
+        toolCall: taskState.toolCall,
+        toolResultSummary: taskState.toolResultSummary,
+        toolRequest: null,
+        taskState,
+        context: [sessionSummary, contextSummary, workspaceContext.summary]
+            .filter((value) => value && value.trim().length > 0)
+            .join('\n\n'),
+    };
+}
+
+async function handleToolResult(bridge: BridgeContext, payload: ToolResultRequest): Promise<AskResponse> {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+
+    const session = bridge.sessions.get(sessionId);
+    if (!session) {
+        throw new Error(`Unknown sessionId: ${sessionId}`);
+    }
+
+    const pending = session.pendingToolRequest;
+    if (!pending) {
+        throw new Error(`No pending tool request for session: ${sessionId}`);
+    }
+
+    const toolRequest = sanitizeToolRequest(payload.toolRequest) ?? pending.toolRequest;
+    const toolResult = normalizeToolResultPayload(payload.toolResult);
+    const relatedFiles = dedupeStrings([
+        ...toolResult.relatedFiles,
+        ...extractRelatedFilesFromToolRequest(toolRequest),
+        ...session.recentWorkspaceFiles,
+    ]);
+    const contextSummary = collectEditorContext();
+    const sessionSummary = buildSessionSummary(session);
+
+    if (!toolResult.success) {
+        session.pendingToolRequest = undefined;
+        session.updatedAt = Date.now();
+        rememberRecentWorkspaceFiles(session, relatedFiles);
+        bridge.sessions.set(sessionId, session);
+
+        const taskState = buildBlockedToolTaskState(toolRequest, toolResult, relatedFiles);
+        return {
+            sessionId,
+            status: taskState.status,
+            message: toolResult.output,
+            summary: toolResult.summary,
+            currentAction: taskState.currentAction,
+            nextAction: taskState.nextAction,
+            relatedFiles: taskState.relatedFiles,
+            toolCall: taskState.toolCall,
+            toolResultSummary: taskState.toolResultSummary,
+            toolRequest,
+            taskState,
+            context: [sessionSummary, contextSummary]
+                .filter((value) => value && value.trim().length > 0)
+                .join('\n\n'),
+        };
+    }
+
+    const model = await selectChatModel();
+    const toolContextPrompt = buildToolResultPrompt(pending.prompt, toolRequest, toolResult);
+    session.messages.push(vscode.LanguageModelChatMessage.User(toolContextPrompt));
+
+    const text = await sendModelRequest(model, session.messages);
+    const summary = summarize(text);
+    const taskState = buildToolAnsweredTaskState(pending.prompt, toolRequest, toolResult, summary, relatedFiles);
+
+    session.pendingToolRequest = undefined;
+    session.messages.push(vscode.LanguageModelChatMessage.Assistant(text));
+    session.lastResponseSummary = summary;
+    rememberRecentWorkspaceFiles(session, relatedFiles);
+    trimSessionMessages(session);
+    session.updatedAt = Date.now();
+    bridge.sessions.set(sessionId, session);
+
+    return {
+        sessionId,
+        status: taskState.status,
+        message: text,
+        summary,
+        currentAction: taskState.currentAction,
+        nextAction: taskState.nextAction,
+        relatedFiles: taskState.relatedFiles,
+        toolCall: taskState.toolCall,
+        toolResultSummary: taskState.toolResultSummary,
+        toolRequest,
+        taskState,
+        context: [sessionSummary, contextSummary]
+            .filter((value) => value && value.trim().length > 0)
+            .join('\n\n'),
+    };
 }
 
 function handleReset(bridge: BridgeContext, payload: ResetRequest): Record<string, unknown> {
@@ -358,6 +503,329 @@ function createSession(): SessionState {
         recentWorkspaceFiles: [],
         updatedAt: Date.now(),
     };
+}
+
+async function selectChatModel(): Promise<vscode.LanguageModelChat> {
+    const [model] = await vscode.lm.selectChatModels({
+        vendor: vscode.workspace.getConfiguration('feishuVscodeBridge').get<string>('agentBridge.vendor', 'copilot'),
+    });
+
+    if (!model) {
+        throw new Error('No compatible chat model is available. Ensure GitHub Copilot Chat or another LM provider is active in VS Code.');
+    }
+
+    return model;
+}
+
+async function sendModelRequest(
+    model: vscode.LanguageModelChat,
+    messages: vscode.LanguageModelChatMessage[],
+): Promise<string> {
+    const tokenSource = new vscode.CancellationTokenSource();
+    try {
+        const response = await model.sendRequest(messages, {}, tokenSource.token);
+        let text = '';
+        for await (const fragment of response.text) {
+            text += fragment;
+        }
+
+        if (!text.trim()) {
+            throw new Error('Model returned an empty response.');
+        }
+
+        return text;
+    } finally {
+        tokenSource.dispose();
+    }
+}
+
+type AgentPlannerDecision = {
+    status: 'answered' | 'needs_tool';
+    message: string;
+    summary: string;
+    currentAction: string;
+    nextAction: string;
+    relatedFiles: string[];
+    toolRequest: AgentToolCall | null;
+};
+
+async function decideAgentAction(
+    model: vscode.LanguageModelChat,
+    prompt: string,
+    promptContext: string,
+    relatedFiles: string[],
+): Promise<AgentPlannerDecision | null> {
+    const plannerPrompt = [
+        'You are planning the next step for a coding agent that can perform at most one read-only tool call before answering.',
+        'Return JSON only with this shape: {"status":"answered"|"needs_tool","message":"...","summary":"...","currentAction":"...","nextAction":"...","relatedFiles":["..."],"toolRequest":null|{"name":"read_file"|"search_text","args":{...},"summary":"..."}}.',
+        'Only choose needs_tool when the answer depends on repository code that is still missing from the current context.',
+        'Prefer search_text before read_file unless you already know the exact file to inspect.',
+        'Use read_file args: {"path":"relative/or/absolute","startLine":number,"endLine":number}.',
+        'Use search_text args: {"query":"text","path":"optional/path","isRegex":false}.',
+        relatedFiles.length > 0 ? `Known related files: ${relatedFiles.join(', ')}` : 'Known related files: none yet.',
+        'Current context:',
+        promptContext || '(no extra context)',
+        'User request:',
+        prompt,
+    ].join('\n\n');
+
+    try {
+        const raw = await sendModelRequest(model, [vscode.LanguageModelChatMessage.User(plannerPrompt)]);
+        return parsePlannerDecision(raw);
+    } catch {
+        return null;
+    }
+}
+
+function parsePlannerDecision(raw: string): AgentPlannerDecision | null {
+    const normalized = raw
+        .trim()
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+    const start = normalized.indexOf('{');
+    const end = normalized.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>;
+        const status = parsed.status === 'needs_tool' ? 'needs_tool' : 'answered';
+        const message = typeof parsed.message === 'string' && parsed.message.trim()
+            ? parsed.message.trim()
+            : (status === 'needs_tool' ? '当前上下文不足，准备调用一个只读工具补充信息。' : '已准备直接回答当前任务。');
+        const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
+            ? parsed.summary.trim()
+            : summarize(message);
+        const currentAction = typeof parsed.currentAction === 'string' && parsed.currentAction.trim()
+            ? parsed.currentAction.trim()
+            : (status === 'needs_tool' ? '分析当前任务并准备读取更多代码上下文' : '结合当前上下文生成回答');
+        const nextAction = typeof parsed.nextAction === 'string' && parsed.nextAction.trim()
+            ? parsed.nextAction.trim()
+            : (status === 'needs_tool' ? '等待只读工具结果后继续完成分析。' : '可以继续追问、要求读取更多代码，或基于当前结论推进任务。');
+        const relatedFiles = Array.isArray(parsed.relatedFiles)
+            ? parsed.relatedFiles.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+            : [];
+        const toolRequest = sanitizeToolRequest(parsed.toolRequest);
+
+        return {
+            status: status === 'needs_tool' && toolRequest ? 'needs_tool' : 'answered',
+            message,
+            summary,
+            currentAction,
+            nextAction,
+            relatedFiles,
+            toolRequest: status === 'needs_tool' ? toolRequest : null,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function sanitizeToolRequest(value: unknown): AgentToolCall | null {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+
+    const record = value as Record<string, unknown>;
+    const name = record.name;
+    if (name !== 'read_file' && name !== 'search_text') {
+        return null;
+    }
+
+    const args = typeof record.args === 'object' && record.args
+        ? { ...(record.args as Record<string, unknown>) }
+        : {};
+
+    if (name === 'read_file') {
+        const path = typeof args.path === 'string' ? args.path.trim() : '';
+        if (!path) {
+            return null;
+        }
+
+        const startLine = asPositiveInteger(args.startLine);
+        const endLine = asPositiveInteger(args.endLine);
+        const sanitizedArgs: Record<string, unknown> = { path };
+        if (startLine !== undefined) {
+            sanitizedArgs.startLine = startLine;
+        }
+        if (endLine !== undefined) {
+            sanitizedArgs.endLine = endLine;
+        }
+
+        return {
+            name,
+            args: sanitizedArgs,
+            summary: typeof record.summary === 'string' && record.summary.trim()
+                ? record.summary.trim()
+                : `读取文件 ${path}`,
+        };
+    }
+
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) {
+        return null;
+    }
+
+    const sanitizedArgs: Record<string, unknown> = {
+        query,
+        isRegex: args.isRegex === true,
+    };
+    if (typeof args.path === 'string' && args.path.trim()) {
+        sanitizedArgs.path = args.path.trim();
+    }
+
+    return {
+        name,
+        args: sanitizedArgs,
+        summary: typeof record.summary === 'string' && record.summary.trim()
+            ? record.summary.trim()
+            : `搜索文本 ${query}`,
+    };
+}
+
+function normalizeToolResultPayload(payload: ToolResultPayload): ToolResultPayload {
+    const output = typeof payload?.output === 'string' ? payload.output.trim() : '';
+    const summary = typeof payload?.summary === 'string' && payload.summary.trim()
+        ? payload.summary.trim()
+        : summarize(output || '工具已返回结果。');
+
+    return {
+        success: payload?.success !== false,
+        output: output ? truncateToolResult(output) : '(无输出)',
+        summary,
+        relatedFiles: Array.isArray(payload?.relatedFiles)
+            ? payload.relatedFiles.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+            : [],
+    };
+}
+
+function buildToolRequestTaskState(
+    decision: AgentPlannerDecision,
+    relatedFiles: string[],
+): AgentTaskState {
+    return {
+        status: 'needs_tool',
+        currentAction: decision.currentAction,
+        resultSummary: decision.summary,
+        nextAction: decision.nextAction,
+        relatedFiles,
+        toolCall: decision.toolRequest ? formatToolRequest(decision.toolRequest) : null,
+        toolResultSummary: null,
+    };
+}
+
+function buildToolAnsweredTaskState(
+    prompt: string,
+    toolRequest: AgentToolCall,
+    toolResult: ToolResultPayload,
+    summary: string,
+    relatedFiles: string[],
+): AgentTaskState {
+    return {
+        status: 'answered',
+        currentAction: `已执行 ${toolRequest.summary} 并结合结果完成分析`,
+        resultSummary: summary,
+        nextAction: `可以继续追问、要求进一步检查，或直接基于当前结论推进任务：${prompt.trim()}`,
+        relatedFiles,
+        toolCall: formatToolRequest(toolRequest),
+        toolResultSummary: toolResult.summary,
+    };
+}
+
+function buildBlockedToolTaskState(
+    toolRequest: AgentToolCall,
+    toolResult: ToolResultPayload,
+    relatedFiles: string[],
+): AgentTaskState {
+    return {
+        status: 'blocked',
+        currentAction: `执行 ${toolRequest.summary} 时失败`,
+        resultSummary: toolResult.summary,
+        nextAction: '请调整任务描述、检查路径参数，或改为更明确的文件/符号后重试。',
+        relatedFiles,
+        toolCall: formatToolRequest(toolRequest),
+        toolResultSummary: toolResult.summary,
+    };
+}
+
+function buildToolResultPrompt(
+    prompt: string,
+    toolRequest: AgentToolCall,
+    toolResult: ToolResultPayload,
+): string {
+    return [
+        'Continue the current Feishu coding-agent task using the read-only tool result below.',
+        'Ground the answer in the provided tool output. If the tool output is still insufficient, say exactly what is missing instead of guessing.',
+        'Original task:',
+        prompt,
+        'Tool request:',
+        formatToolRequest(toolRequest),
+        'Tool result summary:',
+        toolResult.summary,
+        'Tool result output:',
+        truncateToolResult(toolResult.output),
+    ].join('\n\n');
+}
+
+function formatToolRequest(toolRequest: AgentToolCall): string {
+    if (toolRequest.name === 'read_file') {
+        const path = typeof toolRequest.args.path === 'string' ? toolRequest.args.path : '(unknown path)';
+        const startLine = asPositiveInteger(toolRequest.args.startLine);
+        const endLine = asPositiveInteger(toolRequest.args.endLine);
+        if (startLine !== undefined && endLine !== undefined) {
+            return `read_file(${path}:${startLine}-${endLine})`;
+        }
+        return `read_file(${path})`;
+    }
+
+    const query = typeof toolRequest.args.query === 'string' ? toolRequest.args.query : '(empty query)';
+    const path = typeof toolRequest.args.path === 'string' && toolRequest.args.path.trim()
+        ? `, path=${toolRequest.args.path}`
+        : '';
+    const regexFlag = toolRequest.args.isRegex === true ? ', regex=true' : '';
+    return `search_text(${query}${path}${regexFlag})`;
+}
+
+function extractRelatedFilesFromToolRequest(toolRequest: AgentToolCall): string[] {
+    const path = toolRequest.args.path;
+    if (typeof path === 'string' && path.trim()) {
+        return [path.trim()];
+    }
+    return [];
+}
+
+function dedupeStrings(values: string[]): string[] {
+    const unique: string[] = [];
+    for (const value of values) {
+        const trimmed = value.trim();
+        if (trimmed && !unique.includes(trimmed)) {
+            unique.push(trimmed);
+        }
+    }
+    return unique;
+}
+
+function asPositiveInteger(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isInteger(value) && value > 0) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseInt(value, 10);
+        if (Number.isInteger(parsed) && parsed > 0) {
+            return parsed;
+        }
+    }
+    return undefined;
+}
+
+function truncateToolResult(output: string): string {
+    if (output.length <= MAX_TOOL_RESULT_CHARS) {
+        return output;
+    }
+    return `${output.slice(0, MAX_TOOL_RESULT_CHARS - 1)}…`;
 }
 
 function buildAnsweredTaskState(prompt: string, summary: string, relatedFiles: string[]): AgentTaskState {

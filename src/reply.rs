@@ -76,6 +76,18 @@ pub fn format_agent_reply(task_text: &str, result: &vscode::AgentAskResult) -> S
         blocks.push(format!("📄 相关文件: {}", result.related_files.join("、")));
     }
 
+    if let Some(tool_call) = result.tool_call.as_deref().filter(|value| !value.trim().is_empty()) {
+        blocks.push(format!("🛠 工具动作: {}", tool_call.trim()));
+    }
+
+    if let Some(tool_result_summary) = result
+        .tool_result_summary
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        blocks.push(format!("🔎 工具结果: {}", tool_result_summary.trim()));
+    }
+
     if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
         blocks.push(format!("➡️ 下一步建议: {}", next_action.trim()));
     }

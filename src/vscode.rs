@@ -1,7 +1,8 @@
 //! VS Code CLI 操作：打开文件、安装/列出扩展、运行 shell 等
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -17,6 +18,8 @@ pub const TEST_COMMAND_ENV: &str = "BRIDGE_TEST_COMMAND";
 pub const AGENT_BRIDGE_URL_ENV: &str = "BRIDGE_AGENT_BRIDGE_URL";
 pub const AGENT_BRIDGE_PORT_ENV: &str = "BRIDGE_AGENT_BRIDGE_PORT";
 const DEFAULT_AGENT_BRIDGE_PORT: u16 = 8765;
+const AGENT_TOOL_RESULT_PATH: &str = "/v1/chat/tool-result";
+const MAX_AGENT_TOOL_SUMMARY_CHARS: usize = 240;
 
 #[derive(Deserialize)]
 struct AgentTaskStateResponse {
@@ -29,6 +32,15 @@ struct AgentTaskStateResponse {
     next_action: Option<String>,
     #[serde(rename = "relatedFiles", default)]
     related_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentToolCall {
+    pub name: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -45,8 +57,33 @@ struct AgentAskResponse {
     next_action: Option<String>,
     #[serde(rename = "relatedFiles", default)]
     related_files: Vec<String>,
+    #[serde(rename = "toolCall")]
+    tool_call: Option<String>,
+    #[serde(rename = "toolResultSummary")]
+    tool_result_summary: Option<String>,
+    #[serde(rename = "toolRequest")]
+    tool_request: Option<AgentToolCall>,
     #[serde(rename = "taskState")]
     task_state: Option<AgentTaskStateResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentToolResultPayload {
+    success: bool,
+    output: String,
+    summary: String,
+    #[serde(rename = "relatedFiles")]
+    related_files: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AgentToolResultRequest<'a> {
+    #[serde(rename = "sessionId")]
+    session_id: &'a str,
+    #[serde(rename = "toolRequest")]
+    tool_request: &'a AgentToolCall,
+    #[serde(rename = "toolResult")]
+    tool_result: AgentToolResultPayload,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +105,8 @@ pub struct AgentAskResult {
     pub current_action: Option<String>,
     pub next_action: Option<String>,
     pub related_files: Vec<String>,
+    pub tool_call: Option<String>,
+    pub tool_result_summary: Option<String>,
     pub duration_ms: u64,
     pub error: Option<String>,
 }
@@ -116,7 +155,8 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             return Err("提问内容不能为空。".to_string());
         }
 
-        let endpoint = format!("{}/v1/chat/ask", agent_bridge_base_url()?);
+        let base_url = agent_bridge_base_url()?;
+        let endpoint = format!("{}/v1/chat/ask", base_url);
         let response = ureq::post(&endpoint)
             .set("Content-Type", "application/json")
             .send_json(ureq::json!({
@@ -125,9 +165,64 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             }))
             .map_err(|err| format_agent_bridge_error(err, &endpoint))?;
 
-        let payload: AgentAskResponse = response
+        let mut payload: AgentAskResponse = response
             .into_json()
             .map_err(|err| format!("解析 agent bridge 响应失败: {err}"))?;
+
+        let mut carried_tool_call = None;
+        let mut carried_tool_result_summary = None;
+
+        if agent_status_from_response(&payload)
+            .eq_ignore_ascii_case("needs_tool")
+        {
+            let tool_request = payload
+                .tool_request
+                .clone()
+                .ok_or_else(|| "agent bridge 请求了工具，但没有返回可执行的 toolRequest。".to_string())?;
+
+            let executed = execute_agent_tool_call(&tool_request);
+            carried_tool_call = Some(format_agent_tool_call(&tool_request));
+            carried_tool_result_summary = Some(executed.summary.clone());
+
+            if !executed.success {
+                return Ok(AgentAskResult {
+                    success: false,
+                    session_id: Some(payload.session_id.clone()),
+                    status: "blocked".to_string(),
+                    message: executed.output.clone(),
+                    summary: Some(executed.summary.clone()),
+                    current_action: Some(format!(
+                        "执行只读工具失败: {}",
+                        format_agent_tool_call(&tool_request)
+                    )),
+                    next_action: Some("请调整问题描述、检查路径参数，或改为更明确的文件/符号后重试。".to_string()),
+                    related_files: executed.related_files,
+                    tool_call: carried_tool_call,
+                    tool_result_summary: carried_tool_result_summary,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: Some(executed.output),
+                });
+            }
+
+            let tool_endpoint = format!("{}{}", base_url, AGENT_TOOL_RESULT_PATH);
+            let response = ureq::post(&tool_endpoint)
+                .set("Content-Type", "application/json")
+                .send_json(ureq::json!(AgentToolResultRequest {
+                    session_id,
+                    tool_request: &tool_request,
+                    tool_result: AgentToolResultPayload {
+                        success: executed.success,
+                        output: executed.output.clone(),
+                        summary: executed.summary.clone(),
+                        related_files: executed.related_files.clone(),
+                    },
+                }))
+                .map_err(|err| format_agent_bridge_error(err, &tool_endpoint))?;
+
+            payload = response
+                .into_json()
+                .map_err(|err| format!("解析 agent tool result 响应失败: {err}"))?;
+        }
 
         let task_state = payload.task_state;
         let message = payload
@@ -165,7 +260,25 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             .as_ref()
             .map(|state| state.related_files.clone())
             .filter(|files| !files.is_empty())
-            .unwrap_or(payload.related_files);
+            .unwrap_or_else(|| {
+                if payload.related_files.is_empty() {
+                    payload
+                        .tool_request
+                        .as_ref()
+                        .map(agent_tool_related_files)
+                        .unwrap_or_default()
+                } else {
+                    payload.related_files
+                }
+            });
+
+        let tool_call = carried_tool_call
+            .or(payload.tool_call)
+            .or_else(|| payload.tool_request.as_ref().map(format_agent_tool_call));
+
+        let tool_result_summary = carried_tool_result_summary
+            .or(payload.tool_result_summary)
+            .filter(|value| !value.trim().is_empty());
 
         Ok(AgentAskResult {
             success: true,
@@ -176,6 +289,8 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             current_action,
             next_action,
             related_files,
+            tool_call,
+            tool_result_summary,
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
@@ -192,10 +307,237 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             current_action: Some("向本地 agent bridge 发起请求失败".to_string()),
             next_action: Some("确认 VS Code companion extension 已启动，并检查本地 bridge 健康状态。".to_string()),
             related_files: Vec::new(),
+            tool_call: None,
+            tool_result_summary: None,
             duration_ms: start.elapsed().as_millis() as u64,
             error: Some(err),
         },
     }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutedAgentTool {
+    success: bool,
+    output: String,
+    summary: String,
+    related_files: Vec<String>,
+}
+
+impl Serialize for ExecutedAgentTool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        AgentToolResultPayload {
+            success: self.success,
+            output: self.output.clone(),
+            summary: self.summary.clone(),
+            related_files: self.related_files.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+fn agent_status_from_response(payload: &AgentAskResponse) -> String {
+    payload
+        .task_state
+        .as_ref()
+        .and_then(|state| state.status.clone())
+        .or_else(|| payload.status.clone())
+        .unwrap_or_else(|| "answered".to_string())
+}
+
+fn execute_agent_tool_call(tool_call: &AgentToolCall) -> ExecutedAgentTool {
+    match tool_call.name.trim() {
+        "read_file" => execute_agent_read_file(tool_call),
+        "search_text" => execute_agent_search_text(tool_call),
+        other => ExecutedAgentTool {
+            success: false,
+            output: format!("不支持的 agent 工具: {other}"),
+            summary: format!("不支持的 agent 工具: {other}"),
+            related_files: Vec::new(),
+        },
+    }
+}
+
+fn execute_agent_read_file(tool_call: &AgentToolCall) -> ExecutedAgentTool {
+    let path = tool_call
+        .args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(path) = path else {
+        return ExecutedAgentTool {
+            success: false,
+            output: "read_file 缺少 path 参数。".to_string(),
+            summary: "read_file 缺少 path 参数。".to_string(),
+            related_files: Vec::new(),
+        };
+    };
+
+    let start_line = tool_call
+        .args
+        .get("startLine")
+        .and_then(value_to_usize);
+    let end_line = tool_call
+        .args
+        .get("endLine")
+        .and_then(value_to_usize);
+    let result = read_file(path, start_line, end_line);
+    build_executed_agent_tool(result, format_agent_tool_call(tool_call), vec![path.to_string()])
+}
+
+fn execute_agent_search_text(tool_call: &AgentToolCall) -> ExecutedAgentTool {
+    let query = tool_call
+        .args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(query) = query else {
+        return ExecutedAgentTool {
+            success: false,
+            output: "search_text 缺少 query 参数。".to_string(),
+            summary: "search_text 缺少 query 参数。".to_string(),
+            related_files: Vec::new(),
+        };
+    };
+
+    let path = tool_call.args.get("path").and_then(Value::as_str);
+    let is_regex = tool_call
+        .args
+        .get("isRegex")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let related_files = path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+    let result = search_text(query, path, is_regex);
+    build_executed_agent_tool(result, format_agent_tool_call(tool_call), related_files)
+}
+
+fn build_executed_agent_tool(
+    result: CmdResult,
+    label: String,
+    related_files: Vec<String>,
+) -> ExecutedAgentTool {
+    let output = combine_cmd_output(&result);
+    let summary = summarize_agent_tool_output(&label, &output, result.success);
+
+    ExecutedAgentTool {
+        success: result.success,
+        output,
+        summary,
+        related_files,
+    }
+}
+
+fn combine_cmd_output(result: &CmdResult) -> String {
+    if !result.stdout.trim().is_empty() && !result.stderr.trim().is_empty() {
+        format!("{}\n{}", result.stdout.trim(), result.stderr.trim())
+    } else if !result.stdout.trim().is_empty() {
+        result.stdout.trim().to_string()
+    } else if !result.stderr.trim().is_empty() {
+        result.stderr.trim().to_string()
+    } else {
+        "(无输出)".to_string()
+    }
+}
+
+fn summarize_agent_tool_output(label: &str, output: &str, success: bool) -> String {
+    let first_lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let body = if first_lines.is_empty() {
+        if success {
+            "工具执行成功。".to_string()
+        } else {
+            "工具执行失败。".to_string()
+        }
+    } else if first_lines.chars().count() > MAX_AGENT_TOOL_SUMMARY_CHARS {
+        let mut truncated = first_lines
+            .chars()
+            .take(MAX_AGENT_TOOL_SUMMARY_CHARS)
+            .collect::<String>();
+        truncated.push('…');
+        truncated
+    } else {
+        first_lines
+    };
+
+    format!("{}: {}", label, body)
+}
+
+fn format_agent_tool_call(tool_call: &AgentToolCall) -> String {
+    match tool_call.name.trim() {
+        "read_file" => {
+            let path = tool_call
+                .args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("(unknown path)");
+            let start_line = tool_call.args.get("startLine").and_then(value_to_usize);
+            let end_line = tool_call.args.get("endLine").and_then(value_to_usize);
+            match (start_line, end_line) {
+                (Some(start_line), Some(end_line)) => {
+                    format!("read_file({path}:{start_line}-{end_line})")
+                }
+                _ => format!("read_file({path})"),
+            }
+        }
+        "search_text" => {
+            let query = tool_call
+                .args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let path = tool_call
+                .args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|value| format!(", path={value}"))
+                .unwrap_or_default();
+            let regex = if tool_call
+                .args
+                .get("isRegex")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                ", regex=true"
+            } else {
+                ""
+            };
+            format!("search_text({query}{path}{regex})")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn agent_tool_related_files(tool_call: &AgentToolCall) -> Vec<String> {
+    tool_call
+        .args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn value_to_usize(value: &Value) -> Option<usize> {
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse::<usize>().ok()))
 }
 
 pub fn reset_agent_session(session_id: &str) -> CmdResult {

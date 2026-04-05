@@ -713,6 +713,74 @@ fn strip_prefix_any<'a>(lower: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     None
 }
 
+fn strip_command_prefix<'a>(text: &'a str, lower: &str, prefixes: &[&str]) -> Option<&'a str> {
+    for prefix in prefixes {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if rest.is_empty() {
+                return Some("");
+            }
+
+            if rest.chars().next().is_some_and(char::is_whitespace) {
+                let prefix_len = lower.len() - rest.len();
+                let original_rest = &text[prefix_len..];
+                return Some(original_rest.trim_start_matches(|c: char| c.is_whitespace()));
+            }
+        }
+
+        if let Some(prefix_len) = match_command_words(lower, prefix) {
+            let original_rest = &text[prefix_len..];
+            return Some(original_rest.trim_start_matches(|c: char| c.is_whitespace()));
+        }
+    }
+
+    None
+}
+
+fn match_command_words(lower: &str, prefix: &str) -> Option<usize> {
+    let parts = prefix.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let mut offset = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let rest = &lower[offset..];
+        if !rest.starts_with(part) {
+            return None;
+        }
+
+        offset += part.len();
+        if index < parts.len() - 1 {
+            let whitespace_len = lower[offset..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if whitespace_len == 0 {
+                return None;
+            }
+            offset += whitespace_len;
+        }
+    }
+
+    if lower[offset..].is_empty() || lower[offset..].chars().next().is_some_and(char::is_whitespace) {
+        Some(offset)
+    } else {
+        None
+    }
+}
+
+fn matches_command_any(lower: &str, commands: &[&str]) -> bool {
+    let normalized = normalize_command_whitespace(lower);
+    commands
+        .iter()
+        .any(|command| normalized == normalize_command_whitespace(command))
+}
+
+fn normalize_command_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// 解析 "path:line" 格式
 fn parse_file_with_line(s: &str) -> Option<(String, u32)> {
     let colon = s.rfind(':')?;
@@ -885,19 +953,19 @@ fn parse_write_file_intent(text: &str, lower: &str) -> Option<Intent> {
 }
 
 fn parse_agent_ask_intent(text: &str, lower: &str) -> Option<Intent> {
-    let rest = strip_prefix_any(
+    let prompt = strip_command_prefix(
+        text,
         lower,
         &[
-            "问 copilot ",
-            "问copilot ",
-            "问 agent ",
-            "问agent ",
-            "ask copilot ",
-            "ask agent ",
+            "问 copilot",
+            "问copilot",
+            "问 agent",
+            "问agent",
+            "ask copilot",
+            "ask agent",
         ],
     )?;
 
-    let prompt = text[text.len() - rest.len()..].trim();
     if prompt.is_empty() {
         return None;
     }
@@ -908,14 +976,16 @@ fn parse_agent_ask_intent(text: &str, lower: &str) -> Option<Intent> {
 }
 
 fn parse_agent_reset_intent(lower: &str) -> Option<Intent> {
-    if matches!(
+    if matches_command_any(
         lower,
-        "重置 copilot 会话"
-            | "重置copilot会话"
-            | "重置 agent 会话"
-            | "重置agent会话"
-            | "reset copilot session"
-            | "reset agent session"
+        &[
+            "重置 copilot 会话",
+            "重置copilot会话",
+            "重置 agent 会话",
+            "重置agent会话",
+            "reset copilot session",
+            "reset agent session",
+        ],
     ) {
         return Some(Intent::ResetAgentSession);
     }
@@ -1187,9 +1257,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_ask_agent_with_fullwidth_space() {
+        assert_eq!(
+            parse_intent("问　Copilot　parse_intent 这个函数是干什么的"),
+            Intent::AskAgent {
+                prompt: "parse_intent 这个函数是干什么的".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_reset_agent_session() {
         assert_eq!(parse_intent("重置 Copilot 会话"), Intent::ResetAgentSession);
         assert_eq!(parse_intent("reset agent session"), Intent::ResetAgentSession);
+    }
+
+    #[test]
+    fn parse_reset_agent_session_with_fullwidth_space() {
+        assert_eq!(parse_intent("重置　Copilot　会话"), Intent::ResetAgentSession);
     }
 
     #[test]

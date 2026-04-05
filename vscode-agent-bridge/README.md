@@ -13,6 +13,7 @@ This companion extension hosts the VS Code side of the remote agent bridge.
 
 - `GET /health`
 - `POST /v1/chat/ask`
+- `POST /v1/chat/tool-result`
 
 ## Local Prerequisites
 
@@ -85,11 +86,14 @@ Override with either:
 Expected result:
 
 - Rust bridge calls `POST /v1/chat/ask`
-- the extension returns a model reply
+- the extension either returns a model reply directly or asks Rust for one read-only tool call
+- if a tool is requested, Rust executes it and calls `POST /v1/chat/tool-result`
+- the extension returns a grounded final model reply for the same session
 - Feishu receives a text response containing the bridge `session` id and model answer
 
 ## Current Limitations
 
 - The Rust bridge currently only uses the direct ask path: `问 Copilot <问题>`
-- Plan execution and tool-calling loops are not wired into the extension yet
+- The current tool loop is limited to a single read-only hop and only supports `read_file` and `search_text`
+- Plan execution and write-capable tool-calling loops are not wired into the extension yet
 - The extension maintains its own bridge session; it does not attach to the built-in Copilot Chat panel session

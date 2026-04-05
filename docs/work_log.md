@@ -1,5 +1,44 @@
 # Work Log
 
+## 2026-04-05
+
+### Summary
+
+- Continued from the grounded `8765` agent-MVP mainline instead of reopening the optional `8766` dev-host path, using `docs/agent_mvp_execution_plan.md` and `docs/mvp_release_plan.md` as the active source of truth
+- Implemented the first real single-round agent tool loop across the VS Code companion extension and Rust bridge, limited to the low-risk read-only tools `read_file` and `search_text`
+- Reworked the companion extension ask path so it now performs a lightweight planning pass first: it can either answer directly or return a structured `needs_tool` response with a concrete `toolRequest`
+- Added a new local extension endpoint `POST /v1/chat/tool-result`, allowing the Rust bridge to execute the requested read-only tool, post the result back into the same session, and receive a grounded final answer in the same `问 Copilot` command flow
+- Extended the Rust-side agent client to consume structured tool metadata, automatically execute one requested tool round, and surface `toolCall` plus `toolResultSummary` back to Feishu replies instead of treating the bridge as pure text Q&A
+- Updated the Feishu-visible agent reply format so task updates now show the read-only tool action and a compact tool-result summary when the loop is used
+- Revalidated the live Feishu path end-to-end: after replacing a stale `target/bridge-live-runner` listener process, `问 Copilot ...` resumed working and a real Feishu task successfully triggered `read_file(src/lib.rs:887-907)` through the new single-round tool loop
+- Hardened `问 Copilot` / `重置 Copilot 会话` parsing against whitespace variants by making the command prefix matcher tolerate non-ASCII whitespace such as full-width spaces, reducing one real-message parser fragility exposed during live validation
+- Confirmed the whitespace hardening on the real Feishu path as well: a full-width-space `问　Copilot　...` message was parsed successfully and still triggered the read-only tool loop, proving the fix is present in the rebuilt live listener rather than only in unit tests
+- Kept the boundary intentionally narrow for this slice: one round only, read-only tools only, no write path, no multi-tool planner, and no plan-executor integration yet
+
+### Files Updated
+
+- `vscode-agent-bridge/src/extension.ts` — added the planning step, structured `toolRequest`, pending-tool session state, and `POST /v1/chat/tool-result`
+- `src/vscode.rs` — added Rust-side agent tool execution / callback flow and richer agent response parsing
+- `src/reply.rs` — exposed tool action and tool-result summary in Feishu agent replies
+- `src/lib.rs` — made ask/reset command parsing tolerate flexible whitespace and added parser regressions for full-width-space variants
+- `docs/work_log.md` — recorded today’s agent tool-loop implementation and verification
+- `vscode-agent-bridge/README.md` — documented the new tool-result endpoint and the current single-round read-only tool-loop boundary
+
+### Verification
+
+- VS Code diagnostics for `vscode-agent-bridge/src/extension.ts`, `src/vscode.rs`, and `src/reply.rs` reported no errors after the implementation landed
+- Workspace task `build-feishu-agent-bridge-extension` succeeded on Windows after the protocol changes
+- `cargo test --lib` passed with `117 passed; 0 failed`
+- `cargo test --lib parse_ask_agent` passed, including the new full-width-space regression case
+- `cargo test --lib parse_reset_agent_session` passed, including the new full-width-space regression case
+- Live Feishu validation confirmed the restored `问 Copilot ...` path, a real `read_file` tool invocation in the reply, and a successful full-width-space `问　Copilot　...` smoke on the rebuilt listener
+
+### Next Session Focus
+
+- Run a live Feishu validation that proves the new path actually chooses `read_file` or `search_text` on a grounded code-analysis ask instead of answering directly from the initial snippets
+- Decide whether the next slice should strengthen the planner prompt / tool-request validation or add explicit Feishu phrasing for `working` versus `needs_tool`
+- Keep the current loop single-round until the live path is stable, then consider whether a second read-only tool hop is justified
+
 ## 2026-04-01
 
 ### Summary
