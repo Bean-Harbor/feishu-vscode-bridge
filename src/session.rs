@@ -7,8 +7,23 @@ use crate::plan::{ExecutionOutcome, PlanProgress, PlanSession, StepExecution};
 use crate::vscode;
 use crate::Intent;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredSessionKind {
+    Agent,
+    Plan,
+    #[default]
+    Direct,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredSession {
+    #[serde(default)]
+    pub session_kind: StoredSessionKind,
+    #[serde(default)]
+    pub agent_state: Option<StoredAgentState>,
+    #[serde(default)]
+    pub current_project_path: Option<String>,
     pub plan: Option<PlanSession>,
     pub current_task: Option<String>,
     pub pending_steps: Vec<String>,
@@ -45,6 +60,16 @@ pub struct StoredDiff {
 pub struct StoredPatch {
     pub content: String,
     pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoredAgentState {
+    pub session_id: Option<String>,
+    pub status: Option<String>,
+    pub current_action: Option<String>,
+    pub next_action: Option<String>,
+    pub tool_call: Option<String>,
+    pub tool_result_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,11 +127,24 @@ pub fn persist_session(
     session: &StoredSession,
 ) -> Result<(), String> {
     let mut store = load_session_store(path);
-    store.insert(session_key.to_string(), session.clone());
+    let mut merged = session.clone();
+
+    if merged
+        .current_project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        merged.current_project_path = store.get(session_key).and_then(selected_project_path);
+    }
+
+    store.insert(session_key.to_string(), merged);
     save_session_store(path, &store)
 }
 
 pub fn build_stored_session(
+    session_kind: StoredSessionKind,
     plan: Option<PlanSession>,
     task_text: &str,
     action: &str,
@@ -115,6 +153,9 @@ pub fn build_stored_session(
     let recent_file_paths = collect_recent_file_paths(progress);
 
     StoredSession {
+        session_kind,
+        agent_state: None,
+        current_project_path: None,
         pending_steps: plan
             .as_ref()
             .map(|session| {
@@ -162,6 +203,16 @@ pub fn stored_session_from_agent_result(
     reply: &str,
 ) -> StoredSession {
     StoredSession {
+        session_kind: StoredSessionKind::Agent,
+        agent_state: Some(StoredAgentState {
+            session_id: result.session_id.clone(),
+            status: Some(format_agent_status(&result.status)),
+            current_action: result.current_action.clone(),
+            next_action: result.next_action.clone(),
+            tool_call: result.tool_call.clone(),
+            tool_result_summary: result.tool_result_summary.clone(),
+        }),
+        current_project_path: None,
         plan: None,
         current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
         pending_steps: Vec::new(),
@@ -181,6 +232,47 @@ pub fn stored_session_from_agent_result(
         last_diff: None,
         last_patch: None,
     }
+}
+
+pub fn is_agent_task_session(stored: &StoredSession) -> bool {
+    if stored.session_kind == StoredSessionKind::Agent {
+        return true;
+    }
+
+    stored
+        .last_step
+        .as_ref()
+        .map(|step| is_agent_step_description(&step.description))
+        .unwrap_or(false)
+        || stored
+            .current_task
+            .as_deref()
+            .map(|task| task.trim_start().starts_with("问 Copilot"))
+            .unwrap_or(false)
+}
+
+pub fn suggested_agent_next_action(stored: &StoredSession) -> Option<String> {
+    stored
+        .agent_state
+        .as_ref()
+        .and_then(|state| state.next_action.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+    pub fn selected_project_path(stored: &StoredSession) -> Option<String> {
+        stored
+        .current_project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    }
+
+fn is_agent_step_description(description: &str) -> bool {
+    let trimmed = description.trim_start();
+    trimmed.starts_with("问 Copilot") || trimmed.starts_with("继续 Agent 任务")
 }
 
 pub(crate) fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
@@ -232,6 +324,9 @@ fn stored_session_from_legacy(session: PlanSession) -> StoredSession {
     let recent_file_paths = session.current_step().map(paths_for_intent).unwrap_or_default();
 
     StoredSession {
+        session_kind: StoredSessionKind::Plan,
+        agent_state: None,
+        current_project_path: None,
         pending_steps: session
             .pending_steps()
             .iter()
@@ -414,10 +509,25 @@ fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::ContinueAgent { prompt } => match prompt {
+            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent 任务：{}", prompt.trim()),
+            _ => "继续 Agent 任务".to_string(),
+        },
+        Intent::ContinueAgentSuggested => "按建议继续 Agent 任务".to_string(),
         Intent::ResetAgentSession => "重置 Copilot 会话".to_string(),
+        Intent::ShowProjectPicker => "打开项目选择卡片".to_string(),
+        Intent::ShowProjectBrowser { path } => match path {
+            Some(path) => format!("浏览项目目录 {path}"),
+            None => "浏览项目目录".to_string(),
+        },
+        Intent::ShowCurrentProject => "查看当前项目".to_string(),
         Intent::GitStatus { repo } => match repo {
             Some(repo) => format!("查看仓库状态 {repo}"),
             None => "查看当前仓库状态".to_string(),
+        },
+        Intent::GitSync { repo } => match repo {
+            Some(repo) => format!("同步 Git 状态 {repo}"),
+            None => "同步当前项目的 Git 状态".to_string(),
         },
         Intent::GitPull { repo } => match repo {
             Some(repo) => format!("拉取仓库 {repo}"),
@@ -455,7 +565,10 @@ fn describe_intent(intent: &Intent) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::test_support::unique_temp_path;
 
     #[test]
     fn build_stored_session_remembers_file_from_apply_patch() {
@@ -478,7 +591,7 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = build_stored_session(None, "应用补丁", "执行计划", &progress);
+        let stored = build_stored_session(StoredSessionKind::Plan, None, "应用补丁", "执行计划", &progress);
 
         assert_eq!(stored.last_file_path, Some("src/demo.rs".to_string()));
         assert_eq!(stored.recent_file_paths, vec!["src/demo.rs".to_string()]);
@@ -506,7 +619,7 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = build_stored_session(None, "应用补丁", "执行计划", &progress);
+        let stored = build_stored_session(StoredSessionKind::Plan, None, "应用补丁", "执行计划", &progress);
 
         assert_eq!(
             stored.recent_file_paths,
@@ -514,5 +627,113 @@ mod tests {
         );
         assert!(stored.last_diff.as_ref().is_some_and(|diff| diff.content.contains("diff --git a/src/lib.rs")));
         assert!(stored.last_patch.as_ref().is_some_and(|patch| patch.file_paths == vec!["src/bridge.rs".to_string(), "src/lib.rs".to_string()]));
+    }
+
+    #[test]
+    fn detects_agent_task_session_from_last_step() {
+        let stored = StoredSession {
+            session_kind: StoredSessionKind::Agent,
+            agent_state: Some(StoredAgentState {
+                session_id: Some("session-1".to_string()),
+                status: Some("已回答".to_string()),
+                current_action: Some("继续分析".to_string()),
+                next_action: Some("读取 src/lib.rs 350-420".to_string()),
+                tool_call: None,
+                tool_result_summary: None,
+            }),
+            current_project_path: None,
+            plan: None,
+            current_task: Some("问 Copilot parse_intent 这个函数是干什么的".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已回答".to_string(),
+                summary: "已返回 grounded answer。".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "继续 Agent 任务：给我最小修复建议".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/lib.rs".to_string()),
+            recent_file_paths: vec!["src/lib.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        assert!(is_agent_task_session(&stored));
+        assert_eq!(
+            suggested_agent_next_action(&stored).as_deref(),
+            Some("读取 src/lib.rs 350-420")
+        );
+    }
+
+    #[test]
+    fn persist_session_preserves_current_project_path_when_new_write_omits_it() {
+        let session_path = unique_temp_path("session-store", "current-project-merge");
+
+        let selected_project = StoredSession {
+            session_kind: StoredSessionKind::Direct,
+            agent_state: None,
+            current_project_path: Some("C:/work/demo".to_string()),
+            plan: None,
+            current_task: Some("选择项目 C:/work/demo".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已完成".to_string(),
+                summary: "已选择项目。".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "选择项目 C:/work/demo".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: None,
+            recent_file_paths: Vec::new(),
+            last_diff: None,
+            last_patch: None,
+        };
+        persist_session(Some(&session_path), "cli", &selected_project).unwrap();
+
+        let later_agent_write = StoredSession {
+            session_kind: StoredSessionKind::Agent,
+            agent_state: Some(StoredAgentState {
+                session_id: Some("session-1".to_string()),
+                status: Some("已回答".to_string()),
+                current_action: Some("继续分析".to_string()),
+                next_action: Some("给我最小修复建议".to_string()),
+                tool_call: None,
+                tool_result_summary: None,
+            }),
+            current_project_path: None,
+            plan: None,
+            current_task: Some("问 Copilot 继续当前项目".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已回答".to_string(),
+                summary: "已返回建议。".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "问 Copilot 继续当前项目".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: None,
+            recent_file_paths: Vec::new(),
+            last_diff: None,
+            last_patch: None,
+        };
+        persist_session(Some(&session_path), "cli", &later_agent_write).unwrap();
+
+        let merged = load_persisted_session(Some(&session_path), "cli").unwrap();
+        assert_eq!(selected_project_path(&merged).as_deref(), Some("C:/work/demo"));
+        assert_eq!(merged.session_kind, StoredSessionKind::Agent);
+
+        let _ = fs::remove_file(session_path);
     }
 }

@@ -1,7 +1,9 @@
 use crate::bridge::BridgeResponse;
 use crate::bridge_context::BridgeContext;
+use crate::direct_command;
 use crate::reply;
 use crate::session::{self, StoredDiff, StoredResult, StoredStep};
+use crate::Intent;
 use crate::vscode;
 
 const NO_SESSION_TEXT: &str = "⚠️ 当前没有可回看的任务记录。";
@@ -20,6 +22,58 @@ pub fn show_last_result(context: &BridgeContext<'_>, session_key: &str) -> Bridg
     };
 
     BridgeResponse::Text(reply::format_last_result_reply(&stored))
+}
+
+pub fn continue_agent_task(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    prompt_override: Option<&str>,
+) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+        return BridgeResponse::Text("⚠️ 当前没有可继续的 agent 任务。请先发送「问 Copilot <问题>」。".to_string());
+    };
+
+    if !session::is_agent_task_session(&stored) {
+        return BridgeResponse::Text(reply::format_stored_session_summary(&stored));
+    }
+
+    let prompt = build_agent_continuation_prompt(&stored, prompt_override);
+    let intent = Intent::ContinueAgent {
+        prompt: prompt_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    };
+
+    direct_command::execute_agent_turn(
+        context,
+        session_key,
+        task_text,
+        &prompt,
+        &intent,
+        "继续 Agent 任务",
+    )
+}
+
+pub fn continue_agent_suggested_action(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+        return BridgeResponse::Text("⚠️ 当前没有可继续的 agent 任务。请先发送「问 Copilot <问题>」。".to_string());
+    };
+
+    if !session::is_agent_task_session(&stored) {
+        return BridgeResponse::Text(reply::format_stored_session_summary(&stored));
+    }
+
+    let Some(next_action) = session::suggested_agent_next_action(&stored) else {
+        return BridgeResponse::Text("⚠️ 上一轮 agent 结果里没有明确的下一步建议。可以直接发送「继续，<你的要求>」。".to_string());
+    };
+
+    continue_agent_task(context, session_key, task_text, Some(&next_action))
 }
 
 pub fn continue_last_file(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
@@ -116,13 +170,40 @@ pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> Bridge
     BridgeResponse::Text(reply)
 }
 
+fn build_agent_continuation_prompt(stored: &session::StoredSession, prompt_override: Option<&str>) -> String {
+    let last_task = stored
+        .current_task
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("问 Copilot");
+    let last_summary = stored
+        .last_result
+        .as_ref()
+        .map(|result| result.summary.trim())
+        .filter(|value| !value.is_empty());
+
+    let mut parts = vec![format!("继续同一个 agent 任务。上一轮任务：{}", last_task)];
+
+    if let Some(summary) = last_summary {
+        parts.push(format!("上一轮结果摘要：{}", summary));
+    }
+
+    if let Some(prompt) = prompt_override.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(format!("本轮新的推进要求：{}", prompt));
+    } else {
+        parts.push("请不要重复总结上一轮内容，直接基于当前结论继续推进，并给出下一步最有价值的分析、检查建议或最小修复建议。".to_string());
+    }
+
+    parts.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
     use crate::bridge::BridgeApp;
-    use crate::session::{StoredPatch, StoredSession};
+    use crate::session::{StoredPatch, StoredSession, StoredSessionKind};
     use crate::test_support::unique_temp_path;
     use crate::ApprovalPolicy;
 
@@ -132,6 +213,9 @@ mod tests {
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Plan,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("执行计划 $ false; $ pwd".to_string()),
             pending_steps: vec!["执行命令 pwd".to_string()],
@@ -177,6 +261,9 @@ mod tests {
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Direct,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("读取 src/lib.rs 1-20".to_string()),
             pending_steps: Vec::new(),
@@ -225,6 +312,9 @@ mod tests {
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Direct,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("继续修改 demo 文件".to_string()),
             pending_steps: Vec::new(),
@@ -267,6 +357,9 @@ mod tests {
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Direct,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("应用补丁 demo".to_string()),
             pending_steps: Vec::new(),
@@ -314,6 +407,9 @@ mod tests {
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Direct,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("应用补丁 demo".to_string()),
             pending_steps: Vec::new(),
@@ -343,5 +439,46 @@ mod tests {
         }
 
         let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn build_agent_continuation_prompt_includes_summary_and_override() {
+        let stored = StoredSession {
+            session_kind: StoredSessionKind::Agent,
+            agent_state: Some(session::StoredAgentState {
+                session_id: Some("session-1".to_string()),
+                status: Some("已回答".to_string()),
+                current_action: Some("已回答上一轮".to_string()),
+                next_action: Some("给我最小修复建议".to_string()),
+                tool_call: None,
+                tool_result_summary: None,
+            }),
+            current_project_path: None,
+            plan: None,
+            current_task: Some("问 Copilot 分析 parse_intent".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已回答".to_string(),
+                summary: "parse_intent 负责把文本解析成 Intent。".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "问 Copilot 分析 parse_intent".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/lib.rs".to_string()),
+            recent_file_paths: vec!["src/lib.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        let prompt = build_agent_continuation_prompt(&stored, Some("给我最小修复建议"));
+
+        assert!(prompt.contains("继续同一个 agent 任务"));
+        assert!(prompt.contains("问 Copilot 分析 parse_intent"));
+        assert!(prompt.contains("parse_intent 负责把文本解析成 Intent"));
+        assert!(prompt.contains("给我最小修复建议"));
     }
 }

@@ -4,6 +4,61 @@
 
 ### Summary
 
+- Confirmed that the current bridge still does not have a true natural-language parsing layer: the main runtime path is still parser-first (`parse_intent` / explicit command matching), while model usage remains largely isolated to the ask-only Copilot path instead of owning action routing for arbitrary Feishu input
+- Reframed the planner work from a narrow `Unknown -> planner` fallback into a broader architecture change: natural-language understanding should become the primary routing layer for freeform Feishu input, with deterministic command parsing reduced to an explicit fast path rather than the default product model
+- Clarified the next semantic-planner contract around three decision modes instead of direct execution only: low-risk/high-confidence requests can execute immediately, ambiguous or risky requests should return a confirmation card, and underspecified requests should ask a clarifying question before any local action runs
+- Captured a concrete Git-semantics example for the planner design: phrases like “把本地改动同步到 GitHub 上” should not be interpreted as `git pull`; they are closer to `git push` or `git add/commit/push`, and therefore should normally route through a user-confirmed action proposal rather than a hard-coded single command
+
+- Stopped treating `parse_intent` keyword expansion as the main path for natural-language support and instead started the architecture shift toward a real semantic-planner layer for Feishu input
+- Added a new planner-first dispatch slice on top of the existing bridge runtime: explicit commands still take the deterministic fast path, while non-command free text now routes through a dedicated semantic planner instead of failing immediately as `Unknown`
+- Added a new companion-extension planner endpoint `POST /v1/chat/plan` that uses the local VS Code language model to map natural-language requests into structured bridge actions rather than only serving the ask-only Copilot path
+- Added a Rust-side semantic planner module that converts planner actions into existing `Intent` values or step-by-step plans, so the current approval/session/execution machinery can be reused without keeping natural-language routing inside `src/lib.rs`
+
+- Reframed the MVP against the user’s real remote-coding workflow instead of adding more bridge-only commands: the next useful baseline is now “from Feishu, choose the project I want to continue, sync local Git state, then keep pushing the work through Copilot in natural language”
+- Added the first session-bound project-selection slice on top of the existing folder-open path: `选择项目 <路径>` and `切换项目 <路径>` now reuse `OpenFolder`, persist a per-session `current_project_path`, reset the Copilot ask session to avoid cross-project contamination, and tell the user they can continue with `同步 Git 状态` or `问 Copilot ...`
+- Added direct project-status affordances for the same session: `当前项目` now reports the currently selected project, and Feishu follow-up cards now surface `当前项目` / `同步 Git` buttons once a session has an active project
+- Added a new `GitSync` intent and execution path for the clarified “同步github状态” use case, interpreted as local repo sync rather than cloud GitHub APIs: `同步 Git 状态` now resolves the repo from the explicit argument or the selected project, then runs `git status` -> `git pull` -> `git status`
+- Made the existing Git commands project-aware as well, so `git status`, `git pull`, and `git push` no longer depend solely on `BRIDGE_WORKSPACE_PATH` when the user has already selected a project for the current Feishu session
+- Adapted the parser to the user’s habitual natural-language phrasing by treating inputs like `检查Plan或在readme，继续plan里没完成的工作` as `ContinuePlan` instead of `Unknown`, keeping the bridge aligned with how the user actually talks to Copilot rather than requiring explicit operational verbs
+- Added a soft project boundary for Copilot turns before doing any extension-side isolation work: agent asks and continuations now prepend the selected project path into the prompt and instruct the model to focus on that project unless the user explicitly asks otherwise
+
+### Files Updated
+
+- `src/bridge.rs` — changed dispatch so explicit commands use a deterministic parser fast path while freeform natural language now routes through the new semantic planner layer
+- `src/lib.rs` — split explicit-command parsing from the older heuristic parser by adding `parse_explicit_intent(...)`, reducing the parser’s role in the main bridge dispatch path
+- `src/semantic_planner.rs` — added the new Rust-side semantic planner adapter that maps model-planned actions into existing `Intent` values and step plans
+- `src/vscode.rs` — added the Rust client for the new companion-extension semantic planner endpoint
+- `vscode-agent-bridge/src/extension.ts` — added `POST /v1/chat/plan` plus a model-driven semantic planner prompt that returns structured executable actions instead of only ask/tool-loop decisions
+
+- `src/lib.rs` — added `ShowCurrentProject` and `GitSync`, parser aliases for project selection / current-project / git-sync, the natural-language continue-plan heuristic, help text updates, and parser regressions for the new commands
+- `src/session.rs` — added persisted `current_project_path` state, preserved that field across later direct/agent writes unless explicitly replaced, and exposed helper access for selected-project lookup
+- `src/direct_command.rs` — turned `OpenFolder` into a session-aware project-selection path, added `ShowCurrentProject`, routed Git commands through the selected project when available, and injected selected-project context into agent prompts
+- `src/vscode.rs` — added `git_sync(...)` and kept Git execution centralized in the existing VS Code command helper layer
+- `src/intent_executor.rs` / `src/reply.rs` — taught executor/reply formatting about `ShowCurrentProject` and `GitSync`
+- `src/card.rs` — added follow-up actions for `当前项目` and `同步 Git` when a selected project exists in the stored session
+- `README.md` — documented the new project-selection, current-project, and Git-sync commands, plus the session-bound project behavior
+
+### Verification
+
+- `cargo test --lib semantic_planner` passed, covering both planner action conversion and bridge-level routing through the new semantic planner entry point
+- `npm run compile` under `vscode-agent-bridge/` passed after adding the new semantic planner endpoint and response types
+- VS Code diagnostics reported no new errors in `src/bridge.rs`, `src/lib.rs`, `src/semantic_planner.rs`, `src/vscode.rs`, or `vscode-agent-bridge/src/extension.ts`
+
+- VS Code diagnostics reported no new errors in the modified Rust files after the implementation landed
+- The first full `cargo test` run exposed two regressions introduced during the parser edit: a misplaced test block inside `parse_continue_agent_command` and an unnecessary `.as_str()` call on an `&str`; both were fixed immediately in `src/lib.rs`
+- After those repairs, full `cargo test` passed on Windows again: `124 passed; 0 failed` for `src/lib.rs`, plus the `setup-gui` unit tests and `tests/approval_card_flow.rs`
+- The new parser coverage for project selection, Git sync, and the natural-language continue-plan phrase passed as part of the all-target test run
+
+### Next Session Focus
+
+- Continue the architecture shift from parser-first to planner-first by moving more freeform Feishu input onto the semantic planner path instead of extending keyword heuristics in `parse_intent`
+- Extend the planner result schema so it can return `execute` / `confirm` / `clarify` decisions, then render confirmation cards for ambiguous Git and write operations before execution
+- Use the Git phrasing case as the first semantic-confirmation slice: “同步到 GitHub 上” should present candidate actions such as `git push`, `git add + commit + push`, or `先看状态`, rather than silently defaulting to `git pull`
+
+- Run a live Feishu smoke for `选择项目 <路径>`, `当前项目`, `同步 Git 状态`, and a follow-up `问 Copilot ...` turn to verify the selected project is reused end to end on the real path
+- Decide whether the next project-aware slice should be a card-driven recent-project picker or stronger extension-side single-project isolation for Copilot context
+- Keep the interaction model natural-language-first; avoid expanding the command surface unless a new command clearly removes repeated user friction
+
 - Continued from the grounded `8765` agent-MVP mainline instead of reopening the optional `8766` dev-host path, using `docs/agent_mvp_execution_plan.md` and `docs/mvp_release_plan.md` as the active source of truth
 - Implemented the first real single-round agent tool loop across the VS Code companion extension and Rust bridge, limited to the low-risk read-only tools `read_file` and `search_text`
 - Reworked the companion extension ask path so it now performs a lightweight planning pass first: it can either answer directly or return a structured `needs_tool` response with a concrete `toolRequest`
@@ -13,6 +68,17 @@
 - Revalidated the live Feishu path end-to-end: after replacing a stale `target/bridge-live-runner` listener process, `问 Copilot ...` resumed working and a real Feishu task successfully triggered `read_file(src/lib.rs:887-907)` through the new single-round tool loop
 - Hardened `问 Copilot` / `重置 Copilot 会话` parsing against whitespace variants by making the command prefix matcher tolerate non-ASCII whitespace such as full-width spaces, reducing one real-message parser fragility exposed during live validation
 - Confirmed the whitespace hardening on the real Feishu path as well: a full-width-space `问　Copilot　...` message was parsed successfully and still triggered the read-only tool loop, proving the fix is present in the rebuilt live listener rather than only in unit tests
+- Tightened the companion extension's tool-request guardrails so `read_file` ranges are normalized into a bounded forward window even when the planner emits only one side of the range or flips the order, which prevents avoidable Rust-side invalid-range failures from a malformed planner response
+- Tightened `/v1/chat/tool-result` session integrity by rejecting callback payloads whose `toolRequest` no longer matches the session's pending request, keeping the single-round loop from silently accepting a different tool/action than the one originally planned
+- Re-ranked the active MVP mainline away from more single-round tool-loop hardening and toward the bigger missing capability: agent continuation, because the current bridge already has structured status and a one-hop read-only tool loop but still feels like stateful ask/answer instead of a continuing task agent
+- Added the first real agent continuation path on the Rust side: explicit natural follow-ups such as `继续，给我最小修复建议` now parse as a dedicated agent-continuation intent, and plain `继续刚才的任务` now falls back to the most recent agent session when there is no pending plan to resume
+- Reused the existing Feishu session key as the continuation bridge session as well, so follow-up agent turns stay in the same VS Code companion-extension conversation instead of silently starting a fresh ask session
+- Added continuation prompt shaping that carries forward the previous task plus last result summary, so a continuation turn can say “keep going from here” without the user restating the full task every time
+- Revalidated the new continuation path on the real Feishu route after restarting the verified `F5` extension host: a live `问 Copilot 分析 parse_intent 这个函数是干什么的，如果不够就读取代码后回答` request completed successfully, and a follow-up `继续，给我最小建议` reused the same Feishu/extension session and was persisted as `继续 Agent 任务：给我最小建议` instead of falling back to plan-summary semantics
+- Replaced the remaining agent/plan continuation heuristic with explicit persisted session typing: stored sessions now record whether they came from an `agent`, `plan`, or ordinary `direct` command, so `继续` / `继续刚才的任务` routing no longer depends on matching strings like `问 Copilot ...` in the stored task text
+- Added the first controlled follow-up action on top of the new continuation path: agent turns now persist their structured `nextAction`, the Feishu-visible reply explicitly tells the user they can send `按建议继续`, and the bridge can now reuse that stored suggestion as the next continuation prompt instead of requiring the user to paraphrase the suggested next step manually
+- Started the documentation/setup convergence slice for MVP by aligning the top-level README and companion-extension README with the current verified startup path (`F5` first, then `start-live-listener`), the now-supported continuation commands, and the real current MVP story of “same-session task continuation” instead of one-shot ask-only behavior
+- Tightened the installer story so packaging scripts now try to build a bundled companion-extension `.vsix` before assembling Windows/macOS payloads, `setup-gui` points failed local-health checks back to the verified extension bootstrap path, and the README set now describes the same install/health-check flow instead of mixing developer-only and installer-only assumptions
 - Kept the boundary intentionally narrow for this slice: one round only, read-only tools only, no write path, no multi-tool planner, and no plan-executor integration yet
 
 ### Files Updated
@@ -23,6 +89,21 @@
 - `src/lib.rs` — made ask/reset command parsing tolerate flexible whitespace and added parser regressions for full-width-space variants
 - `docs/work_log.md` — recorded today’s agent tool-loop implementation and verification
 - `vscode-agent-bridge/README.md` — documented the new tool-result endpoint and the current single-round read-only tool-loop boundary
+- `vscode-agent-bridge/src/extension.ts` — normalized `read_file` line ranges, strengthened planner instructions for bounded line requests, and rejected mismatched tool-result callbacks before continuing a pending session
+- `src/lib.rs` — added explicit agent-continuation parsing for natural follow-ups such as `继续，...` and documented the new continuation command shape in help text
+- `src/bridge.rs` — changed `继续刚才的任务` routing so it now resumes a pending plan when one exists, otherwise continues the most recent agent task when the stored session came from `问 Copilot`
+- `src/direct_command.rs` — extracted a reusable agent-turn execution path so initial ask and continuation both share the same session/persistence flow
+- `src/follow_up.rs` — added the first agent continuation executor and synthesized continuation prompt builder based on the last stored task/result
+- `src/reply.rs` / `src/session.rs` — taught intent formatting and stored-session helpers about `ContinueAgent`, including agent-session detection for no-plan continuation fallback
+- `src/intent_executor.rs` — marked agent continuation as direct-only, matching the current direct-command-only status of `问 Copilot`
+- `src/session.rs` — added explicit `StoredSessionKind` persistence and moved agent-session detection to prefer this typed state over string heuristics
+- `src/plan_dispatch.rs` / `src/direct_command.rs` — now persist `plan` versus `direct` session kinds explicitly so later continuation routing can make deterministic decisions
+- `src/session.rs` — now also persists structured agent metadata such as `session_id`, `current_action`, and `next_action`, and exposes a helper for retrieving the stored suggested next action
+- `src/lib.rs` / `src/bridge.rs` / `src/follow_up.rs` — added the new `按建议继续` follow-up command and routed it into the existing agent continuation flow using the stored `nextAction`
+- `src/reply.rs` — agent replies now advertise the new `按建议继续` affordance whenever the model returns a non-empty `nextAction`
+- `README.md` / `vscode-agent-bridge/README.md` — updated the developer-facing MVP story so the verified `F5` bootstrap path, live smoke path, and supported continuation commands are documented consistently instead of implying a one-shot ask-only flow
+- `scripts/package-windows-installer.ps1` / `scripts/package-macos-installer.sh` / `vscode-agent-bridge/package.json` — made installer packaging produce a bundled `dist/feishu-agent-bridge.vsix` by default so payload assembly no longer depends on a pre-existing manually generated VSIX
+- `src/bin/setup_gui.rs` / `README.md` / `vscode-agent-bridge/README.md` — aligned setup-gui health-check guidance and installer documentation with the same “extension first, then `/health`, then listener” path
 
 ### Verification
 
@@ -32,6 +113,25 @@
 - `cargo test --lib parse_ask_agent` passed, including the new full-width-space regression case
 - `cargo test --lib parse_reset_agent_session` passed, including the new full-width-space regression case
 - Live Feishu validation confirmed the restored `问 Copilot ...` path, a real `read_file` tool invocation in the reply, and a successful full-width-space `问　Copilot　...` smoke on the rebuilt listener
+- Workspace task `build-feishu-agent-bridge-extension` succeeded again after the tool-request validation hardening in `vscode-agent-bridge/src/extension.ts`
+- `cargo test --lib continue_agent`
+- `cargo test --lib continuation_prompt`
+- `cargo test --lib detects_agent_task_session`
+- `cargo test --lib continue_plan_without_pending_plan_returns_continuity_summary`
+- Full `cargo test` is currently still blocked by an existing unrelated compile error in `src/bin/setup_gui.rs` (`TcpStream::write_all` missing `std::io::Write` import), so this continuation slice was verified through `--lib` coverage rather than an all-target test pass
+- After adding the missing non-macOS `std::io::Write` import in `src/bin/setup_gui.rs`, full `cargo test` passed again on Windows: `122 passed; 0 failed` for `src/lib.rs`, plus the `setup-gui` unit tests and `tests/approval_card_flow.rs`
+- Real Feishu smoke passed for the continuation slice: listener logs confirmed both inbound messages and successful replies, `.feishu-vscode-bridge-audit.jsonl` recorded the follow-up command `继续，给我最小建议` with `🧾 上次动作: 继续 Agent 任务`, and `.feishu-vscode-bridge-session.json` persisted the last step as `继续 Agent 任务：给我最小建议`
+- After introducing explicit `StoredSessionKind`, full `cargo test` still passed on Windows with the same all-target coverage, confirming the persistence format extension did not regress plan cards, follow-up replies, or setup-gui tests
+- After adding the stored `nextAction` follow-up path, full `cargo test` still passed on Windows with all Rust targets green, confirming the new `按建议继续` intent did not regress existing plan, follow-up, or agent bootstrap behavior
+- VS Code diagnostics still reported no new errors in `src/bin/setup_gui.rs` and `vscode-agent-bridge/package.json` after the installer-path convergence edits
+- `npm run package:vsix` now succeeds under `vscode-agent-bridge/` and produces `vscode-agent-bridge/dist/feishu-agent-bridge.vsix` after making the VSIX path non-interactive and ensuring `dist/` exists
+- `scripts/package-windows-installer.ps1 -Configuration Release` now stages a real Windows payload containing `bridge-cli.exe`, `setup-gui.exe`, and `feishu-agent-bridge.vsix`; the only remaining blocker to a local `Setup.exe` on this host is that `makensis` is not installed
+- After installing NSIS on this Windows host and removing non-ASCII NSIS UI strings from `scripts/windows-installer.nsi`, `scripts/package-windows-installer.ps1 -Configuration Release` now completes end-to-end and produces a Windows installer under `dist/windows/`; the final artifact has since been renamed from the generic `Setup.exe` to `FeishuVSCodeBridgeSetup.exe` to avoid the NSIS compatibility-shim warning on Windows
+- After renaming the Windows NSIS output to `FeishuVSCodeBridgeSetup.exe`, the same packaging command completed again on this host with the product-specific filename under `dist/windows/` and no longer emitted the previous NSIS warning about the generic `Setup.exe` name
+- Switched the Windows NSIS installer from an admin + `Program Files` default to a per-user installer rooted in `%LOCALAPPDATA%\Programs\Feishu VS Code Bridge`, matching its existing HKCU uninstall data and user-scoped shortcuts so silent install smoke can run without UAC on a normal shell
+- Verified the per-user Windows installer with a full silent smoke on this host: `FeishuVSCodeBridgeSetup.exe /S /D=%LOCALAPPDATA%\FeishuVSCodeBridgeSmoke` installed `bridge-cli.exe`, `setup-gui.exe`, `feishu-agent-bridge.vsix`, and `Uninstall.exe`, wrote the expected HKCU uninstall entry, and the matching silent uninstall removed both the install directory and uninstall registry key cleanly
+- Upgraded `docs/feishu_live_regression_checklist.md` from a mostly plan/follow-up smoke list into an agent-MVP regression checklist that now requires `/health`, a real `问 Copilot ...` tool-loop-capable ask, same-session continuation via `继续，...`, `按建议继续`, failure recovery, and an explicit recording format for whether a real tool loop occurred
+- Added a matching top-level README path for Windows post-install validation so the packaged installer story now points directly at `setup-gui` -> `/health` -> live listener -> `问 Copilot ...` -> continuation, instead of forcing users to reconstruct that sequence from separate dev-only notes
 
 ### Next Session Focus
 

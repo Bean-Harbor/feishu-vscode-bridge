@@ -42,6 +42,7 @@ pub fn start_plan(
         ),
     };
     let stored = session::build_stored_session(
+        session::StoredSessionKind::Plan,
         if progress.completed {
             None
         } else {
@@ -98,6 +99,7 @@ pub fn resume_plan(
         })
     };
     stored = session::build_stored_session(
+        session::StoredSessionKind::Plan,
         if progress.completed {
             None
         } else {
@@ -140,6 +142,7 @@ pub fn approve_plan(
         )
     });
     stored = session::build_stored_session(
+        session::StoredSessionKind::Plan,
         if progress.completed {
             None
         } else {

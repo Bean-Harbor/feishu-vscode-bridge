@@ -12,6 +12,8 @@
 use eframe::egui;
 use feishu_vscode_bridge::vscode::AGENT_BRIDGE_PORT_ENV;
 use std::io::Read;
+#[cfg(not(target_os = "macos"))]
+use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -362,7 +364,7 @@ fn launch_vscode_workspace_and_check_health() -> SetupTaskStatus {
         ok: false,
         label: "本地 bridge 健康检查失败".to_string(),
         detail: format!(
-            "VS Code 已尝试打开工作区，但在 {} 秒内没有等到 http://127.0.0.1:{port}/health 返回 OK。请确认 extension 已启用、VS Code 已完成激活。",
+            "VS Code 已尝试把当前仓库加入窗口，但在 {} 秒内没有等到 http://127.0.0.1:{port}/health 返回 OK。请先确认 companion extension 已启用；如果你在做开发态联调，请优先在仓库里按 F5 启动 `Run Feishu Agent Bridge Extension`，不要继续排查监听器或飞书鉴权。",
             HEALTH_CHECK_ATTEMPTS
         ),
     }

@@ -20,14 +20,16 @@
 - workspace context 注入
 - `问 Copilot` / `重置 Copilot 会话`
 - 现成的 Rust 只读/低风险工具能力
+- 最小 `AgentTaskState` / 结构化 agent 响应
+- 单轮只读 tool loop，当前支持 `read_file` 和 `search_text`
+- Feishu 侧最小 agent 进度文本展示
 
 当前还缺：
 
-- agent task state
-- agent response schema
-- model -> tool -> model 的最小闭环
-- Feishu 侧的 agent 进度表达
 - 基于任务而不是基于问答的验证标准
+- 一条更稳定、更可重复的 real Feishu 验证脚本化路径
+- 发布视角下的安装/诊断收尾
+- 面向真实用户的 installer / setup 收口
 
 ## MVP Definition
 
@@ -219,6 +221,44 @@
 
 - 用户能从一条飞书回复里看懂 agent 当前在哪个阶段
 
+### W4.5 Agent Continuation
+
+目标：让 agent 从“问一次”升级成“继续做同一个任务”。
+
+当前问题：
+
+- `问 Copilot ...` 已能返回结构化状态，但后续仍主要依赖用户再次发送新的 `问 Copilot ...`
+- Rust 侧虽然会把 agent 结果持久化到 session，但 `继续` / `继续刚才的任务` 仍主要服务于计划执行语义
+- 这会让用户感知到的是“带一点状态的问答”，而不是“可继续推进的任务 agent`
+
+需要补的能力：
+
+- 区分“继续计划”与“继续 agent 任务”
+- 当最近一次任务是 agent 且没有待执行 plan 时，把 `继续刚才的任务` 路由到 agent continuation
+- 让 continuation 能复用当前 agent session，并把新的推进意图发回 extension
+- 在 Feishu 回复里明确当前是在“继续上一个 agent 任务”而不是重新发起新问答
+
+建议落点：
+
+- `src/bridge.rs`
+- `src/direct_command.rs`
+- `src/session.rs`
+- `src/lib.rs`
+- `src/vscode.rs`
+
+验收：
+
+- 用户在一次 `问 Copilot ...` 之后，可以直接发送 `继续刚才的任务` 或 `继续，给我最小修复建议`
+- 同一飞书会话内连续两到三轮推进仍复用同一个 agent session
+- 当存在 plan 会话时，不破坏现有 `继续` 语义
+
+当前状态：最小版本已完成。
+
+- 已支持 `继续刚才的任务`
+- 已支持自然追问 `继续，...`
+- 已支持 `按建议继续`
+- 已完成一次真实 Feishu continuation smoke
+
 ### W5. Validation Harness
 
 目标：把验证标准从“ask 成功”升级成“agent loop 成功”。
@@ -348,7 +388,7 @@
 
 ### Slice 1
 
-先做协议，不做复杂行为。
+已完成。
 
 - 定义 `AgentTaskState`
 - 定义 `AgentTaskResponse`
@@ -356,7 +396,7 @@
 
 ### Slice 2
 
-接第一个 tool loop。
+已完成。
 
 - extension 能产出 tool request
 - Rust 能执行 `read_file`
@@ -364,14 +404,14 @@
 
 ### Slice 3
 
-补第二个只读工具。
+已完成最小版本。
 
 - `search_text`
 - 改善 agent 对“需要更多上下文”的处理
 
 ### Slice 4
 
-补 Feishu 展示。
+已完成最小文本版。
 
 - 任务状态
 - 工具摘要
@@ -379,11 +419,35 @@
 
 ### Slice 5
 
+优先拆成两段，先做“大功能”，再做回归与安装验证。
+
+- 先补 agent continuation 主链路
+- 再做真实回归和安装验证
+
+### Slice 5A
+
+已完成。
+
+- 为 agent 增加“继续任务”语义
+- 打通 `继续刚才的任务` 与最近 agent session 的复用
+- 保证与 plan continuation 不冲突
+
+### Slice 5B
+
 做真实回归和安装验证。
 
 - real Feishu smoke
 - README 安装路径
 - 最小诊断手册
+
+### Slice 6
+
+把 MVP 从“开发者可跑”推进到“用户可装”。
+
+- 固化 Windows `Setup.exe` 路径
+- 固化 macOS `.dmg` 路径
+- 收口 extension 安装、health check、失败恢复说明
+- 让 setup wizard / packaging 脚本和 README 对齐
 
 ## File-Level Change Plan
 
@@ -411,13 +475,13 @@
 
 ## First Coding Slice
 
-下一步第一批代码不要同时改所有东西，只做下面三件：
+下一步第一批工作不要继续扩命令面，而是只做下面三件：
 
-1. 在 extension 侧引入结构化 `AgentResponse`
-2. 在 Rust 侧把 `ask_agent()` 改成解析结构化响应
-3. 在 Feishu 回复里显示 `状态 + 当前动作 + 结果摘要`
+1. 把 real Feishu 验证标准固定成可重复 checklist，而不是临场 smoke
+2. 把 README、setup wizard、packaging 脚本的启动/诊断路径收成一个一致的安装故事
+3. 优先补发布视角的缺口，而不是继续给 agent continuation 加更多细粒度命令
 
-这三步完成后，产品就会从“连续问答”正式进入“agent MVP 骨架”。
+这三步完成后，产品才会从“本地已验证的 agent 原型”进入“可准备私测的 agent MVP”。
 
 ## Success Criteria For This Breakdown
 

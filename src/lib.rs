@@ -171,6 +171,8 @@ pub enum Intent {
         mode: ExecutionMode,
     },
     ContinuePlan,
+    ContinueAgent { prompt: Option<String> },
+    ContinueAgentSuggested,
     RetryFailedStep,
     ExecuteAll,
     ApprovePending,
@@ -220,9 +222,13 @@ pub enum Intent {
     WriteFile { path: String, content: String },
     AskAgent { prompt: String },
     ResetAgentSession,
+    ShowProjectPicker,
+    ShowProjectBrowser { path: Option<String> },
+    ShowCurrentProject,
 
     // Git 操作
     GitStatus { repo: Option<String> },
+    GitSync { repo: Option<String> },
     GitPull { repo: Option<String> },
     GitPushAll { repo: Option<String>, message: String },
     GitLog { count: Option<usize>, path: Option<String> },
@@ -250,12 +256,22 @@ pub mod plan;
 pub mod reply;
 pub mod session;
 pub mod vscode;
+pub mod semantic_planner;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
 /// 解析用户消息为意图
 pub fn parse_intent(text: &str) -> Intent {
+    parse_intent_internal(text, true)
+}
+
+/// 仅解析显式命令，不尝试自然语言语义推断。
+pub fn parse_explicit_intent(text: &str) -> Intent {
+    parse_intent_internal(text, false)
+}
+
+fn parse_intent_internal(text: &str, allow_natural_language: bool) -> Intent {
     let text = text.trim();
     let lower = text.to_lowercase();
 
@@ -278,6 +294,14 @@ pub fn parse_intent(text: &str) -> Intent {
             | "continue last task"
     ) {
         return Intent::ContinuePlan;
+    }
+
+    if allow_natural_language && looks_like_continue_plan_phrase(&lower) {
+        return Intent::ContinuePlan;
+    }
+
+    if let Some(intent) = parse_agent_continue_intent(text, &lower) {
+        return intent;
     }
 
     if matches!(
@@ -312,6 +336,36 @@ pub fn parse_intent(text: &str) -> Intent {
             | "last result"
     ) {
         return Intent::ShowLastResult;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "按建议继续"
+            | "按建议执行"
+            | "执行建议动作"
+            | "继续建议的动作"
+            | "follow suggested next step"
+            | "accept next action"
+    ) {
+        return Intent::ContinueAgentSuggested;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "选择项目" | "切换项目" | "select project" | "choose project" | "use project"
+    ) {
+        return Intent::ShowProjectPicker;
+    }
+
+    if matches!(
+        lower.as_str(),
+        "浏览项目" | "浏览文件夹" | "browse project" | "browse folder"
+    ) {
+        return Intent::ShowProjectBrowser { path: None };
+    }
+
+    if matches!(lower.as_str(), "当前项目" | "current project" | "project status") {
+        return Intent::ShowCurrentProject;
     }
 
     if matches!(
@@ -390,7 +444,7 @@ pub fn parse_intent(text: &str) -> Intent {
         }
     }
 
-    parse_single_intent(text, &lower)
+    parse_single_intent(text, &lower, allow_natural_language)
 }
 
 fn parse_plan(text: &str, mode: ExecutionMode) -> Option<Intent> {
@@ -398,7 +452,7 @@ fn parse_plan(text: &str, mode: ExecutionMode) -> Option<Intent> {
         .into_iter()
         .filter_map(|step| {
             let lower = step.to_lowercase();
-            let intent = parse_single_intent(step, &lower);
+            let intent = parse_single_intent(step, &lower, false);
             intent.is_runnable().then_some(intent)
         })
         .collect();
@@ -417,7 +471,7 @@ fn split_plan_steps(text: &str) -> Vec<&str> {
         .collect()
 }
 
-fn parse_single_intent(text: &str, lower: &str) -> Intent {
+fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) -> Intent {
 
     // ── 帮助 ──
     if lower.is_empty() || matches!(lower, "help" | "帮助" | "?") {
@@ -539,6 +593,20 @@ fn parse_single_intent(text: &str, lower: &str) -> Intent {
     }
 
     // ── VS Code 打开文件夹 ──
+    if let Some(rest) = strip_prefix_any(&lower, &["选择项目 ", "切换项目 ", "select project ", "use project "]) {
+        let rest = text[text.len() - rest.len()..].trim();
+        return Intent::OpenFolder {
+            path: rest.to_string(),
+        };
+    }
+
+    if let Some(rest) = strip_prefix_any(&lower, &["浏览项目 ", "浏览文件夹 ", "browse project ", "browse folder "]) {
+        let rest = text[text.len() - rest.len()..].trim();
+        return Intent::ShowProjectBrowser {
+            path: Some(rest.to_string()),
+        };
+    }
+
     if let Some(rest) = strip_prefix_any(&lower, &["打开文件夹 ", "打开目录 ", "open folder "]) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::OpenFolder {
@@ -607,6 +675,38 @@ fn parse_single_intent(text: &str, lower: &str) -> Intent {
         };
     }
 
+    // ── Git sync ──
+    if matches!(
+        lower,
+        "git sync"
+            | "sync git"
+            | "同步git状态"
+            | "同步 git 状态"
+            | "同步github状态"
+            | "同步 github 状态"
+            | "同步代码状态"
+            | "同步当前项目"
+    ) {
+        return Intent::GitSync { repo: None };
+    }
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "git sync ",
+            "sync git ",
+            "同步git状态 ",
+            "同步 git 状态 ",
+            "同步github状态 ",
+            "同步 github 状态 ",
+            "同步代码状态 ",
+        ],
+    ) {
+        let rest = text[text.len() - rest.len()..].trim();
+        return Intent::GitSync {
+            repo: Some(rest.to_string()),
+        };
+    }
+
     // ── Git pull ──
     if matches!(lower, "git pull" | "拉取" | "拉取代码") {
         return Intent::GitPull { repo: None };
@@ -659,6 +759,12 @@ fn parse_single_intent(text: &str, lower: &str) -> Intent {
         };
     }
 
+    if allow_natural_language {
+        if let Some(intent) = parse_natural_language_intent(text, lower) {
+            return intent;
+        }
+    }
+
     // 无法识别
     Intent::Unknown(text.to_string())
 }
@@ -669,6 +775,10 @@ impl Intent {
             self,
             Intent::ExplainLastFailure
                 | Intent::ShowLastResult
+                | Intent::ContinueAgentSuggested
+                | Intent::ShowProjectPicker
+                | Intent::ShowProjectBrowser { .. }
+                | Intent::ShowCurrentProject
                 | Intent::ContinueLastFile
                 | Intent::ShowLastDiff
                 | Intent::ShowRecentFiles
@@ -692,8 +802,10 @@ impl Intent {
                     | Intent::RunTestFile { .. }
                     | Intent::WriteFile { .. }
                     | Intent::AskAgent { .. }
+                    | Intent::ContinueAgent { .. }
                     | Intent::ResetAgentSession
                 | Intent::GitStatus { .. }
+                    | Intent::GitSync { .. }
                 | Intent::GitPull { .. }
                 | Intent::GitPushAll { .. }
                 | Intent::GitLog { .. }
@@ -702,6 +814,18 @@ impl Intent {
         )
     }
 }
+
+    fn looks_like_continue_plan_phrase(lower: &str) -> bool {
+        let has_continue_plan = lower.contains("继续plan")
+            || lower.contains("继续 plan")
+            || lower.contains("continue plan");
+        let has_pending_work = lower.contains("没完成")
+            || lower.contains("未完成")
+            || lower.contains("unfinished")
+            || lower.contains("pending");
+
+        has_continue_plan && has_pending_work
+    }
 
 /// 辅助：尝试匹配多个前缀，返回去掉前缀后的剩余文本
 fn strip_prefix_any<'a>(lower: &'a str, prefixes: &[&str]) -> Option<&'a str> {
@@ -779,6 +903,112 @@ fn matches_command_any(lower: &str, commands: &[&str]) -> bool {
 
 fn normalize_command_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_natural_language_intent(text: &str, lower: &str) -> Option<Intent> {
+    parse_natural_project_intent(text, lower)
+        .or_else(|| parse_natural_git_intent(lower))
+        .or_else(|| parse_natural_agent_request(text, lower))
+}
+
+fn parse_natural_project_intent(text: &str, lower: &str) -> Option<Intent> {
+    if contains_any(lower, &["当前项目", "现在在哪个项目", "现在在哪个仓库", "当前仓库"]) {
+        return Some(Intent::ShowCurrentProject);
+    }
+
+    let looks_like_navigation_request = !contains_any(
+        lower,
+        &["工作", "任务", "实现", "修复", "继续", "未完成", "readme", "docs/", "src/"],
+    );
+
+    if contains_any(lower, &["浏览", "看看", "看一下", "查看"]) 
+        && contains_any(lower, &["项目", "目录", "文件夹", "本地文件夹"])
+        && looks_like_navigation_request
+    {
+        return Some(Intent::ShowProjectBrowser { path: None });
+    }
+
+    if contains_any(lower, &["切到", "切换到", "打开", "进入", "使用", "改到"]) {
+        if let Some(path) = extract_path_candidate(text) {
+            return Some(Intent::OpenFolder { path });
+        }
+    }
+
+    None
+}
+
+fn parse_natural_git_intent(lower: &str) -> Option<Intent> {
+    let mentions_remote = contains_any(lower, &["github", "远程", "仓库", "origin"]);
+    let mentions_local_changes = contains_any(lower, &["本地", "改动", "变更", "代码", "提交"]);
+
+    if contains_any(lower, &["同步", "推送", "提交", "上传", "发上去"]) && mentions_remote && mentions_local_changes {
+        return Some(Intent::GitPushAll {
+            repo: None,
+            message: "auto commit via feishu-bridge".to_string(),
+        });
+    }
+
+    if contains_any(lower, &["拉取", "更新本地", "同步到本地", "拉下来"]) && mentions_remote {
+        return Some(Intent::GitPull { repo: None });
+    }
+
+    if contains_any(lower, &["看看状态", "查看状态", "仓库状态", "git状态", "git 状态", "有没有改动", "有哪些改动", "本地改动", "工作区状态"]) {
+        return Some(Intent::GitStatus { repo: None });
+    }
+
+    None
+}
+
+fn parse_natural_agent_request(text: &str, lower: &str) -> Option<Intent> {
+    let has_task_verb = contains_any(
+        lower,
+        &[
+            "检查", "分析", "解释", "看看", "查看", "阅读", "读取", "搜索", "查找", "继续",
+            "修复", "修改", "实现", "重构", "review", "inspect", "analyze", "explain",
+            "check", "read", "search", "find", "continue", "fix", "implement", "update",
+            "modify",
+        ],
+    );
+    let has_code_context = contains_any(
+        lower,
+        &[
+            "readme", "docs/", "src/", ".rs", ".ts", "代码", "项目", "函数", "文件", "测试",
+            "plan", "diff", "copilot", "bug",
+        ],
+    );
+
+    (has_task_verb && has_code_context).then(|| Intent::AskAgent {
+        prompt: text.trim().to_string(),
+    })
+}
+
+fn extract_path_candidate(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(trim_wrapping_punctuation)
+        .find(|token| looks_like_path_candidate(token))
+        .map(ToString::to_string)
+}
+
+fn trim_wrapping_punctuation(token: &str) -> &str {
+    token.trim_matches(|c: char| matches!(c, '"' | '\'' | '，' | '。' | '：' | ':' | '；' | ';' | '（' | '）' | '(' | ')' | '、'))
+}
+
+fn looks_like_path_candidate(token: &str) -> bool {
+    let trimmed = token.trim();
+    if trimmed.len() < 2 {
+        return false;
+    }
+
+    trimmed.contains(":/")
+        || trimmed.contains(":\\")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('/')
+        || trimmed.contains("\\")
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 /// 解析 "path:line" 格式
@@ -975,6 +1205,42 @@ fn parse_agent_ask_intent(text: &str, lower: &str) -> Option<Intent> {
     })
 }
 
+fn parse_agent_continue_intent(text: &str, lower: &str) -> Option<Intent> {
+    const PREFIXES: &[&str] = &[
+        "继续，",
+        "继续,",
+        "继续：",
+        "继续:",
+        "继续刚才的任务，",
+        "继续刚才的任务,",
+        "继续刚才的任务：",
+        "继续刚才的任务:",
+        "continue,",
+        "continue:",
+        "continue，",
+        "continue：",
+        "continue last task,",
+        "continue last task:",
+        "continue last task，",
+        "continue last task：",
+    ];
+
+    for prefix in PREFIXES {
+        if lower.starts_with(prefix) {
+            let rest = text[prefix.len()..].trim();
+            if rest.is_empty() {
+                return None;
+            }
+
+            return Some(Intent::ContinueAgent {
+                prompt: Some(rest.to_string()),
+            });
+        }
+    }
+
+    None
+}
+
 fn parse_agent_reset_intent(lower: &str) -> Option<Intent> {
     if matches_command_any(
         lower,
@@ -1059,6 +1325,7 @@ pub fn help_text() -> &'static str {
 ▸ 追问
     刚才为什么失败              — 看失败原因
     把上一步结果发我            — 看上一步输出
+    按建议继续                  — 直接采用上一轮 agent 的下一步建议
     继续改刚才那个文件          — 回到刚才那个文件
     把刚才的 diff 发我          — 看刚才的 diff / patch
     把刚才改动的文件列表发我    — 看刚才改了哪些文件
@@ -1067,7 +1334,11 @@ pub fn help_text() -> &'static str {
 ▸ VS Code
   打开 <文件路径>          — 用 VS Code 打开文件
   打开 <文件:行号>         — 打开并跳转到指定行
+        选择项目                 — 打开项目选择卡片
+        浏览项目                 — 浏览本机目录并选择项目
   打开文件夹 <路径>        — 打开目录
+    选择项目 <路径>          — 设为当前项目并在 VS Code 打开目录
+    当前项目                 — 查看当前飞书会话绑定的项目
   安装扩展 <ext.id>        — 安装 VS Code 扩展
   卸载扩展 <ext.id>        — 卸载扩展
   扩展列表                 — 列出已安装扩展
@@ -1087,6 +1358,8 @@ pub fn help_text() -> &'static str {
     运行测试文件 <路径>      — 按测试文件执行测试
     写入文件 <路径>\n<内容>  — 创建或覆盖文件（需审批）
     问 Copilot <问题>        — 通过 companion extension 发起一次 ask-style agent 会话
+    继续刚才的任务          — 无待执行计划时，优先继续最近一次 agent 任务
+    继续，<新的推进要求>    — 在同一 agent 会话里继续追问，例如「继续，给我最小修复建议」
     重置 Copilot 会话        — 清空当前飞书会话对应的 extension ask 历史
     应用补丁 <unified diff>  — 将补丁应用到当前工作区
 
@@ -1094,6 +1367,7 @@ pub fn help_text() -> &'static str {
     查看 diff [路径]         — 查看当前工作区未提交变更
     git diff [路径]          — 同上
   git status [仓库路径]    — 查看仓库状态
+    同步 Git 状态 [仓库路径] — 依次执行 git status / git pull / git status
   git pull [仓库路径]      — 拉取代码
   git push [提交信息]      — 提交并推送
     git log [条数] [路径]    — 查看提交历史
@@ -1356,6 +1630,81 @@ mod tests {
     }
 
     #[test]
+    fn parse_continue_agent_command() {
+        assert_eq!(
+            parse_intent("继续，给我最小修复建议"),
+            Intent::ContinueAgent {
+                prompt: Some("给我最小修复建议".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_intent("continue, give me the smallest fix"),
+            Intent::ContinueAgent {
+                prompt: Some("give me the smallest fix".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_project_and_git_sync_commands() {
+        assert_eq!(parse_intent("选择项目"), Intent::ShowProjectPicker);
+        assert_eq!(parse_intent("浏览项目"), Intent::ShowProjectBrowser { path: None });
+        assert_eq!(
+            parse_intent("选择项目 C:/work/demo"),
+            Intent::OpenFolder {
+                path: "C:/work/demo".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_intent("浏览项目 C:/work"),
+            Intent::ShowProjectBrowser {
+                path: Some("C:/work".to_string()),
+            }
+        );
+        assert_eq!(parse_intent("当前项目"), Intent::ShowCurrentProject);
+        assert_eq!(parse_intent("同步 Git 状态"), Intent::GitSync { repo: None });
+    }
+
+    #[test]
+    fn parse_natural_language_vscode_actions() {
+        assert_eq!(
+            parse_intent("把本地的改动同步到github上"),
+            Intent::GitPushAll {
+                repo: None,
+                message: "auto commit via feishu-bridge".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_intent("看看当前项目"),
+            Intent::ShowCurrentProject
+        );
+        assert_eq!(
+            parse_intent("浏览一下本地项目目录"),
+            Intent::ShowProjectBrowser { path: None }
+        );
+        assert_eq!(
+            parse_intent("切换到 C:/Users/beanw/OpenSource/feishu-vscode-bridge"),
+            Intent::OpenFolder {
+                path: "C:/Users/beanw/OpenSource/feishu-vscode-bridge".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_intent("检查 README 和 docs/work_log，继续未完成的项目浏览工作"),
+            Intent::AskAgent {
+                prompt: "检查 README 和 docs/work_log，继续未完成的项目浏览工作".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_natural_continue_plan_phrase() {
+        assert_eq!(
+            parse_intent("检查Plan或在readme，继续plan里没完成的工作"),
+            Intent::ContinuePlan
+        );
+    }
+
+    #[test]
     fn parse_approval_commands() {
         assert_eq!(parse_intent("批准"), Intent::ApprovePending);
         assert_eq!(parse_intent("approve"), Intent::ApprovePending);
@@ -1369,6 +1718,7 @@ mod tests {
         assert_eq!(parse_intent("为什么失败了"), Intent::ExplainLastFailure);
         assert_eq!(parse_intent("把上一步结果发我"), Intent::ShowLastResult);
         assert_eq!(parse_intent("看上一步"), Intent::ShowLastResult);
+        assert_eq!(parse_intent("按建议继续"), Intent::ContinueAgentSuggested);
         assert_eq!(parse_intent("继续改刚才那个文件"), Intent::ContinueLastFile);
         assert_eq!(parse_intent("继续这个文件"), Intent::ContinueLastFile);
         assert_eq!(parse_intent("把刚才的 diff 发我"), Intent::ShowLastDiff);

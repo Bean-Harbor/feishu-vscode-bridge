@@ -28,7 +28,10 @@ From this directory:
 ```powershell
 npm install
 npm run compile
+npm run package:vsix
 ```
+
+`npm run package:vsix` writes the installer-friendly artifact to `dist/feishu-agent-bridge.vsix`.
 
 ## Run In Extension Host
 
@@ -47,7 +50,7 @@ The repository now includes:
 
 Use this shortest path before debugging Rust-side code:
 
-1. Launch the Extension Development Host with `Run Feishu Agent Bridge Extension`.
+1. Launch the Extension Development Host with `Run Feishu Agent Bridge Extension` by pressing `F5` in the repository workspace.
   - On hosts without `npm` but with an existing compiled `out/extension.js`, you can use `./scripts/start-extension-dev-host.sh --port 8766` as an isolated Mac-side experiment against the repository checkout, but the supported mainline path remains the regular `8765` bridge.
 2. Check the `Feishu Agent Bridge` output channel and confirm it logs the local server port.
 3. Verify `http://127.0.0.1:8765/health` returns OK, or let `setup-gui` run the same health check after installing the extension.
@@ -72,7 +75,7 @@ Override with either:
 - `BRIDGE_AGENT_BRIDGE_URL`
 - `BRIDGE_AGENT_BRIDGE_PORT`
 
-## First Ask-Style Smoke
+## First Agent MVP Smoke
 
 1. Launch the Extension Development Host with `Run Feishu Agent Bridge Extension`.
 2. Wait for the output channel `Feishu Agent Bridge` to show the local server port.
@@ -80,7 +83,14 @@ Override with either:
 4. Send this message from Feishu:
 
 ```text
-问 Copilot parse_intent 这个函数是干什么的
+问 Copilot 分析 parse_intent 这个函数是干什么的，如果不够就读取代码后回答
+```
+
+5. After the first reply, continue the same task with either of these:
+
+```text
+继续，给我最小修复建议
+按建议继续
 ```
 
 Expected result:
@@ -90,10 +100,12 @@ Expected result:
 - if a tool is requested, Rust executes it and calls `POST /v1/chat/tool-result`
 - the extension returns a grounded final model reply for the same session
 - Feishu receives a text response containing the bridge `session` id and model answer
+- the second turn stays on the same Feishu/extension session instead of starting a fresh ask session
 
 ## Current Limitations
 
 - The Rust bridge currently only uses the direct ask path: `问 Copilot <问题>`
+- Agent continuation currently stays in the same direct bridge path; it does not yet expose a separate multi-step planner inside the extension
 - The current tool loop is limited to a single read-only hop and only supports `read_file` and `search_text`
 - Plan execution and write-capable tool-calling loops are not wired into the extension yet
 - The extension maintains its own bridge session; it does not attach to the built-in Copilot Chat panel session

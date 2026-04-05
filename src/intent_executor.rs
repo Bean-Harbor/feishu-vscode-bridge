@@ -18,6 +18,18 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
                 reply: result.to_reply(&format!("打开目录 {path}")),
             }
         }
+        Intent::ShowCurrentProject => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 当前项目只支持直接命令调用。".to_string(),
+        },
+        Intent::ShowProjectPicker => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 项目选择卡片只支持直接命令调用。".to_string(),
+        },
+        Intent::ShowProjectBrowser { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 项目目录浏览只支持直接命令调用。".to_string(),
+        },
         Intent::InstallExtension { ext_id } => {
             let result = vscode::install_extension(ext_id);
             ExecutionOutcome {
@@ -103,6 +115,13 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
                 reply: result.to_reply("Git 状态"),
             }
         }
+        Intent::GitSync { repo } => {
+            let result = vscode::git_sync(repo.as_deref());
+            ExecutionOutcome {
+                success: result.success,
+                reply: result.to_reply("同步 Git 状态"),
+            }
+        }
         Intent::GitPull { repo } => {
             let result = vscode::git_pull(repo.as_deref());
             ExecutionOutcome {
@@ -183,6 +202,14 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
         Intent::AskAgent { .. } => ExecutionOutcome {
             success: false,
             reply: "⚠️ 问 Copilot 目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::ContinueAgent { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 继续 Agent 任务目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::ContinueAgentSuggested => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 按建议继续目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
         },
         Intent::ResetAgentSession => ExecutionOutcome {
             success: false,

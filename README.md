@@ -32,7 +32,7 @@ This repository is the current VS Code + Feishu delivery surface of a broader lo
 ## Distribution Strategy
 
 - User-facing form: one installer per platform, not a loose collection of binaries, scripts, `.env` files, and manual steps
-- Windows target form: signed `Setup.exe`
+- Windows target form: signed `FeishuVSCodeBridgeSetup.exe`
 - macOS target form: signed `.dmg` carrying a setup app, with optional later move to `.pkg` only if background-service registration needs it
 - Internal packaged components: local runtime binary, setup UI, configuration template, logs directory bootstrap, and VS Code companion extension install path
 - Installation principle: users should experience one guided install flow even if the product is internally composed of multiple components
@@ -45,17 +45,18 @@ This repository is the current VS Code + Feishu delivery surface of a broader lo
 - Collect and persist Feishu configuration
 - Validate local prerequisites and show a short recovery path on failure
 - Start or register the local runtime in a way appropriate for the platform
+- Keep the first Windows installer flow per-user so the default install path does not require administrator elevation
 
 ## Platform Packaging Plan
 
-- Windows: `Setup.exe` installs the runtime, performs first-run configuration, installs or upgrades the companion extension, and creates a Start Menu entry
+- Windows: `FeishuVSCodeBridgeSetup.exe` installs the runtime into the current user's local app data, performs first-run configuration, installs or upgrades the companion extension, and creates a Start Menu entry
 - macOS: `.dmg` installs a setup app that performs the same first-run flow, handles VS Code detection, guides extension install, and creates a predictable local runtime location
 - Platform parity requirement: the first public install experience cannot be Windows-only in product definition even if Windows is the first external beta channel
 - Release sequencing rule: if a capability is required in the day-to-day workflow on both Windows and macOS, it must be designed once and mapped to both installers before release
 
 ## Current Installer Decisions
 
-- Windows installer technology: NSIS, because it is straightforward for a single `Setup.exe`, supports silent install, shortcuts, bundled payloads, and later auto-update friendly flows
+- Windows installer technology: NSIS, because it is straightforward for a single `FeishuVSCodeBridgeSetup.exe`, supports silent install, shortcuts, bundled payloads, and later auto-update friendly flows
 - macOS installer technology: signed `.dmg` built around a setup app, because the current product still behaves like an app-guided bootstrapper rather than a system package
 - Companion extension delivery: bundle a `.vsix` when available and fall back to Marketplace/open-install guidance when direct local install is unavailable
 
@@ -64,6 +65,8 @@ Initial packaging script entry points:
 - Windows: `scripts/package-windows-installer.ps1`
 - macOS: `scripts/package-macos-installer.sh`
 
+Both packaging scripts now try to build `vscode-agent-bridge/dist/feishu-agent-bridge.vsix` before assembling the installer payload. If that artifact is unavailable, the packaged `setup-gui` flow still works, but it falls back to Marketplace installation for the companion extension.
+
 ## Quick Start
 
 ```bash
@@ -71,6 +74,17 @@ cargo test
 cargo run --bin bridge-cli -- "执行计划 打开 Cargo.toml; git status"
 cargo run --bin bridge-cli -- "执行全部 打开 Cargo.toml; git status"
 ```
+
+## Verified Dev Path
+
+When validating the current agent MVP on a developer machine, use this path first instead of ad hoc startup commands:
+
+1. In VS Code, press `F5` with the workspace launch config `Run Feishu Agent Bridge Extension`.
+2. Confirm the `Feishu Agent Bridge` output channel reports the local server on `http://127.0.0.1:8765`.
+3. Start the live listener with `./scripts/start-live-listener.sh` on POSIX or `./scripts/start-live-listener.ps1` on Windows.
+4. Send a Feishu task such as `问 Copilot 分析 parse_intent 这个函数是干什么的，如果不够就读取代码后回答`.
+
+If `http://127.0.0.1:8765/health` is down, treat the blocker as extension bootstrap or activation first. Do not keep probing listener or Feishu auth until the verified `F5` path is running.
 
 ## GUI Setup Wizard
 
@@ -92,6 +106,8 @@ What it does:
 
 - Detects whether VS Code is installed before continuing
 - Guides the user to install VS Code if it is missing
+- Installs or updates the companion extension from a bundled `.vsix` when the installer payload includes one, otherwise falls back to Marketplace
+- Opens the current repository in VS Code and waits for `http://127.0.0.1:8765/health` to confirm the local bridge is actually running
 - Collects Feishu App ID and App Secret and writes them to `.env`
 - Preserves unrelated existing `.env` entries when updating Feishu settings
 
@@ -103,9 +119,23 @@ Compatibility status:
 
 Current installer status:
 
-- Windows: setup flow exists in code, but final packaged installer output is not yet wired into a release artifact
-- macOS: setup flow exists in code, but final `.dmg` packaging, signing, and first-run ergonomics still need to be completed
-- Current gap: the repository can be run by developers today, but the end-user installation surface still needs productized packaging on both primary platforms
+- Windows: packaging script now builds Rust binaries plus a bundled companion-extension `.vsix`, then stages `FeishuVSCodeBridgeSetup.exe` when NSIS is available
+- macOS: packaging script now builds Rust binaries plus a bundled companion-extension `.vsix`, then stages a setup app and `.dmg`
+- Current gap: release signing, artifact publishing, and final first-run ergonomics still need to be completed on both primary platforms
+
+## Windows Post-Install Check
+
+After building or receiving `dist/windows/FeishuVSCodeBridgeSetup.exe`, use this shortest Windows validation path:
+
+1. Run `FeishuVSCodeBridgeSetup.exe` and let it launch `setup-gui`.
+2. In `setup-gui`, confirm the companion extension install step succeeds and the local health check reaches `http://127.0.0.1:8765/health`.
+3. Start the live listener with `./scripts/start-live-listener.ps1`.
+4. Send `问 Copilot 分析 parse_intent 这个函数是干什么的，如果不够就读取代码后回答` from Feishu.
+5. Continue with `继续，给我最小修复建议`, and if the reply exposes a next action, also send `按建议继续`.
+
+If `/health` is down after install, treat the blocker as the companion extension bootstrap path first. Do not keep probing Feishu auth until that local endpoint is healthy.
+
+For the full live regression standard, including failure recovery and card callbacks, use [docs/feishu_live_regression_checklist.md](docs/feishu_live_regression_checklist.md).
 
 ## Current Scope
 
@@ -117,9 +147,11 @@ Current installer status:
 - Interactive Feishu cards for pause / failure / approval states, with primary actions and follow-up actions grouped separately
 - Configurable approval gates for selected command types before execution, including approval handling for patch application
 - Configurable default workspace path for Git operations
+- Per-session current-project binding, so a Feishu chat can remember the selected local project path for later Git and Copilot turns
 - JSONL audit logging for Feishu inbound messages and card callbacks, including session key, sender, command, reply kind, and send outcome
 - Workspace read/search/test/change tools: `读取`, `列出`, `搜索`, `搜索符号`, `查找引用`, `查找实现`, `运行测试`, `运行指定测试`, `运行测试文件`, `写入文件`, `查看 diff`, `应用补丁`, `git log`, `git blame`
 - Early agent bootstrap commands: `问 Copilot <问题>` currently enters the first implemented agent path through the local companion extension under `vscode-agent-bridge/`, and `重置 Copilot 会话` clears the current Feishu session's extension-side bootstrap history so the next agent turn starts fresh
+- The current agent MVP also supports continuation on the same session: `继续刚才的任务`, natural follow-ups such as `继续，给我最小修复建议`, and `按建议继续` when the last agent reply exposed a suggested next action
 - Patch rollback support via reverse apply of the latest remembered patch
 - Minimal CLI demo executor
 - Native desktop setup GUI for initial configuration
@@ -142,7 +174,13 @@ For the companion-extension launch flow used by the remote agent bridge, see [vs
 
 - `执行计划 <命令1>; <命令2>`: execute exactly one step, then pause
 - `继续`: execute the next pending step, or retry the failed step
-- `继续刚才的任务`: resume the current plan, or summarize the last persisted task when no active plan remains
+- `继续刚才的任务`: resume the current plan, or continue the last agent task when no active plan remains
+- `按建议继续`: reuse the latest persisted agent `nextAction` as the next continuation prompt
+- `选择项目`: open a Feishu card with known project choices for one-tap selection
+- `浏览项目`: open a Feishu card that browses local folders from the filesystem root downward
+- `选择项目 <路径>` / `打开文件夹 <路径>`: bind the current Feishu session to a local project folder and open it in VS Code
+- `当前项目`: show the current project bound to this Feishu session
+- `同步 Git 状态`: run `git status`, `git pull`, and `git status` again against the current project
 - `刚才为什么失败`: explain the latest failure using the stored step result
 - `把上一步结果发我`: return the latest stored step result verbatim
 - `继续改刚才那个文件`: reopen context by reading the most recently touched file, including files inferred from `apply_patch` diff headers
@@ -176,6 +214,12 @@ Workspace examples:
 运行测试
 运行测试 cargo test --lib
 问 Copilot parse_intent 这个函数是干什么的
+选择项目 C:/Users/beanw/OpenSource/feishu-vscode-bridge
+浏览项目
+当前项目
+同步 Git 状态
+继续，给我最小修复建议
+按建议继续
 重置 Copilot 会话
 运行指定测试 parse_search
 运行测试文件 tests/approval_card_flow.rs
@@ -209,7 +253,11 @@ Session notes:
 - 飞书计划按 chat 隔离，不同会话不会共用同一个待执行计划
 - 飞书计划现在按 `chat_id + sender_id` 隔离，群聊里不同发送者不会共享同一份上下文
 - 会话会持久化 `current_task`、`pending_steps`、`last_result`、`last_action`
+- 会话现在还会显式记录最近任务属于 `agent`、`plan` 还是普通 `direct` 命令，这样 `继续` / `继续刚才的任务` 不再依赖字符串启发式路由
 - 会话还会持久化最近一步的原始结果、最近一次明确操作到的主文件、最近文件列表、最近一次 diff / patch 内容，以及最近一次可撤回的补丁
+- 如果直接发送 `选择项目`，bridge 会优先从 `BRIDGE_PROJECT_MAPPINGS`、最近选过的项目，以及 `BRIDGE_WORKSPACE_PATH` 生成一张项目选择卡片；`BRIDGE_PROJECT_MAPPINGS` 的格式是 `别名=路径;别名=路径`
+- 如果发送 `浏览项目`，bridge 会从磁盘根目录开始逐级列出本机文件夹，支持返回上一级、直接选择当前目录，并保留最近使用项目作为快捷入口
+- agent 会话还会持久化最近一次结构化状态，包括 `session_id`、`current_action`、`next_action`、最近工具动作和工具结果摘要，所以 `按建议继续` 可以复用上一轮 agent 的建议动作
 - companion extension 侧当前会复用同一个飞书 session key，并保留最近追问、最近回答摘要、最近工作区文件；这仍是 agent 的基础层，不是最终的完整 agent loop，当前默认 30 分钟无活动后自然过期
 - 可直接发送 `重置 Copilot 会话` 主动清空当前飞书会话对应的 extension bootstrap 历史，避免连续追问串入旧上下文
 - 飞书监听还会默认追加写入 `.feishu-vscode-bridge-audit.jsonl`，用于审计消息、卡片回调和回复结果；可通过 `BRIDGE_AUDIT_LOG_PATH` 覆盖路径

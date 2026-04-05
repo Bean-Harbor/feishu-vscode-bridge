@@ -6,10 +6,13 @@ use crate::bridge_context::BridgeContext;
 use crate::intent_executor::execute_runnable_intent;
 use crate::plan_dispatch;
 use crate::plan::ExecutionOutcome;
+use crate::reply;
+use crate::semantic_planner::{self, SemanticDispatch};
 use crate::session;
-use crate::{ApprovalPolicy, ExecutionMode, Intent, help_text, parse_intent};
+use crate::{ApprovalPolicy, ExecutionMode, Intent, help_text, parse_explicit_intent};
 
 pub type IntentExecutor = fn(&Intent) -> ExecutionOutcome;
+pub type SemanticPlanner = for<'a> fn(&BridgeContext<'a>, &str, &str) -> SemanticDispatch;
 
 #[derive(Debug, Clone)]
 pub enum BridgeResponse {
@@ -24,6 +27,7 @@ pub struct BridgeApp {
     session_store_path: Option<PathBuf>,
     approval_policy: ApprovalPolicy,
     executor: IntentExecutor,
+    semantic_planner: SemanticPlanner,
 }
 
 impl Default for BridgeApp {
@@ -32,6 +36,7 @@ impl Default for BridgeApp {
             session_store_path: session::default_session_store_path(),
             approval_policy: ApprovalPolicy::from_env(),
             executor: execute_runnable_intent,
+            semantic_planner: semantic_planner::plan_freeform_intent,
         }
     }
 }
@@ -42,6 +47,7 @@ impl BridgeApp {
             session_store_path,
             approval_policy,
             executor: execute_runnable_intent,
+            semantic_planner: semantic_planner::plan_freeform_intent,
         }
     }
 
@@ -54,13 +60,37 @@ impl BridgeApp {
             session_store_path,
             approval_policy,
             executor,
+            semantic_planner: semantic_planner::plan_freeform_intent,
+        }
+    }
+
+    pub fn with_executor_and_planner(
+        session_store_path: Option<PathBuf>,
+        approval_policy: ApprovalPolicy,
+        executor: IntentExecutor,
+        semantic_planner: SemanticPlanner,
+    ) -> Self {
+        Self {
+            session_store_path,
+            approval_policy,
+            executor,
+            semantic_planner,
         }
     }
 
     pub fn dispatch(&self, text: &str, session_key: &str) -> BridgeResponse {
-        let intent = parse_intent(text);
         let trimmed_text = text.trim();
         let context = self.context();
+        let intent = parse_explicit_intent(trimmed_text);
+
+        if matches!(intent, Intent::Unknown(_)) {
+            return match (self.semantic_planner)(&context, session_key, trimmed_text) {
+                SemanticDispatch::Planned(planned) => {
+                    self.dispatch_intent(&context, session_key, trimmed_text, planned)
+                }
+                SemanticDispatch::Reply(reply) => BridgeResponse::Text(reply),
+            };
+        }
 
         self.dispatch_intent(&context, session_key, trimmed_text, intent)
     }
@@ -84,7 +114,13 @@ impl BridgeApp {
             | Intent::RetryFailedStep
             | Intent::ExecuteAll
             | Intent::ApprovePending
-            | Intent::RejectPending => dispatch_plan_action(context, session_key, intent),
+            | Intent::RejectPending => dispatch_plan_action(context, session_key, task_text, intent),
+            Intent::ContinueAgent { prompt } => {
+                follow_up::continue_agent_task(context, session_key, task_text, prompt.as_deref())
+            }
+            Intent::ContinueAgentSuggested => {
+                follow_up::continue_agent_suggested_action(context, session_key, task_text)
+            }
             Intent::ExplainLastFailure
             | Intent::ShowLastResult
             | Intent::ContinueLastFile
@@ -135,10 +171,23 @@ impl BridgeApp {
 fn dispatch_plan_action(
     context: &BridgeContext<'_>,
     session_key: &str,
+    task_text: &str,
     intent: Intent,
 ) -> BridgeResponse {
     match intent {
-        Intent::ContinuePlan => plan_dispatch::resume_plan(context, session_key, false, "继续"),
+        Intent::ContinuePlan => {
+            let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+                return BridgeResponse::Text("⚠️ 当前没有待继续的计划。\n\n发送「执行计划 <命令1>; <命令2>」创建逐步计划，或先发送「问 Copilot <问题>」建立 agent 任务。".to_string());
+            };
+
+            if stored.plan.is_some() {
+                plan_dispatch::resume_plan(context, session_key, false, "继续")
+            } else if session::is_agent_task_session(&stored) {
+                follow_up::continue_agent_task(context, session_key, task_text, None)
+            } else {
+                BridgeResponse::Text(reply::format_stored_session_summary(&stored))
+            }
+        }
         Intent::RetryFailedStep => {
             plan_dispatch::resume_plan(context, session_key, false, "重新执行失败步骤")
         }
@@ -184,8 +233,25 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use crate::session::{self, StoredDiff, StoredResult, StoredSession, StoredStep};
+    use crate::semantic_planner::SemanticDispatch;
+    use crate::session::{self, StoredDiff, StoredResult, StoredSession, StoredSessionKind, StoredStep};
     use crate::test_support::unique_temp_path;
+
+    fn planner_returns_git_sync(
+        _context: &BridgeContext<'_>,
+        _session_key: &str,
+        _task_text: &str,
+    ) -> SemanticDispatch {
+        SemanticDispatch::Planned(Intent::GitSync { repo: None })
+    }
+
+    fn planner_should_not_run(
+        _context: &BridgeContext<'_>,
+        _session_key: &str,
+        _task_text: &str,
+    ) -> SemanticDispatch {
+        panic!("semantic planner should not run for explicit commands")
+    }
 
     #[test]
     fn continue_plan_without_pending_plan_returns_continuity_summary() {
@@ -193,6 +259,9 @@ mod tests {
         let app = BridgeApp::new(Some(session_path.clone()), ApprovalPolicy::default());
         let session_key = "cli";
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Plan,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("应用补丁后继续检查 bridge 回复".to_string()),
             pending_steps: vec!["运行测试命令 cargo test".to_string(), "查看当前工作区 diff".to_string()],
@@ -245,6 +314,46 @@ mod tests {
                 assert!(text.contains("当前没有待继续的计划"));
             }
             BridgeResponse::Card { .. } => panic!("expected warning text"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn freeform_text_routes_through_semantic_planner() {
+        let session_path = unique_temp_path("bridge", "semantic-planner");
+        let app = BridgeApp::with_executor_and_planner(
+            Some(session_path.clone()),
+            ApprovalPolicy::from_spec("none"),
+            execute_runnable_intent,
+            planner_returns_git_sync,
+        );
+
+        match app.dispatch("把当前项目同步到 github", "cli") {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("同步 Git 状态"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text reply"),
+        }
+
+        let _ = fs::remove_file(session_path);
+    }
+
+    #[test]
+    fn explicit_commands_bypass_semantic_planner() {
+        let session_path = unique_temp_path("bridge", "explicit-fast-path");
+        let app = BridgeApp::with_executor_and_planner(
+            Some(session_path.clone()),
+            ApprovalPolicy::from_spec("none"),
+            execute_runnable_intent,
+            planner_should_not_run,
+        );
+
+        match app.dispatch("帮助", "cli") {
+            BridgeResponse::Text(text) => {
+                assert!(text.contains("执行计划"));
+            }
+            BridgeResponse::Card { .. } => panic!("expected text help reply"),
         }
 
         let _ = fs::remove_file(session_path);

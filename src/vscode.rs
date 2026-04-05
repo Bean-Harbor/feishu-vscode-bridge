@@ -19,6 +19,7 @@ pub const AGENT_BRIDGE_URL_ENV: &str = "BRIDGE_AGENT_BRIDGE_URL";
 pub const AGENT_BRIDGE_PORT_ENV: &str = "BRIDGE_AGENT_BRIDGE_PORT";
 const DEFAULT_AGENT_BRIDGE_PORT: u16 = 8765;
 const AGENT_TOOL_RESULT_PATH: &str = "/v1/chat/tool-result";
+const AGENT_PLAN_PATH: &str = "/v1/chat/plan";
 const MAX_AGENT_TOOL_SUMMARY_CHARS: usize = 240;
 
 #[derive(Deserialize)]
@@ -67,6 +68,22 @@ struct AgentAskResponse {
     task_state: Option<AgentTaskStateResponse>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticPlanAction {
+    pub name: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+#[derive(Deserialize)]
+struct SemanticPlanResponse {
+    status: Option<String>,
+    message: Option<String>,
+    summary: Option<String>,
+    #[serde(default)]
+    actions: Vec<SemanticPlanAction>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AgentToolResultPayload {
     success: bool,
@@ -108,6 +125,16 @@ pub struct AgentAskResult {
     pub tool_call: Option<String>,
     pub tool_result_summary: Option<String>,
     pub duration_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticPlanResult {
+    pub success: bool,
+    pub status: String,
+    pub message: String,
+    pub summary: Option<String>,
+    pub actions: Vec<SemanticPlanAction>,
     pub error: Option<String>,
 }
 
@@ -575,6 +602,74 @@ pub fn reset_agent_session(session_id: &str) -> CmdResult {
     into_cmd_result(result, start.elapsed().as_millis() as u64)
 }
 
+pub fn plan_semantic_intent(
+    session_id: &str,
+    prompt: &str,
+    current_project: Option<&str>,
+) -> SemanticPlanResult {
+    let trimmed_session_id = session_id.trim();
+    let trimmed_prompt = prompt.trim();
+
+    if trimmed_session_id.is_empty() {
+        return SemanticPlanResult {
+            success: false,
+            status: "blocked".to_string(),
+            message: "sessionId 不能为空。".to_string(),
+            summary: Some("sessionId 不能为空。".to_string()),
+            actions: Vec::new(),
+            error: Some("sessionId 不能为空。".to_string()),
+        };
+    }
+
+    if trimmed_prompt.is_empty() {
+        return SemanticPlanResult {
+            success: false,
+            status: "blocked".to_string(),
+            message: "自然语言请求不能为空。".to_string(),
+            summary: Some("自然语言请求不能为空。".to_string()),
+            actions: Vec::new(),
+            error: Some("自然语言请求不能为空。".to_string()),
+        };
+    }
+
+    let result = (|| -> Result<SemanticPlanResult, String> {
+        let endpoint = format!("{}{}", agent_bridge_base_url()?, AGENT_PLAN_PATH);
+        let response = ureq::post(&endpoint)
+            .set("Content-Type", "application/json")
+            .send_json(ureq::json!({
+                "sessionId": trimmed_session_id,
+                "prompt": trimmed_prompt,
+                "currentProject": current_project,
+            }))
+            .map_err(|err| format_agent_bridge_error(err, &endpoint))?;
+
+        let payload: SemanticPlanResponse = response
+            .into_json()
+            .map_err(|err| format!("解析 semantic planner 响应失败: {err}"))?;
+
+        Ok(SemanticPlanResult {
+            success: true,
+            status: payload.status.unwrap_or_else(|| "unsupported".to_string()),
+            message: payload.message.unwrap_or_default(),
+            summary: payload.summary.filter(|value| !value.trim().is_empty()),
+            actions: payload.actions,
+            error: None,
+        })
+    })();
+
+    match result {
+        Ok(planned) => planned,
+        Err(err) => SemanticPlanResult {
+            success: false,
+            status: "blocked".to_string(),
+            message: err.clone(),
+            summary: Some(err.clone()),
+            actions: Vec::new(),
+            error: Some(err),
+        },
+    }
+}
+
 /// 读取工作区文件内容
 pub fn read_file(path: &str, start_line: Option<usize>, end_line: Option<usize>) -> CmdResult {
     let start = Instant::now();
@@ -923,6 +1018,23 @@ pub fn git_status(repo_path: Option<&str>) -> CmdResult {
         Some(p) => run_cmd("git", &["-C", p, "status", "--short"], 10),
         None => run_cmd("git", &["status", "--short"], 10),
     }
+}
+
+/// Git status + pull + status
+pub fn git_sync(repo_path: Option<&str>) -> CmdResult {
+    let before = git_status(repo_path);
+    if !before.success {
+        return with_step_label("git status (before sync)", before);
+    }
+
+    let pull = git_pull(repo_path);
+    let after = git_status(repo_path);
+
+    combine_results(&[
+        ("git status (before sync)", before),
+        ("git pull", pull),
+        ("git status (after sync)", after),
+    ])
 }
 
 /// Git pull

@@ -53,6 +53,14 @@ pub fn agent_result_summary(result: &vscode::AgentAskResult) -> String {
 }
 
 pub fn format_agent_reply(task_text: &str, result: &vscode::AgentAskResult) -> String {
+    format_agent_reply_with_action(task_text, "问 Copilot", result)
+}
+
+pub fn format_agent_reply_with_action(
+    task_text: &str,
+    action_label: &str,
+    result: &vscode::AgentAskResult,
+) -> String {
     let mut blocks = vec!["🧭 Agent 任务更新".to_string()];
 
     if let Some(session_id) = result.session_id.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -61,7 +69,7 @@ pub fn format_agent_reply(task_text: &str, result: &vscode::AgentAskResult) -> S
 
     blocks.push(format!("🎯 当前任务: {}", task_text.trim().trim_end_matches('\n')));
     blocks.push(format!("📌 最近状态: {}", format_agent_status(&result.status)));
-    blocks.push(format!("🧾 上次动作: 问 Copilot  ({}ms)", result.duration_ms));
+    blocks.push(format!("🧾 上次动作: {}  ({}ms)", action_label, result.duration_ms));
 
     if let Some(action) = result.current_action.as_deref().filter(|value| !value.trim().is_empty()) {
         blocks.push(format!("⚙️ 当前动作: {}", action.trim()));
@@ -90,6 +98,7 @@ pub fn format_agent_reply(task_text: &str, result: &vscode::AgentAskResult) -> S
 
     if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
         blocks.push(format!("➡️ 下一步建议: {}", next_action.trim()));
+        blocks.push("🤝 采纳这一步可直接发送：按建议继续".to_string());
     }
 
     if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -325,10 +334,25 @@ pub fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::ContinueAgent { prompt } => match prompt {
+            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent 任务：{}", prompt.trim()),
+            _ => "继续 Agent 任务".to_string(),
+        },
+        Intent::ContinueAgentSuggested => "按建议继续 Agent 任务".to_string(),
         Intent::ResetAgentSession => "重置 Copilot 会话".to_string(),
+        Intent::ShowProjectPicker => "打开项目选择卡片".to_string(),
+        Intent::ShowProjectBrowser { path } => match path {
+            Some(path) => format!("浏览项目目录 {path}"),
+            None => "浏览项目目录".to_string(),
+        },
+        Intent::ShowCurrentProject => "查看当前项目".to_string(),
         Intent::GitStatus { repo } => match repo {
             Some(repo) => format!("查看仓库状态 {repo}"),
             None => "查看当前仓库状态".to_string(),
+        },
+        Intent::GitSync { repo } => match repo {
+            Some(repo) => format!("同步 Git 状态 {repo}"),
+            None => "同步当前项目的 Git 状态".to_string(),
         },
         Intent::GitPull { repo } => match repo {
             Some(repo) => format!("拉取仓库 {repo}"),

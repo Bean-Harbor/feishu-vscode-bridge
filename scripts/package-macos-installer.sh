@@ -8,11 +8,21 @@ APP_STAGING_ROOT="${OUTPUT_ROOT}/FeishuBridgeSetup.app"
 CONTENTS_DIR="${APP_STAGING_ROOT}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+SKIP_EXTENSION_PACKAGE="${SKIP_EXTENSION_PACKAGE:-0}"
 
 echo "[macos-installer] repo root: ${REPO_ROOT}"
 echo "[macos-installer] output dir: ${OUTPUT_ROOT}"
 
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+
+if [[ "${SKIP_EXTENSION_PACKAGE}" != "1" ]]; then
+  echo "[macos-installer] packaging companion extension"
+  pushd "${REPO_ROOT}/vscode-agent-bridge" >/dev/null
+  npm install
+  npm run compile
+  npm run package:vsix
+  popd >/dev/null
+fi
 
 echo "[macos-installer] building Rust binaries"
 if [[ "${CONFIGURATION}" == "release" ]]; then
@@ -53,8 +63,8 @@ PLIST
 
 VSIX_SOURCE=""
 for candidate in \
-  "${REPO_ROOT}/vscode-agent-bridge/feishu-agent-bridge.vsix" \
-  "${REPO_ROOT}/vscode-agent-bridge/dist/feishu-agent-bridge.vsix"
+  "${REPO_ROOT}/vscode-agent-bridge/dist/feishu-agent-bridge.vsix" \
+  "${REPO_ROOT}/vscode-agent-bridge/feishu-agent-bridge.vsix"
 do
   if [[ -f "$candidate" ]]; then
     VSIX_SOURCE="$candidate"
@@ -64,6 +74,8 @@ done
 
 if [[ -n "${VSIX_SOURCE}" ]]; then
   cp "${VSIX_SOURCE}" "${RESOURCES_DIR}/feishu-agent-bridge.vsix"
+else
+  echo "[macos-installer] warning: companion extension VSIX not found; setup-gui will fall back to Marketplace install"
 fi
 
 DMG_PATH="${OUTPUT_ROOT}/FeishuBridgeSetup.dmg"

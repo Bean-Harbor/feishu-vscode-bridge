@@ -10,6 +10,12 @@ type ResetRequest = {
     sessionId: string;
 };
 
+type SemanticPlanRequest = {
+    sessionId: string;
+    prompt: string;
+    currentProject?: string | null;
+};
+
 type AgentToolName = 'read_file' | 'search_text';
 
 type AgentToolCall = {
@@ -74,6 +80,47 @@ type AskResponse = {
     context: string;
 };
 
+type SemanticActionName =
+    | 'ask_agent'
+    | 'continue_agent'
+    | 'continue_plan'
+    | 'continue_agent_suggested'
+    | 'show_project_picker'
+    | 'show_project_browser'
+    | 'show_current_project'
+    | 'open_folder'
+    | 'open_file'
+    | 'read_file'
+    | 'list_directory'
+    | 'search_text'
+    | 'search_symbol'
+    | 'find_references'
+    | 'find_implementations'
+    | 'run_tests'
+    | 'run_specific_test'
+    | 'run_test_file'
+    | 'git_diff'
+    | 'git_status'
+    | 'git_sync'
+    | 'git_pull'
+    | 'git_push_all'
+    | 'git_log'
+    | 'git_blame'
+    | 'reset_agent_session'
+    | 'help';
+
+type SemanticPlannedAction = {
+    name: SemanticActionName;
+    args: Record<string, unknown>;
+};
+
+type SemanticPlanResponse = {
+    status: 'planned' | 'clarify' | 'unsupported';
+    message: string;
+    summary: string;
+    actions: SemanticPlannedAction[];
+};
+
 type BridgeContext = {
     server?: http.Server;
     output: vscode.OutputChannel;
@@ -84,6 +131,7 @@ const HEALTH_PATH = '/health';
 const ASK_PATH = '/v1/chat/ask';
 const RESET_PATH = '/v1/chat/reset';
 const TOOL_RESULT_PATH = '/v1/chat/tool-result';
+const PLAN_PATH = '/v1/chat/plan';
 const MAX_SUMMARY_LENGTH = 200;
 const MAX_WORKSPACE_SNIPPETS = 3;
 const MAX_FILE_BYTES = 512 * 1024;
@@ -93,6 +141,8 @@ const MAX_RECENT_USER_PROMPTS = 3;
 const MAX_RECENT_WORKSPACE_FILES = 3;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_RESULT_CHARS = 12_000;
+const DEFAULT_READ_FILE_LINE_SPAN = 120;
+const MAX_READ_FILE_LINE_SPAN = 200;
 const WORKSPACE_FILE_GLOB = '**/*.{rs,ts,tsx,js,jsx,py,toml}';
 const WORKSPACE_EXCLUDE_GLOB = '**/{.git,node_modules,target,out,dist,build,.next,coverage}/**';
 const BOOTSTRAP_WORKSPACE_ENV = 'BRIDGE_AGENT_BOOTSTRAP_WORKSPACE';
@@ -245,6 +295,13 @@ async function startBridgeServer(bridge: BridgeContext): Promise<void> {
                 return;
             }
 
+            if (req.method === 'POST' && req.url === PLAN_PATH) {
+                const payload = await readJsonBody<SemanticPlanRequest>(req);
+                const result = await handleSemanticPlan(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
             if (req.method === 'POST' && req.url === TOOL_RESULT_PATH) {
                 const payload = await readJsonBody<ToolResultRequest>(req);
                 const result = await handleToolResult(bridge, payload);
@@ -382,7 +439,14 @@ async function handleToolResult(bridge: BridgeContext, payload: ToolResultReques
         throw new Error(`No pending tool request for session: ${sessionId}`);
     }
 
-    const toolRequest = sanitizeToolRequest(payload.toolRequest) ?? pending.toolRequest;
+    const incomingToolRequest = sanitizeToolRequest(payload.toolRequest);
+    if (incomingToolRequest && !areEquivalentToolRequests(incomingToolRequest, pending.toolRequest)) {
+        throw new Error(
+            `toolRequest mismatch for session ${sessionId}: expected ${formatToolRequest(pending.toolRequest)}, received ${formatToolRequest(incomingToolRequest)}`,
+        );
+    }
+
+    const toolRequest = incomingToolRequest ?? pending.toolRequest;
     const toolResult = normalizeToolResultPayload(payload.toolResult);
     const relatedFiles = dedupeStrings([
         ...toolResult.relatedFiles,
@@ -471,6 +535,54 @@ function handleReset(bridge: BridgeContext, payload: ResetRequest): Record<strin
     };
 }
 
+async function handleSemanticPlan(
+    bridge: BridgeContext,
+    payload: SemanticPlanRequest,
+): Promise<SemanticPlanResponse> {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    const prompt = payload.prompt?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+    if (!prompt) {
+        throw new Error('prompt is required');
+    }
+
+    const session = bridge.sessions.get(sessionId) ?? createSession();
+    const contextSummary = collectEditorContext();
+    const workspaceContext = await collectWorkspaceContext(prompt);
+    const sessionSummary = buildSessionSummary(session);
+    const projectSummary = payload.currentProject?.trim()
+        ? `Current project: ${payload.currentProject.trim()}`
+        : 'Current project: none selected';
+    const promptContext = [sessionSummary, contextSummary, projectSummary, workspaceContext.summary]
+        .filter((value) => value && value.trim().length > 0)
+        .join('\n\n');
+
+    rememberRecentPrompt(session, prompt);
+    rememberRecentWorkspaceFiles(session, workspaceContext.files);
+    session.currentTask = prompt;
+    session.updatedAt = Date.now();
+    trimSessionMessages(session);
+    bridge.sessions.set(sessionId, session);
+
+    const model = await selectChatModel();
+    const decision = await decideSemanticPlan(model, prompt, promptContext, workspaceContext.files, payload.currentProject ?? null);
+
+    if (decision) {
+        return decision;
+    }
+
+    return {
+        status: 'unsupported',
+        message: '当前还不能稳定判断这句话对应的 VS Code 动作，请补充目标项目、文件或预期结果。',
+        summary: 'semantic planner could not classify the request',
+        actions: [],
+    };
+}
+
 function collectEditorContext(): string {
     const parts: string[] = [];
     const folders = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ?? [];
@@ -549,6 +661,138 @@ type AgentPlannerDecision = {
     toolRequest: AgentToolCall | null;
 };
 
+async function decideSemanticPlan(
+    model: vscode.LanguageModelChat,
+    prompt: string,
+    promptContext: string,
+    relatedFiles: string[],
+    currentProject: string | null,
+): Promise<SemanticPlanResponse | null> {
+    const plannerPrompt = [
+        'You are the semantic planning layer for a Feishu -> VS Code local agent bridge.',
+        'Your job is to convert arbitrary natural language into executable VS Code actions.',
+        'Return JSON only with this shape: {"status":"planned"|"clarify"|"unsupported","message":"...","summary":"...","actions":[{"name":"...","args":{...}}]}.',
+        'Use status=planned only when you can map the request to one or more concrete actions from the supported action set.',
+        'Use status=clarify when the request is actionable but missing a required target such as a path, file, repo, or intended operation.',
+        'Use status=unsupported when the request should not execute directly and should instead be handled later by a richer agent path.',
+        'Prefer deterministic project/git/navigation actions when the user is clearly asking for project selection, browsing, current project, git status, git sync, git pull, or git push.',
+        'For general coding work like analyzing code, fixing bugs, continuing unfinished work, checking README/docs, or implementing changes, prefer a single ask_agent action with the original prompt.',
+        'Do not emit shell, apply_patch, write_file, install_extension, or uninstall_extension actions in this planner.',
+        'If the request combines multiple clear operations, you may return multiple actions in sequence.',
+        'Supported actions and args:',
+        '- ask_agent {"prompt":"string"}',
+        '- continue_agent {"prompt":"optional string"}',
+        '- continue_plan {}',
+        '- continue_agent_suggested {}',
+        '- show_project_picker {}',
+        '- show_project_browser {"path":"optional string"}',
+        '- show_current_project {}',
+        '- open_folder {"path":"string"}',
+        '- open_file {"path":"string","line":number optional}',
+        '- read_file {"path":"string","startLine":number optional,"endLine":number optional}',
+        '- list_directory {"path":"optional string"}',
+        '- search_text {"query":"string","path":"optional string","isRegex":boolean optional}',
+        '- search_symbol {"query":"string","path":"optional string"}',
+        '- find_references {"query":"string","path":"optional string"}',
+        '- find_implementations {"query":"string","path":"optional string"}',
+        '- run_tests {"command":"optional string"}',
+        '- run_specific_test {"filter":"string"}',
+        '- run_test_file {"path":"string"}',
+        '- git_diff {"path":"optional string"}',
+        '- git_status {"repo":"optional string"}',
+        '- git_sync {"repo":"optional string"}',
+        '- git_pull {"repo":"optional string"}',
+        '- git_push_all {"repo":"optional string","message":"optional string"}',
+        '- git_log {"count":number optional,"path":"optional string"}',
+        '- git_blame {"path":"string"}',
+        '- reset_agent_session {}',
+        '- help {}',
+        currentProject ? `Current project: ${currentProject}` : 'Current project: none selected',
+        relatedFiles.length > 0 ? `Known related files: ${relatedFiles.join(', ')}` : 'Known related files: none yet.',
+        'Current context:',
+        promptContext || '(no extra context)',
+        'User request:',
+        prompt,
+    ].join('\n\n');
+
+    try {
+        const raw = await sendModelRequest(model, [vscode.LanguageModelChatMessage.User(plannerPrompt)]);
+        return parseSemanticPlanDecision(raw, prompt);
+    } catch {
+        return null;
+    }
+}
+
+function parseSemanticPlanDecision(raw: string, originalPrompt: string): SemanticPlanResponse | null {
+    const normalized = raw
+        .trim()
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+    const start = normalized.indexOf('{');
+    const end = normalized.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>;
+        const rawStatus = parsed.status === 'planned' || parsed.status === 'clarify' ? parsed.status : 'unsupported';
+        const actions = Array.isArray(parsed.actions)
+            ? parsed.actions
+                .map(sanitizeSemanticAction)
+                .filter((value): value is SemanticPlannedAction => value !== null)
+            : [];
+        const message = typeof parsed.message === 'string' && parsed.message.trim()
+            ? parsed.message.trim()
+            : defaultSemanticPlannerMessage(rawStatus, originalPrompt);
+        const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
+            ? parsed.summary.trim()
+            : summarize(message);
+        const status = rawStatus === 'planned' && actions.length === 0 ? 'unsupported' : rawStatus;
+
+        return {
+            status,
+            message,
+            summary,
+            actions: status === 'planned' ? actions : [],
+        };
+    } catch {
+        return null;
+    }
+}
+
+function sanitizeSemanticAction(value: unknown): SemanticPlannedAction | null {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+
+    const candidate = value as Record<string, unknown>;
+    const name = typeof candidate.name === 'string' ? candidate.name.trim() as SemanticActionName : '';
+    if (!name) {
+        return null;
+    }
+
+    const args = candidate.args && typeof candidate.args === 'object' && !Array.isArray(candidate.args)
+        ? candidate.args as Record<string, unknown>
+        : {};
+
+    return { name, args };
+}
+
+function defaultSemanticPlannerMessage(status: 'planned' | 'clarify' | 'unsupported', originalPrompt: string): string {
+    if (status === 'planned') {
+        return `已将这句自然语言映射为可执行动作: ${originalPrompt}`;
+    }
+
+    if (status === 'clarify') {
+        return '还需要更具体的目标，例如项目路径、文件路径、仓库或预期结果。';
+    }
+
+    return '当前还不能稳定把这句自然语言映射为现有动作。';
+}
+
 async function decideAgentAction(
     model: vscode.LanguageModelChat,
     prompt: string,
@@ -560,6 +804,8 @@ async function decideAgentAction(
         'Return JSON only with this shape: {"status":"answered"|"needs_tool","message":"...","summary":"...","currentAction":"...","nextAction":"...","relatedFiles":["..."],"toolRequest":null|{"name":"read_file"|"search_text","args":{...},"summary":"..."}}.',
         'Only choose needs_tool when the answer depends on repository code that is still missing from the current context.',
         'Prefer search_text before read_file unless you already know the exact file to inspect.',
+        'When using read_file with line numbers, always provide both startLine and endLine.',
+        'Keep read_file ranges focused and no longer than 200 lines.',
         'Use read_file args: {"path":"relative/or/absolute","startLine":number,"endLine":number}.',
         'Use search_text args: {"query":"text","path":"optional/path","isRegex":false}.',
         relatedFiles.length > 0 ? `Known related files: ${relatedFiles.join(', ')}` : 'Known related files: none yet.',
@@ -645,14 +891,11 @@ function sanitizeToolRequest(value: unknown): AgentToolCall | null {
             return null;
         }
 
-        const startLine = asPositiveInteger(args.startLine);
-        const endLine = asPositiveInteger(args.endLine);
         const sanitizedArgs: Record<string, unknown> = { path };
-        if (startLine !== undefined) {
-            sanitizedArgs.startLine = startLine;
-        }
-        if (endLine !== undefined) {
-            sanitizedArgs.endLine = endLine;
+        const lineRange = normalizeReadFileRange(args);
+        if (lineRange) {
+            sanitizedArgs.startLine = lineRange.startLine;
+            sanitizedArgs.endLine = lineRange.endLine;
         }
 
         return {
@@ -700,6 +943,32 @@ function normalizeToolResultPayload(payload: ToolResultPayload): ToolResultPaylo
             ? payload.relatedFiles.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
             : [],
     };
+}
+
+function normalizeReadFileRange(args: Record<string, unknown>): { startLine: number; endLine: number } | null {
+    const rawStartLine = asPositiveInteger(args.startLine);
+    const rawEndLine = asPositiveInteger(args.endLine);
+
+    if (rawStartLine === undefined && rawEndLine === undefined) {
+        return null;
+    }
+
+    let startLine = rawStartLine ?? Math.max(1, (rawEndLine ?? 1) - DEFAULT_READ_FILE_LINE_SPAN + 1);
+    let endLine = rawEndLine ?? (startLine + DEFAULT_READ_FILE_LINE_SPAN - 1);
+
+    if (endLine < startLine) {
+        [startLine, endLine] = [endLine, startLine];
+    }
+
+    if (endLine - startLine + 1 > MAX_READ_FILE_LINE_SPAN) {
+        endLine = startLine + MAX_READ_FILE_LINE_SPAN - 1;
+    }
+
+    return { startLine, endLine };
+}
+
+function areEquivalentToolRequests(left: AgentToolCall, right: AgentToolCall): boolean {
+    return left.name === right.name && formatToolRequest(left) === formatToolRequest(right);
 }
 
 function buildToolRequestTaskState(

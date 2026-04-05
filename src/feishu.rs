@@ -140,6 +140,22 @@ struct MsgResp {
     msg: String,
 }
 
+fn format_http_error(prefix: &str, error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|read_error| format!("<failed to read response body: {read_error}>"));
+            format!("{prefix}: status code {status}, body: {body}")
+        }
+        other => format!("{prefix}: {other}"),
+    }
+}
+
+fn encode_interactive_card_content(card: &Value) -> Result<String, String> {
+    serde_json::to_string(card).map_err(|e| format!("序列化卡片失败: {e}"))
+}
+
 // ──────────────────────────── implementation ────────────────────────────
 
 impl FeishuClient {
@@ -199,7 +215,7 @@ impl FeishuClient {
         let resp: MsgResp = ureq::post(&url)
             .set("Authorization", &format!("Bearer {token}"))
             .send_json(&body)
-            .map_err(|e| format!("发送消息失败: {e}"))?
+            .map_err(|e| format_http_error("发送消息失败", e))?
             .into_json()
             .map_err(|e| format!("解析发送响应失败: {e}"))?;
 
@@ -216,8 +232,7 @@ impl FeishuClient {
         card: &Value,
     ) -> Result<(), String> {
         let token = self.token()?;
-        let content = serde_json::to_string(card)
-            .map_err(|e| format!("序列化卡片失败: {e}"))?;
+        let content = encode_interactive_card_content(card)?;
         let body = MsgBody {
             receive_id,
             msg_type: "interactive",
@@ -227,7 +242,7 @@ impl FeishuClient {
         let resp: MsgResp = ureq::post(&url)
             .set("Authorization", &format!("Bearer {token}"))
             .send_json(&body)
-            .map_err(|e| format!("发送卡片失败: {e}"))?
+            .map_err(|e| format_http_error("发送卡片失败", e))?
             .into_json()
             .map_err(|e| format!("解析卡片响应失败: {e}"))?;
 
@@ -707,6 +722,47 @@ fn strip_leading_list_marker(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn interactive_card_content_serializes_raw_card_json() {
+        let content = encode_interactive_card_content(&json!({
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": "选择项目"
+                }
+            }
+        }))
+        .expect("card content should serialize");
+
+        let parsed: Value = serde_json::from_str(&content).expect("content should be valid json");
+        assert_eq!(
+            parsed,
+            json!({
+                "header": {
+                    "title": {
+                        "tag": "plain_text",
+                        "content": "选择项目"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn format_http_error_includes_status_and_body() {
+        let error = ureq::Error::Status(
+            400,
+            ureq::Response::new(400, "Bad Request", r#"{"code":123,"msg":"invalid card"}"#)
+                .expect("response should build"),
+        );
+
+        let formatted = format_http_error("发送卡片失败", error);
+
+        assert!(formatted.contains("发送卡片失败: status code 400"));
+        assert!(formatted.contains("invalid card"));
+    }
 
     #[test]
     fn parse_message_event_payload() {

@@ -6,6 +6,319 @@ use crate::reply;
 use crate::session::StoredSession;
 use crate::ApprovalPolicy;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectChoice {
+    pub label: String,
+    pub path: String,
+    pub note: Option<String>,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryChoice {
+    pub label: String,
+    pub path: String,
+    pub note: Option<String>,
+}
+
+pub fn format_project_picker_reply(choices: &[ProjectChoice]) -> BridgeResponse {
+    let current_project = choices
+        .iter()
+        .find(|choice| choice.is_current)
+        .map(|choice| choice.path.as_str());
+
+    let fallback_lines = choices
+        .iter()
+        .map(|choice| {
+            let suffix = if choice.is_current { " (当前项目)" } else { "" };
+            format!("- {}{}: {}", choice.label, suffix, choice.path)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut elements = vec![json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": "**使用方式**\n点击下面的项目按钮即可切换当前飞书会话绑定的项目。"
+        }
+    })];
+
+    if let Some(current_project) = current_project {
+        elements.push(json!({
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": format!("当前项目: {current_project}")
+                }
+            ]
+        }));
+    }
+
+    if choices.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**最近项目 / 预设项目**\n当前还没有最近项目或预设项目，可以直接浏览本机文件夹。"
+            }
+        }));
+    } else {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**最近项目 / 预设项目**\n点击下面的按钮即可切换项目。"
+            }
+        }));
+
+        for chunk in choices.chunks(4) {
+            let actions = chunk
+                .iter()
+                .map(|choice| {
+                    let button_label = if choice.is_current {
+                        format!("{} · 当前", choice.label)
+                    } else {
+                        choice.label.clone()
+                    };
+                    let mut action = json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": button_label
+                        },
+                        "value": {
+                            "command": format!("选择项目 {}", choice.path)
+                        }
+                    });
+
+                    if choice.is_current {
+                        action["type"] = json!("primary");
+                    }
+
+                    action
+                })
+                .collect::<Vec<_>>();
+
+            elements.push(json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+    }
+
+    elements.push(json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": "**浏览本机文件夹**\n如果最近项目里没有你要的目录，可以从磁盘根目录开始逐级选择。"
+        }
+    }));
+    elements.push(json!({
+        "tag": "action",
+        "actions": [
+            {
+                "tag": "button",
+                "type": "primary",
+                "text": {
+                    "tag": "plain_text",
+                    "content": "浏览文件夹"
+                },
+                "value": {
+                    "command": "浏览项目"
+                }
+            }
+        ]
+    }));
+
+    BridgeResponse::Card {
+        fallback_text: format!(
+            "📁 请选择项目\n\n{}\n\n点击卡片按钮即可切换项目，也可以直接发送「选择项目 <路径>」。",
+            fallback_lines
+        ),
+        card: json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "template": "blue",
+                "title": {
+                    "tag": "plain_text",
+                    "content": "选择项目"
+                }
+            },
+            "elements": elements
+        }),
+    }
+}
+
+pub fn format_project_browser_reply(
+    current_label: &str,
+    current_path: Option<&str>,
+    parent_path: Option<&str>,
+    choices: &[DirectoryChoice],
+    selected_project: Option<&str>,
+    truncated: bool,
+) -> BridgeResponse {
+    let mut elements = vec![json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": format!("**当前位置**\n{}", current_label)
+        }
+    })];
+
+    if let Some(selected_project) = selected_project.filter(|value| !value.trim().is_empty()) {
+        elements.push(json!({
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": format!("当前项目: {selected_project}")
+                }
+            ]
+        }));
+    }
+
+    let mut nav_actions = vec![json!({
+        "tag": "button",
+        "text": {
+            "tag": "plain_text",
+            "content": "最近项目"
+        },
+        "value": {
+            "command": "选择项目"
+        }
+    })];
+
+    if let Some(parent_path) = parent_path {
+        nav_actions.push(json!({
+            "tag": "button",
+            "text": {
+                "tag": "plain_text",
+                "content": "上一级"
+            },
+            "value": {
+                "command": format!("浏览项目 {}", parent_path)
+            }
+        }));
+    }
+
+    if let Some(current_path) = current_path {
+        nav_actions.push(json!({
+            "tag": "button",
+            "type": "primary",
+            "text": {
+                "tag": "plain_text",
+                "content": "选择当前目录"
+            },
+            "value": {
+                "command": format!("选择项目 {}", current_path)
+            }
+        }));
+    }
+
+    elements.push(json!({
+        "tag": "action",
+        "actions": nav_actions
+    }));
+
+    let summary = if choices.is_empty() {
+        "当前目录下没有可继续浏览的子目录。可以直接选择当前目录，或返回上一级。".to_string()
+    } else if truncated {
+        format!("当前仅展示前 {} 个子目录。若没看到目标目录，请逐步缩小范围后再进入。", choices.len())
+    } else {
+        format!("当前可继续进入 {} 个子目录。", choices.len())
+    };
+
+    elements.push(json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": format!("**目录浏览**\n{}", summary)
+        }
+    }));
+
+    if !choices.is_empty() {
+        let directory_lines = choices
+            .iter()
+            .map(|choice| {
+                let note = choice
+                    .note
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!("\n{}", value.trim()))
+                    .unwrap_or_default();
+                format!("**{}**\n{}{}", choice.label, choice.path, note)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**可浏览目录**\n{}", directory_lines)
+            }
+        }));
+
+        for chunk in choices.chunks(4) {
+            let actions = chunk
+                .iter()
+                .map(|choice| {
+                    json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": choice.label
+                        },
+                        "value": {
+                            "command": format!("浏览项目 {}", choice.path)
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            elements.push(json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+    }
+
+    let fallback_lines = if choices.is_empty() {
+        "(当前没有可继续浏览的子目录)".to_string()
+    } else {
+        choices
+            .iter()
+            .map(|choice| format!("- {}: {}", choice.label, choice.path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    BridgeResponse::Card {
+        fallback_text: format!(
+            "📂 浏览项目\n\n当前位置: {}\n\n{}\n\n可直接发送「选择项目 <路径>」选择当前目录。",
+            current_label,
+            fallback_lines
+        ),
+        card: json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "template": "wathet",
+                "title": {
+                    "tag": "plain_text",
+                    "content": "浏览项目"
+                }
+            },
+            "elements": elements
+        }),
+    }
+}
+
 pub fn format_plan_reply(
     progress: &PlanProgress,
     auto_run: bool,
@@ -490,6 +803,29 @@ fn build_follow_up_actions(stored: &StoredSession) -> Vec<serde_json::Value> {
         }));
     }
 
+    if stored.current_project_path.is_some() {
+        actions.push(json!({
+            "tag": "button",
+            "text": {
+                "tag": "plain_text",
+                "content": "当前项目"
+            },
+            "value": {
+                "command": "当前项目"
+            }
+        }));
+        actions.push(json!({
+            "tag": "button",
+            "text": {
+                "tag": "plain_text",
+                "content": "同步 Git"
+            },
+            "value": {
+                "command": "同步 Git 状态"
+            }
+        }));
+    }
+
     if !stored.recent_file_paths.is_empty() || stored.last_file_path.is_some() {
         actions.push(json!({
             "tag": "button",
@@ -550,7 +886,7 @@ mod tests {
     use super::*;
 
     use crate::plan::{ApprovalRequest, ExecutionOutcome};
-    use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredSession};
+    use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredSession, StoredSessionKind};
     use crate::Intent;
 
     fn shell_intent(cmd: &str) -> Intent {
@@ -561,6 +897,9 @@ mod tests {
 
     fn stored_task(task: &str, status: &str, summary: &str) -> StoredSession {
         StoredSession {
+            session_kind: StoredSessionKind::Plan,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some(task.to_string()),
             pending_steps: Vec::new(),
@@ -702,6 +1041,9 @@ mod tests {
             approval_request: None,
         };
         let stored = StoredSession {
+            session_kind: StoredSessionKind::Plan,
+            agent_state: None,
+            current_project_path: None,
             plan: None,
             current_task: Some("应用补丁 demo".to_string()),
             pending_steps: Vec::new(),
@@ -737,6 +1079,92 @@ mod tests {
                 assert!(card_text.contains("看文件列表"));
                 assert!(card_text.contains("撤回补丁"));
                 assert!(card_text.contains("继续问"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn project_picker_reply_returns_selection_card() {
+        let choices = vec![
+            ProjectChoice {
+                label: "HarborLookout".to_string(),
+                path: "C:/Users/beanw/OpenSource/HarborLookout".to_string(),
+                note: Some("来自项目映射".to_string()),
+                is_current: true,
+            },
+            ProjectChoice {
+                label: "feishu-vscode-bridge".to_string(),
+                path: "C:/Users/beanw/OpenSource/feishu-vscode-bridge".to_string(),
+                note: Some("默认工作区".to_string()),
+                is_current: false,
+            },
+        ];
+
+        match format_project_picker_reply(&choices) {
+            BridgeResponse::Card { fallback_text, card } => {
+                let card_text = card.to_string();
+                assert!(fallback_text.contains("请选择项目"));
+                assert!(card_text.contains("HarborLookout"));
+                assert!(card_text.contains("选择项目 C:/Users/beanw/OpenSource/HarborLookout"));
+                assert!(card_text.contains("当前项目"));
+                assert!(card_text.contains("浏览文件夹"));
+                assert!(card_text.contains("点击下面的按钮即可切换项目"));
+                assert!(!card_text.contains("\"type\":\"default\""));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn project_picker_reply_normalizes_windows_paths_for_buttons() {
+        let choices = vec![ProjectChoice {
+            label: "Bridge".to_string(),
+            path: "C:/Users/beanw/OpenSource/feishu-vscode-bridge".to_string(),
+            note: None,
+            is_current: false,
+        }];
+
+        match format_project_picker_reply(&choices) {
+            BridgeResponse::Card { card, .. } => {
+                let card_text = card.to_string();
+                assert!(card_text.contains("选择项目 C:/Users/beanw/OpenSource/feishu-vscode-bridge"));
+                assert!(!card_text.contains(r#"选择项目 C:\\Users\\beanw\\OpenSource\\feishu-vscode-bridge"#));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn project_browser_reply_returns_navigation_card() {
+        let choices = vec![
+            DirectoryChoice {
+                label: "Users".to_string(),
+                path: "C:/Users".to_string(),
+                note: Some("目录".to_string()),
+            },
+            DirectoryChoice {
+                label: "Program Files".to_string(),
+                path: "C:/Program Files".to_string(),
+                note: Some("目录".to_string()),
+            },
+        ];
+
+        match format_project_browser_reply(
+            "C:/",
+            Some("C:/"),
+            Some("/"),
+            &choices,
+            Some("C:/Users/beanw/OpenSource/HarborLookout"),
+            false,
+        ) {
+            BridgeResponse::Card { fallback_text, card } => {
+                let card_text = card.to_string();
+                assert!(fallback_text.contains("浏览项目"));
+                assert!(card_text.contains("选择当前目录"));
+                assert!(card_text.contains("浏览项目 C:/Users"));
+                assert!(card_text.contains("最近项目"));
+                assert!(card_text.contains("上一级"));
             }
             BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
         }

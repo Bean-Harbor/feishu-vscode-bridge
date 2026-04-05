@@ -12,20 +12,20 @@ Unicode true
 
 !define APP_NAME "Feishu VS Code Bridge"
 !define COMPANY_NAME "Bean Harbor"
-!define INSTALL_DIR "$PROGRAMFILES64\${APP_NAME}"
-!define OUTPUT_EXE "${OUTPUT_DIR}\Setup.exe"
+!define INSTALL_DIR "$LOCALAPPDATA\Programs\${APP_NAME}"
+!define OUTPUT_EXE "${OUTPUT_DIR}\FeishuVSCodeBridgeSetup.exe"
 
 Name "${APP_NAME}"
 OutFile "${OUTPUT_EXE}"
 InstallDir "${INSTALL_DIR}"
 InstallDirRegKey HKCU "Software\${COMPANY_NAME}\${APP_NAME}" "InstallDir"
-RequestExecutionLevel admin
+RequestExecutionLevel user
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\setup-gui.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "安装完成后立即启动配置向导"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch setup wizard after install"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -48,9 +48,9 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}" "Publisher" "${COMPANY_NAME}"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}\配置向导.lnk" "$INSTDIR\setup-gui.exe"
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe"
-  CreateShortcut "$DESKTOP\${APP_NAME} 配置向导.lnk" "$INSTDIR\setup-gui.exe"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\Setup Wizard.lnk" "$INSTDIR\setup-gui.exe"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortcut "$DESKTOP\${APP_NAME} Setup Wizard.lnk" "$INSTDIR\setup-gui.exe"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
@@ -61,10 +61,10 @@ Section "Uninstall"
   Delete "$INSTDIR\feishu-agent-bridge.vsix"
   Delete "$INSTDIR\Uninstall.exe"
 
-  Delete "$SMPROGRAMS\${APP_NAME}\配置向导.lnk"
-  Delete "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\${APP_NAME}\Setup Wizard.lnk"
+  Delete "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
-  Delete "$DESKTOP\${APP_NAME} 配置向导.lnk"
+  Delete "$DESKTOP\${APP_NAME} Setup Wizard.lnk"
 
   DeleteRegKey HKCU "Software\${COMPANY_NAME}\${APP_NAME}"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"

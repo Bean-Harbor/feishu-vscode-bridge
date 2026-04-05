@@ -1,5 +1,6 @@
 param(
     [string]$WorkspacePath,
+    [string]$ProjectMappings,
     [string]$ApprovalRequired = "none",
     [string]$TargetDir = "target/bridge-live-runner",
     [switch]$SkipBuild,
@@ -52,17 +53,27 @@ try {
     }
 
     $env:BRIDGE_WORKSPACE_PATH = $WorkspacePath
+    if ($ProjectMappings) {
+        $env:BRIDGE_PROJECT_MAPPINGS = $ProjectMappings
+    }
     $env:BRIDGE_APPROVAL_REQUIRED = $ApprovalRequired
     $env:CARGO_TARGET_DIR = $TargetDir
 
-    $binaryPath = Join-Path $repoRoot (Join-Path $TargetDir "debug/bridge-cli.exe")
     $commandPreview = @(
-        "Set BRIDGE_WORKSPACE_PATH=$WorkspacePath",
+        "Set BRIDGE_WORKSPACE_PATH=$WorkspacePath"
+    )
+    if ($ProjectMappings) {
+        $commandPreview += "Set BRIDGE_PROJECT_MAPPINGS=$ProjectMappings"
+    }
+    $commandPreview += @(
         "Set BRIDGE_APPROVAL_REQUIRED=$ApprovalRequired",
         "Set CARGO_TARGET_DIR=$TargetDir",
         "cargo build --bin bridge-cli",
-        "$binaryPath listen"
-    ) -join [Environment]::NewLine
+        "$(Join-Path $repoRoot (Join-Path $TargetDir \"debug/bridge-cli.exe\")) listen"
+    )
+    $commandPreview = $commandPreview -join [Environment]::NewLine
+
+    $binaryPath = Join-Path $repoRoot (Join-Path $TargetDir "debug/bridge-cli.exe")
 
     if ($PrintOnly) {
         Write-Output $commandPreview
@@ -70,6 +81,9 @@ try {
     }
 
     Write-Output "Using workspace: $WorkspacePath"
+    if ($ProjectMappings) {
+        Write-Output "Using project mappings: $ProjectMappings"
+    }
     Write-Output "Using approval policy: $ApprovalRequired"
     Write-Output "Using cargo target dir: $TargetDir"
 

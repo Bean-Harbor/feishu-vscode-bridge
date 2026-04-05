@@ -5,6 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
 workspace_path="${BRIDGE_WORKSPACE_PATH:-$repo_root}"
+project_mappings="${BRIDGE_PROJECT_MAPPINGS:-}"
 approval_required="${BRIDGE_APPROVAL_REQUIRED:-none}"
 target_dir="${CARGO_TARGET_DIR:-target/bridge-live-runner}"
 skip_build=0
@@ -19,6 +20,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --approval-required)
             approval_required="$2"
+            shift 2
+            ;;
+        --project-mappings)
+            project_mappings="$2"
             shift 2
             ;;
         --target-dir)
@@ -53,6 +58,9 @@ if [[ $no_env -eq 0 && -f .env ]]; then
 fi
 
 export BRIDGE_WORKSPACE_PATH="$workspace_path"
+if [[ -n "$project_mappings" ]]; then
+    export BRIDGE_PROJECT_MAPPINGS="$project_mappings"
+fi
 export BRIDGE_APPROVAL_REQUIRED="$approval_required"
 export CARGO_TARGET_DIR="$target_dir"
 
@@ -60,6 +68,9 @@ binary_path="$repo_root/$target_dir/debug/bridge-cli"
 
 if [[ $print_only -eq 1 ]]; then
     printf 'export BRIDGE_WORKSPACE_PATH=%q\n' "$workspace_path"
+    if [[ -n "$project_mappings" ]]; then
+        printf 'export BRIDGE_PROJECT_MAPPINGS=%q\n' "$project_mappings"
+    fi
     printf 'export BRIDGE_APPROVAL_REQUIRED=%q\n' "$approval_required"
     printf 'export CARGO_TARGET_DIR=%q\n' "$target_dir"
     echo "cargo build --bin bridge-cli"
@@ -68,6 +79,9 @@ if [[ $print_only -eq 1 ]]; then
 fi
 
 echo "Using workspace: $workspace_path"
+if [[ -n "$project_mappings" ]]; then
+    echo "Using project mappings: $project_mappings"
+fi
 echo "Using approval policy: $approval_required"
 echo "Using cargo target dir: $target_dir"
 

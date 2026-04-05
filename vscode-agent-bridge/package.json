@@ -50,9 +50,11 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package:vsix": "node -e \"require('fs').mkdirSync('dist', { recursive: true })\" && npx @vscode/vsce package --allow-missing-repository --skip-license --out dist/feishu-agent-bridge.vsix"
   },
   "devDependencies": {
+    "@vscode/vsce": "^3.6.0",
     "@types/node": "^20.17.30",
     "@types/vscode": "^1.99.0",
     "typescript": "^5.8.3"
