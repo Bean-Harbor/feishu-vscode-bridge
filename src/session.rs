@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent_runtime::AgentRunState;
 use crate::plan::{ExecutionOutcome, PlanProgress, PlanSession, StepExecution};
+use crate::reply;
 use crate::vscode;
 use crate::Intent;
 
@@ -70,6 +72,8 @@ pub struct StoredAgentState {
     pub next_action: Option<String>,
     pub tool_call: Option<String>,
     pub tool_result_summary: Option<String>,
+    #[serde(default)]
+    pub run: Option<AgentRunState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +107,66 @@ pub fn load_session_store(path: Option<&PathBuf>) -> HashMap<String, StoredSessi
     }
 }
 
+pub fn stored_session_from_semantic_plan_result(
+    task_text: &str,
+    intent: &Intent,
+    result: &vscode::SemanticPlanResult,
+    reply_text: &str,
+    current_project_path: Option<String>,
+    pending_steps: Vec<String>,
+) -> StoredSession {
+    let status = match result.decision.trim().to_ascii_lowercase().as_str() {
+        "confirm" => "待确认".to_string(),
+        "clarify" => "待澄清".to_string(),
+        "execute" => "已规划".to_string(),
+        other if other.is_empty() => "已规划".to_string(),
+        other => format!("已规划 ({other})"),
+    };
+
+    let summary = result
+        .summary_for_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            result
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            let message = result.message.trim();
+            (!message.is_empty()).then(|| message.to_string())
+        })
+        .unwrap_or_else(|| task_text.trim().to_string());
+
+    StoredSession {
+        session_kind: StoredSessionKind::Plan,
+        agent_state: None,
+        current_project_path,
+        plan: None,
+        current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
+        pending_steps,
+        last_result: Some(StoredResult {
+            status,
+            summary,
+            success: result.success,
+        }),
+        last_action: Some(reply::describe_intent(intent)),
+        last_step: Some(StoredStep {
+            description: reply::describe_intent(intent),
+            reply: reply_text.to_string(),
+            success: result.success,
+        }),
+        last_file_path: None,
+        recent_file_paths: Vec::new(),
+        last_diff: None,
+        last_patch: None,
+    }
+}
 pub fn save_session_store(
     path: Option<&PathBuf>,
     store: &HashMap<String, StoredSession>,
@@ -211,6 +275,7 @@ pub fn stored_session_from_agent_result(
             next_action: result.next_action.clone(),
             tool_call: result.tool_call.clone(),
             tool_result_summary: result.tool_result_summary.clone(),
+            run: result.run.clone(),
         }),
         current_project_path: None,
         plan: None,
@@ -229,6 +294,81 @@ pub fn stored_session_from_agent_result(
         }),
         last_file_path: result.related_files.first().cloned(),
         recent_file_paths: result.related_files.clone(),
+        last_diff: None,
+        last_patch: None,
+    }
+}
+
+pub fn stored_session_from_agent_run_result(
+    task_text: &str,
+    intent: &Intent,
+    result: &vscode::AgentRunResult,
+    reply_text: &str,
+    current_project_path: Option<String>,
+) -> StoredSession {
+    let run = result.run.clone();
+    let (status, current_action, next_action, recent_file_paths) = run
+        .as_ref()
+        .map(|run| {
+            let recent_files = run
+                .reversible_artifacts
+                .iter()
+                .flat_map(|artifact| artifact.file_paths.iter().cloned())
+                .collect::<Vec<_>>();
+            (
+                reply::format_agent_run_status(run.status.as_str()),
+                Some(run.current_action.clone()).filter(|value| !value.trim().is_empty()),
+                Some(run.next_action.clone()).filter(|value| !value.trim().is_empty()),
+                recent_files,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                if result.success {
+                    "已初始化".to_string()
+                } else {
+                    "已阻塞".to_string()
+                },
+                None,
+                None,
+                Vec::new(),
+            )
+        });
+
+    let summary = run
+        .as_ref()
+        .map(|value| value.summary.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| result.message.clone());
+
+    StoredSession {
+        session_kind: StoredSessionKind::Agent,
+        agent_state: Some(StoredAgentState {
+            session_id: Some(result.session_id.clone()).filter(|value| !value.trim().is_empty()),
+            status: Some(status.clone()),
+            current_action,
+            next_action,
+            tool_call: None,
+            tool_result_summary: Some(summary.clone()).filter(|value| !value.trim().is_empty()),
+            run,
+        }),
+        current_project_path,
+        plan: None,
+        current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
+        pending_steps: Vec::new(),
+        last_result: Some(StoredResult {
+            status,
+            summary,
+            success: result.success,
+        }),
+        last_action: Some(reply::describe_intent(intent)),
+        last_step: Some(StoredStep {
+            description: reply::describe_intent(intent),
+            reply: reply_text.to_string(),
+            success: result.success,
+        }),
+        last_file_path: recent_file_paths.first().cloned(),
+        recent_file_paths,
         last_diff: None,
         last_patch: None,
     }
@@ -255,10 +395,48 @@ pub fn suggested_agent_next_action(stored: &StoredSession) -> Option<String> {
     stored
         .agent_state
         .as_ref()
-        .and_then(|state| state.next_action.as_ref())
+        .and_then(|state| {
+            state
+                .run
+                .as_ref()
+                .map(|run| run.next_action.as_str())
+                .or_else(|| state.next_action.as_deref())
+        })
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+pub fn current_agent_run(stored: &StoredSession) -> Option<&AgentRunState> {
+    stored.agent_state.as_ref().and_then(|state| state.run.as_ref())
+}
+
+pub fn current_agent_run_id(stored: &StoredSession) -> Option<String> {
+    current_agent_run(stored).map(|run| run.run_id.clone())
+}
+
+pub fn current_agent_decision(
+    stored: &StoredSession,
+) -> Option<(&AgentRunState, &crate::agent_runtime::PendingUserDecision)> {
+    let run = current_agent_run(stored)?;
+    let decision = run.pending_user_decision.as_ref()?;
+    Some((run, decision))
+}
+
+pub fn suggested_agent_decision_option(stored: &StoredSession) -> Option<String> {
+    let (_, decision) = current_agent_decision(stored)?;
+    decision
+        .recommended_option_id
+        .as_ref()
+        .cloned()
+        .or_else(|| {
+            decision
+                .options
+                .iter()
+                .find(|option| option.primary)
+                .map(|option| option.option_id.clone())
+        })
+        .or_else(|| decision.options.first().map(|option| option.option_id.clone()))
 }
 
     pub fn selected_project_path(stored: &StoredSession) -> Option<String> {
@@ -272,7 +450,10 @@ pub fn suggested_agent_next_action(stored: &StoredSession) -> Option<String> {
 
 fn is_agent_step_description(description: &str) -> bool {
     let trimmed = description.trim_start();
-    trimmed.starts_with("问 Copilot") || trimmed.starts_with("继续 Agent 任务")
+    trimmed.starts_with("问 Copilot")
+        || trimmed.starts_with("继续 Agent 任务")
+        || trimmed.starts_with("启动 Agent Runtime")
+        || trimmed.starts_with("继续 Agent Runtime")
 }
 
 pub(crate) fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
@@ -464,6 +645,7 @@ fn describe_intent(intent: &Intent) -> String {
             None => format!("打开文件 {path}"),
         },
         Intent::OpenFolder { path } => format!("打开目录 {path}"),
+        Intent::ShowPlanPrompt { prompt } => format!("Plan 模式：{prompt}"),
         Intent::InstallExtension { ext_id } => format!("安装扩展 {ext_id}"),
         Intent::UninstallExtension { ext_id } => format!("卸载扩展 {ext_id}"),
         Intent::ListExtensions => "列出扩展".to_string(),
@@ -509,6 +691,17 @@ fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::StartAgentRun { prompt } => format!("启动 Agent Runtime：{prompt}"),
+        Intent::ContinueAgentRun { prompt } => match prompt {
+            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent Runtime：{}", prompt.trim()),
+            _ => "继续 Agent Runtime".to_string(),
+        },
+        Intent::ShowAgentRunStatus => "查看 Agent Runtime 状态".to_string(),
+        Intent::ApproveAgentRun { option_id } => match option_id {
+            Some(option_id) if !option_id.trim().is_empty() => format!("批准 Agent Runtime 决策 {}", option_id.trim()),
+            _ => "批准当前 Agent Runtime 决策".to_string(),
+        },
+        Intent::CancelAgentRun => "取消 Agent Runtime".to_string(),
         Intent::ContinueAgent { prompt } => match prompt {
             Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent 任务：{}", prompt.trim()),
             _ => "继续 Agent 任务".to_string(),
@@ -568,6 +761,9 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::agent_runtime::{
+        AgentRunMode, AgentRunState, AgentRunStatus, ResultDisposition, RunBudget, RunCheckpoint,
+    };
     use crate::test_support::unique_temp_path;
 
     #[test]
@@ -640,6 +836,7 @@ mod tests {
                 next_action: Some("读取 src/lib.rs 350-420".to_string()),
                 tool_call: None,
                 tool_result_summary: None,
+                run: None,
             }),
             current_project_path: None,
             plan: None,
@@ -666,6 +863,174 @@ mod tests {
         assert_eq!(
             suggested_agent_next_action(&stored).as_deref(),
             Some("读取 src/lib.rs 350-420")
+        );
+    }
+
+    #[test]
+    fn detects_agent_task_session_from_persisted_runtime_run() {
+        let stored = StoredSession {
+            session_kind: StoredSessionKind::Agent,
+            agent_state: Some(StoredAgentState {
+                session_id: Some("session-ask-runtime".to_string()),
+                status: Some("等待用户".to_string()),
+                current_action: Some("Waiting for follow-up".to_string()),
+                next_action: Some("继续检查 parser 边界情况".to_string()),
+                tool_call: None,
+                tool_result_summary: Some("已完成 ask-mode runtime 第一轮分析。".to_string()),
+                run: Some(AgentRunState {
+                    run_id: "run-ask-1".to_string(),
+                    mode: AgentRunMode::Ask,
+                    status: AgentRunStatus::WaitingUser,
+                    summary: "Ask runtime paused with a follow-up suggestion.".to_string(),
+                    current_action: "Waiting for follow-up".to_string(),
+                    next_action: "继续检查 parser 边界情况".to_string(),
+                    current_step: Some("waiting_user".to_string()),
+                    authorization_policy: None,
+                    result_disposition: ResultDisposition::Pending,
+                    pending_user_decision: None,
+                    budget: RunBudget {
+                        max_iterations: 3,
+                        max_tool_calls: 2,
+                        max_write_operations: 0,
+                    },
+                    checkpoints: vec![RunCheckpoint {
+                        checkpoint_id: "cp-1".to_string(),
+                        label: "waiting-user".to_string(),
+                        status_summary: "Ask runtime paused".to_string(),
+                        timestamp_ms: 1,
+                    }],
+                    reversible_artifacts: Vec::new(),
+                }),
+            }),
+            current_project_path: None,
+            plan: None,
+            current_task: Some("问 Copilot parser 的自然语言入口还缺什么".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "等待用户".to_string(),
+                summary: "Ask runtime paused with a follow-up suggestion.".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "问 Copilot parser 的自然语言入口还缺什么".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/lib.rs".to_string()),
+            recent_file_paths: vec!["src/lib.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        assert!(is_agent_task_session(&stored));
+        assert!(current_agent_run(&stored).is_some());
+        assert_eq!(current_agent_run_id(&stored).as_deref(), Some("run-ask-1"));
+        assert_eq!(
+            suggested_agent_next_action(&stored).as_deref(),
+            Some("继续检查 parser 边界情况")
+        );
+    }
+
+    #[test]
+    fn stored_session_from_agent_result_preserves_runtime_run() {
+        let result = crate::vscode::AgentAskResult {
+            success: true,
+            session_id: Some("session-1".to_string()),
+            status: "waiting_user".to_string(),
+            message: "Ask runtime paused.".to_string(),
+            summary: Some("Ask runtime paused.".to_string()),
+            current_action: Some("Waiting for follow-up".to_string()),
+            next_action: Some("继续查看 src/lib.rs 120-180".to_string()),
+            related_files: vec!["src/lib.rs".to_string()],
+            tool_call: None,
+            tool_result_summary: None,
+            run: Some(AgentRunState {
+                run_id: "run-ask-2".to_string(),
+                mode: AgentRunMode::Ask,
+                status: AgentRunStatus::WaitingUser,
+                summary: "Ask runtime paused.".to_string(),
+                current_action: "Waiting for follow-up".to_string(),
+                next_action: "继续查看 src/lib.rs 120-180".to_string(),
+                current_step: Some("waiting_user".to_string()),
+                authorization_policy: None,
+                result_disposition: ResultDisposition::Pending,
+                pending_user_decision: None,
+                budget: RunBudget {
+                    max_iterations: 3,
+                    max_tool_calls: 2,
+                    max_write_operations: 0,
+                },
+                checkpoints: Vec::new(),
+                reversible_artifacts: Vec::new(),
+            }),
+            duration_ms: 42,
+            error: None,
+        };
+
+        let stored = stored_session_from_agent_result(
+            "问 Copilot parser 的自然语言入口还缺什么",
+            &Intent::AskAgent {
+                prompt: "parser 的自然语言入口还缺什么".to_string(),
+            },
+            &result,
+            "reply",
+        );
+
+        assert_eq!(stored.session_kind, StoredSessionKind::Agent);
+        assert_eq!(current_agent_run_id(&stored).as_deref(), Some("run-ask-2"));
+        assert_eq!(
+            suggested_agent_next_action(&stored).as_deref(),
+            Some("继续查看 src/lib.rs 120-180")
+        );
+    }
+
+    #[test]
+    fn stored_session_from_semantic_plan_result_keeps_planner_context() {
+        let result = vscode::SemanticPlanResult {
+            success: true,
+            decision: "confirm".to_string(),
+            message: "当前请求可能影响多个失败点，建议先确认范围。".to_string(),
+            summary: Some("建议先确认修复范围。".to_string()),
+            summary_for_user: Some("先确认修复范围，再开始执行。".to_string()),
+            confidence: Some(0.64),
+            risk: Some("medium".to_string()),
+            actions: Vec::new(),
+            options: vec![vscode::SemanticPlanOption {
+                label: "只修 parser".to_string(),
+                command: "先只修 parser 相关测试".to_string(),
+                note: None,
+                primary: true,
+            }],
+            error: None,
+        };
+
+        let stored = stored_session_from_semantic_plan_result(
+            "/plan 修复当前测试失败",
+            &Intent::ShowPlanPrompt {
+                prompt: "修复当前测试失败".to_string(),
+            },
+            &result,
+            "🧭 Plan 模式\n\n任务: 修复当前测试失败",
+            Some("C:\\work\\demo".to_string()),
+            vec!["只修 parser -> 先只修 parser 相关测试".to_string()],
+        );
+
+        assert_eq!(stored.session_kind, StoredSessionKind::Plan);
+        assert_eq!(stored.current_project_path.as_deref(), Some("C:\\work\\demo"));
+        assert_eq!(stored.current_task.as_deref(), Some("/plan 修复当前测试失败"));
+        assert_eq!(stored.last_result.as_ref().map(|value| value.status.as_str()), Some("待确认"));
+        assert_eq!(
+            stored.last_result.as_ref().map(|value| value.summary.as_str()),
+            Some("先确认修复范围，再开始执行。")
+        );
+        assert_eq!(
+            stored.pending_steps,
+            vec!["只修 parser -> 先只修 parser 相关测试".to_string()]
+        );
+        assert_eq!(
+            stored.last_step.as_ref().map(|step| step.description.as_str()),
+            Some("Plan 模式：修复当前测试失败")
         );
     }
 
@@ -707,6 +1072,7 @@ mod tests {
                 next_action: Some("给我最小修复建议".to_string()),
                 tool_call: None,
                 tool_result_summary: None,
+                run: None,
             }),
             current_project_path: None,
             plan: None,

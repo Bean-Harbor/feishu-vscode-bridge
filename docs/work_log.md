@@ -1,5 +1,36 @@
 # Work Log
 
+## 2026-04-06
+
+### Summary
+
+- Replaced the first semantic-planner result contract from the older `planned / clarify / unsupported` shape with a decision-oriented structure closer to the intended product model: `execute / confirm / clarify`, plus planner-supplied `confidence`, `risk`, and `summaryForUser`
+- Kept the low-risk path direct: when the planner returns `execute`, the Rust bridge still maps planner actions into existing `Intent` values or step plans and reuses the current execution flow without adding a parallel runtime path
+- Added the first real `confirm` bridge surface for ambiguous natural-language requests by rendering a Feishu confirmation card with candidate action buttons instead of forcing a single hard-coded intent
+- Grounded the first `confirm` slice around the Git ambiguity that motivated the change: prompts like “把本地改动同步到 GitHub 上” are now meant to return candidate commands such as `git push`, `git push auto commit via feishu-bridge`, or `同步 Git 状态`, rather than silently collapsing to `git pull`
+- Kept the integration pragmatic: confirmation options currently point at existing explicit bridge commands, so button clicks reuse the normal parser, approval policy, and execution machinery instead of introducing a second confirmation executor
+
+### Files Updated
+
+- `vscode-agent-bridge/src/extension.ts` — changed the semantic planner prompt/response schema to emit `decision`, `summaryForUser`, `confidence`, `risk`, and confirmation options, with explicit instruction to classify ambiguous GitHub sync phrasing as `confirm`
+- `src/vscode.rs` — updated the Rust-side planner client types to consume the new decision-based payload, including confirmation options and risk/confidence metadata
+- `src/semantic_planner.rs` — changed freeform routing so planner `execute` still maps to intents, while planner `confirm` now returns a user-facing confirmation card instead of a forced direct action
+- `src/card.rs` — added a reusable semantic-confirmation card formatter plus a unit test for candidate-action cards
+- `src/bridge.rs` — allowed semantic planner responses to return full bridge responses directly, not only mapped intents
+
+### Verification
+
+- Workspace task `build-feishu-agent-bridge-extension` passed after the semantic planner protocol change
+- `cargo test semantic_planner` passed, covering the execute-path mapping plus the new confirmation-option conversion
+- `cargo test semantic_confirm_reply_returns_confirmation_card` passed, covering the new Feishu confirmation card rendering
+- Full `cargo test` currently still reports two existing Windows path-format test failures in `src/direct_command.rs` (`choose_project_without_path_returns_picker_card` and `normalize_project_path_removes_windows_extended_prefix`), which are outside this semantic-planner change set
+
+### Next Session Focus
+
+- Run a live Feishu smoke that proves an ambiguous GitHub-sync phrase now returns a confirmation card instead of directly executing `git pull` or another single command
+- Decide whether broad coding requests such as “帮我修一下这个问题” should also default to `confirm`, or whether they should stay on the `ask_agent` path until write-capable execution exists
+- If the live smoke is stable, extend planner-side confirmation examples beyond Git to cover risky multi-step coding requests and underspecified “继续做完” style prompts
+
 ## 2026-04-05
 
 ### Summary

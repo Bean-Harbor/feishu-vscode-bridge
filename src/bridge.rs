@@ -88,7 +88,7 @@ impl BridgeApp {
                 SemanticDispatch::Planned(planned) => {
                     self.dispatch_intent(&context, session_key, trimmed_text, planned)
                 }
-                SemanticDispatch::Reply(reply) => BridgeResponse::Text(reply),
+                SemanticDispatch::Response(response) => response,
             };
         }
 
@@ -110,11 +110,21 @@ impl BridgeApp {
             Intent::RunPlan { steps, mode } => {
                 plan_dispatch::start_plan(context, session_key, task_text, steps, mode)
             }
+            Intent::ShowPlanPrompt { prompt } => {
+                semantic_planner::show_plan_prompt(context, session_key, task_text, &prompt)
+            }
             Intent::ContinuePlan
             | Intent::RetryFailedStep
             | Intent::ExecuteAll
             | Intent::ApprovePending
             | Intent::RejectPending => dispatch_plan_action(context, session_key, task_text, intent),
+            Intent::StartAgentRun { .. }
+            | Intent::ContinueAgentRun { .. }
+            | Intent::ShowAgentRunStatus
+            | Intent::ApproveAgentRun { .. }
+            | Intent::CancelAgentRun => {
+                direct_command::execute_direct_command(context, session_key, task_text, intent)
+            }
             Intent::ContinueAgent { prompt } => {
                 follow_up::continue_agent_task(context, session_key, task_text, prompt.as_deref())
             }

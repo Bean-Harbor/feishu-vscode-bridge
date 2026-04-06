@@ -22,6 +22,10 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
             success: false,
             reply: "⚠️ 当前项目只支持直接命令调用。".to_string(),
         },
+        Intent::ShowPlanPrompt { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ Plan 模式只支持直接命令调用。".to_string(),
+        },
         Intent::ShowProjectPicker => ExecutionOutcome {
             success: false,
             reply: "⚠️ 项目选择卡片只支持直接命令调用。".to_string(),
@@ -202,6 +206,26 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
         Intent::AskAgent { .. } => ExecutionOutcome {
             success: false,
             reply: "⚠️ 问 Copilot 目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::StartAgentRun { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ Agent Runtime 启动目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::ContinueAgentRun { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ Agent Runtime 续跑目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::ShowAgentRunStatus => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ Agent Runtime 状态查询目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::ApproveAgentRun { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ Agent Runtime 审批目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
+        Intent::CancelAgentRun => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ Agent Runtime 取消目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
         },
         Intent::ContinueAgent { .. } => ExecutionOutcome {
             success: false,

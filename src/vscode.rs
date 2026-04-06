@@ -11,6 +11,7 @@ use std::path::Component;
 use std::process::Command;
 use std::time::Instant;
 
+use crate::agent_runtime::AgentRunState;
 use crate::executor::{run_cmd, CmdResult};
 
 pub const WORKSPACE_PATH_ENV: &str = "BRIDGE_WORKSPACE_PATH";
@@ -20,6 +21,11 @@ pub const AGENT_BRIDGE_PORT_ENV: &str = "BRIDGE_AGENT_BRIDGE_PORT";
 const DEFAULT_AGENT_BRIDGE_PORT: u16 = 8765;
 const AGENT_TOOL_RESULT_PATH: &str = "/v1/chat/tool-result";
 const AGENT_PLAN_PATH: &str = "/v1/chat/plan";
+const AGENT_START_PATH: &str = "/v1/chat/agent/start";
+const AGENT_CONTINUE_PATH: &str = "/v1/chat/agent/continue";
+const AGENT_STATUS_PATH: &str = "/v1/chat/agent/status";
+const AGENT_APPROVE_PATH: &str = "/v1/chat/agent/approve";
+const AGENT_CANCEL_PATH: &str = "/v1/chat/agent/cancel";
 const MAX_AGENT_TOOL_SUMMARY_CHARS: usize = 240;
 
 #[derive(Deserialize)]
@@ -66,6 +72,7 @@ struct AgentAskResponse {
     tool_request: Option<AgentToolCall>,
     #[serde(rename = "taskState")]
     task_state: Option<AgentTaskStateResponse>,
+    run: Option<AgentRunState>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,13 +82,29 @@ pub struct SemanticPlanAction {
     pub args: Value,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticPlanOption {
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub primary: bool,
+}
+
 #[derive(Deserialize)]
 struct SemanticPlanResponse {
-    status: Option<String>,
+    decision: Option<String>,
     message: Option<String>,
     summary: Option<String>,
+    #[serde(rename = "summaryForUser")]
+    summary_for_user: Option<String>,
+    confidence: Option<f32>,
+    risk: Option<String>,
     #[serde(default)]
     actions: Vec<SemanticPlanAction>,
+    #[serde(default)]
+    options: Vec<SemanticPlanOption>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +135,14 @@ struct AgentResetResponse {
     remaining_sessions: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentRunResponse {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub message: String,
+    pub run: AgentRunState,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentAskResult {
     pub success: bool,
@@ -124,6 +155,7 @@ pub struct AgentAskResult {
     pub related_files: Vec<String>,
     pub tool_call: Option<String>,
     pub tool_result_summary: Option<String>,
+    pub run: Option<AgentRunState>,
     pub duration_ms: u64,
     pub error: Option<String>,
 }
@@ -131,11 +163,77 @@ pub struct AgentAskResult {
 #[derive(Debug, Clone)]
 pub struct SemanticPlanResult {
     pub success: bool,
-    pub status: String,
+    pub decision: String,
     pub message: String,
     pub summary: Option<String>,
+    pub summary_for_user: Option<String>,
+    pub confidence: Option<f32>,
+    pub risk: Option<String>,
     pub actions: Vec<SemanticPlanAction>,
+    pub options: Vec<SemanticPlanOption>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRunResult {
+    pub success: bool,
+    pub session_id: String,
+    pub message: String,
+    pub run: Option<AgentRunState>,
+    pub error: Option<String>,
+}
+
+pub fn start_agent_run(
+    session_id: &str,
+    prompt: &str,
+    current_project: Option<&str>,
+) -> AgentRunResult {
+    let payload = ureq::json!({
+        "sessionId": session_id.trim(),
+        "prompt": prompt.trim(),
+        "currentProject": current_project,
+    });
+    call_agent_run_endpoint(AGENT_START_PATH, payload)
+}
+
+pub fn continue_agent_run(session_id: &str, run_id: &str, prompt: Option<&str>) -> AgentRunResult {
+    let payload = ureq::json!({
+        "sessionId": session_id.trim(),
+        "runId": run_id.trim(),
+        "prompt": prompt.map(str::trim),
+    });
+    call_agent_run_endpoint(AGENT_CONTINUE_PATH, payload)
+}
+
+pub fn get_agent_run_status(session_id: &str, run_id: &str) -> AgentRunResult {
+    let payload = ureq::json!({
+        "sessionId": session_id.trim(),
+        "runId": run_id.trim(),
+    });
+    call_agent_run_endpoint(AGENT_STATUS_PATH, payload)
+}
+
+pub fn approve_agent_run(
+    session_id: &str,
+    run_id: &str,
+    decision_id: &str,
+    option_id: &str,
+) -> AgentRunResult {
+    let payload = ureq::json!({
+        "sessionId": session_id.trim(),
+        "runId": run_id.trim(),
+        "decisionId": decision_id.trim(),
+        "optionId": option_id.trim(),
+    });
+    call_agent_run_endpoint(AGENT_APPROVE_PATH, payload)
+}
+
+pub fn cancel_agent_run(session_id: &str, run_id: &str) -> AgentRunResult {
+    let payload = ureq::json!({
+        "sessionId": session_id.trim(),
+        "runId": run_id.trim(),
+    });
+    call_agent_run_endpoint(AGENT_CANCEL_PATH, payload)
 }
 
 /// 打开文件（可指定行号）
@@ -226,6 +324,7 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
                     related_files: executed.related_files,
                     tool_call: carried_tool_call,
                     tool_result_summary: carried_tool_result_summary,
+                    run: payload.run.clone(),
                     duration_ms: start.elapsed().as_millis() as u64,
                     error: Some(executed.output),
                 });
@@ -318,6 +417,7 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             related_files,
             tool_call,
             tool_result_summary,
+            run: payload.run,
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         })
@@ -336,7 +436,43 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             related_files: Vec::new(),
             tool_call: None,
             tool_result_summary: None,
+            run: None,
             duration_ms: start.elapsed().as_millis() as u64,
+            error: Some(err),
+        },
+    }
+}
+
+fn call_agent_run_endpoint(payload_path: &str, payload: serde_json::Value) -> AgentRunResult {
+    let result = (|| -> Result<AgentRunResponse, String> {
+        let endpoint = format!("{}{}", agent_bridge_base_url()?, payload_path);
+        let response = ureq::post(&endpoint)
+            .set("Content-Type", "application/json")
+            .send_json(&payload)
+            .map_err(|err| format_agent_bridge_error(err, &endpoint))?;
+
+        response
+            .into_json()
+            .map_err(|err| format!("解析 agent runtime 响应失败: {err}"))
+    })();
+
+    match result {
+        Ok(payload) => AgentRunResult {
+            success: true,
+            session_id: payload.session_id,
+            message: payload.message,
+            run: Some(payload.run),
+            error: None,
+        },
+        Err(err) => AgentRunResult {
+            success: false,
+            session_id: payload
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            message: err.clone(),
+            run: None,
             error: Some(err),
         },
     }
@@ -613,10 +749,14 @@ pub fn plan_semantic_intent(
     if trimmed_session_id.is_empty() {
         return SemanticPlanResult {
             success: false,
-            status: "blocked".to_string(),
+            decision: "clarify".to_string(),
             message: "sessionId 不能为空。".to_string(),
             summary: Some("sessionId 不能为空。".to_string()),
+            summary_for_user: Some("sessionId 不能为空。".to_string()),
+            confidence: None,
+            risk: Some("unknown".to_string()),
             actions: Vec::new(),
+            options: Vec::new(),
             error: Some("sessionId 不能为空。".to_string()),
         };
     }
@@ -624,10 +764,14 @@ pub fn plan_semantic_intent(
     if trimmed_prompt.is_empty() {
         return SemanticPlanResult {
             success: false,
-            status: "blocked".to_string(),
+            decision: "clarify".to_string(),
             message: "自然语言请求不能为空。".to_string(),
             summary: Some("自然语言请求不能为空。".to_string()),
+            summary_for_user: Some("自然语言请求不能为空。".to_string()),
+            confidence: None,
+            risk: Some("unknown".to_string()),
             actions: Vec::new(),
+            options: Vec::new(),
             error: Some("自然语言请求不能为空。".to_string()),
         };
     }
@@ -649,10 +793,16 @@ pub fn plan_semantic_intent(
 
         Ok(SemanticPlanResult {
             success: true,
-            status: payload.status.unwrap_or_else(|| "unsupported".to_string()),
+            decision: payload.decision.unwrap_or_else(|| "clarify".to_string()),
             message: payload.message.unwrap_or_default(),
             summary: payload.summary.filter(|value| !value.trim().is_empty()),
+            summary_for_user: payload
+                .summary_for_user
+                .filter(|value| !value.trim().is_empty()),
+            confidence: payload.confidence,
+            risk: payload.risk.filter(|value| !value.trim().is_empty()),
             actions: payload.actions,
+            options: payload.options,
             error: None,
         })
     })();
@@ -661,10 +811,14 @@ pub fn plan_semantic_intent(
         Ok(planned) => planned,
         Err(err) => SemanticPlanResult {
             success: false,
-            status: "blocked".to_string(),
+            decision: "clarify".to_string(),
             message: err.clone(),
             summary: Some(err.clone()),
+            summary_for_user: Some(err.clone()),
+            confidence: None,
+            risk: Some("unknown".to_string()),
             actions: Vec::new(),
+            options: Vec::new(),
             error: Some(err),
         },
     }

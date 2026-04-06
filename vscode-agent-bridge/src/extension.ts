@@ -1,4 +1,7 @@
 import * as http from 'http';
+import * as nodePath from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import * as vscode from 'vscode';
 
 type AskRequest = {
@@ -16,7 +19,36 @@ type SemanticPlanRequest = {
     currentProject?: string | null;
 };
 
-type AgentToolName = 'read_file' | 'search_text';
+type AgentStartRequest = {
+    sessionId: string;
+    prompt: string;
+    currentProject?: string | null;
+};
+
+type AgentContinueRequest = {
+    sessionId: string;
+    runId: string;
+    prompt?: string;
+};
+
+type AgentStatusRequest = {
+    sessionId: string;
+    runId: string;
+};
+
+type AgentApproveRequest = {
+    sessionId: string;
+    runId: string;
+    decisionId: string;
+    optionId: string;
+};
+
+type AgentCancelRequest = {
+    sessionId: string;
+    runId: string;
+};
+
+type AgentToolName = 'read_file' | 'search_text' | 'run_tests' | 'write_file' | 'apply_patch';
 
 type AgentToolCall = {
     name: AgentToolName;
@@ -29,6 +61,13 @@ type ToolResultPayload = {
     output: string;
     summary: string;
     relatedFiles: string[];
+    artifactSnapshots?: ArtifactFileSnapshot[];
+};
+
+type ArtifactFileSnapshot = {
+    path: string;
+    existed: boolean;
+    previousContent: string;
 };
 
 type ToolResultRequest = {
@@ -43,6 +82,12 @@ type PendingToolRequest = {
     requestedAt: number;
 };
 
+type PendingRuntimeToolRequest = {
+    prompt: string;
+    toolRequest: AgentToolCall;
+    requestedAt: number;
+};
+
 type SessionState = {
     messages: vscode.LanguageModelChatMessage[];
     lastResponseSummary?: string;
@@ -50,7 +95,99 @@ type SessionState = {
     recentWorkspaceFiles: string[];
     currentTask?: string;
     pendingToolRequest?: PendingToolRequest;
+    pendingRuntimeToolRequest?: PendingRuntimeToolRequest;
+    runtimeArtifactSnapshots: Record<string, ArtifactFileSnapshot[]>;
+    agentRun?: AgentRunState;
     updatedAt: number;
+};
+
+type AgentRuntimeLoopResult = {
+    message: string;
+    run: AgentRunState;
+};
+
+type AgentRuntimeConfig = {
+    mode: AgentRunMode;
+    maxIterations: number;
+    maxToolCalls: number;
+    maxWriteOperations: number;
+    allowWriteTools: boolean;
+    allowTestTool: boolean;
+    summaryLabel: string;
+};
+
+type AgentRunMode = 'ask' | 'plan' | 'agent';
+
+type AgentRunStatus = 'initialized' | 'running' | 'waiting_user' | 'completed' | 'cancelled' | 'failed';
+
+type ControlPointKind = 'authorization' | 'result_disposition' | 'goal_revision' | 'pacing';
+
+type ResultDisposition = 'pending' | 'kept' | 'reverted' | 'abandoned';
+
+type ReversibleArtifactKind = 'patch' | 'file_write' | 'command_side_effect' | 'other';
+
+type AgentAuthorizationPolicy = {
+    requireWriteApproval: boolean;
+    requireShellApproval: boolean;
+    requireDestructiveApproval: boolean;
+    allowBypassForSession: boolean;
+};
+
+type AgentDecisionOption = {
+    optionId: string;
+    label: string;
+    note?: string;
+    primary: boolean;
+};
+
+type PendingUserDecision = {
+    decisionId: string;
+    controlKind: ControlPointKind;
+    summary: string;
+    options: AgentDecisionOption[];
+    recommendedOptionId?: string;
+};
+
+type ReversibleArtifact = {
+    artifactId: string;
+    kind: ReversibleArtifactKind;
+    summary: string;
+    filePaths: string[];
+};
+
+type RunBudget = {
+    maxIterations: number;
+    maxToolCalls: number;
+    maxWriteOperations: number;
+};
+
+type RunCheckpoint = {
+    checkpointId: string;
+    label: string;
+    statusSummary: string;
+    timestampMs: number;
+};
+
+type AgentRunState = {
+    runId: string;
+    mode: AgentRunMode;
+    status: AgentRunStatus;
+    summary: string;
+    currentAction: string;
+    nextAction: string;
+    currentStep?: string;
+    authorizationPolicy?: AgentAuthorizationPolicy;
+    resultDisposition: ResultDisposition;
+    pendingUserDecision?: PendingUserDecision;
+    budget: RunBudget;
+    checkpoints: RunCheckpoint[];
+    reversibleArtifacts: ReversibleArtifact[];
+};
+
+type AgentRunResponse = {
+    sessionId: string;
+    message: string;
+    run: AgentRunState;
 };
 
 type AgentStatus = 'answered' | 'working' | 'needs_tool' | 'waiting_user' | 'blocked' | 'completed';
@@ -78,6 +215,7 @@ type AskResponse = {
     toolRequest: AgentToolCall | null;
     taskState: AgentTaskState;
     context: string;
+    run?: AgentRunState;
 };
 
 type SemanticActionName =
@@ -114,11 +252,22 @@ type SemanticPlannedAction = {
     args: Record<string, unknown>;
 };
 
+type SemanticConfirmOption = {
+    label: string;
+    command: string;
+    note: string;
+    primary: boolean;
+};
+
 type SemanticPlanResponse = {
-    status: 'planned' | 'clarify' | 'unsupported';
+    decision: 'execute' | 'confirm' | 'clarify';
     message: string;
     summary: string;
+    summaryForUser: string;
+    confidence: number | null;
+    risk: 'low' | 'medium' | 'high' | 'unknown';
     actions: SemanticPlannedAction[];
+    options: SemanticConfirmOption[];
 };
 
 type BridgeContext = {
@@ -132,6 +281,11 @@ const ASK_PATH = '/v1/chat/ask';
 const RESET_PATH = '/v1/chat/reset';
 const TOOL_RESULT_PATH = '/v1/chat/tool-result';
 const PLAN_PATH = '/v1/chat/plan';
+const AGENT_START_PATH = '/v1/chat/agent/start';
+const AGENT_CONTINUE_PATH = '/v1/chat/agent/continue';
+const AGENT_STATUS_PATH = '/v1/chat/agent/status';
+const AGENT_APPROVE_PATH = '/v1/chat/agent/approve';
+const AGENT_CANCEL_PATH = '/v1/chat/agent/cancel';
 const MAX_SUMMARY_LENGTH = 200;
 const MAX_WORKSPACE_SNIPPETS = 3;
 const MAX_FILE_BYTES = 512 * 1024;
@@ -146,6 +300,7 @@ const MAX_READ_FILE_LINE_SPAN = 200;
 const WORKSPACE_FILE_GLOB = '**/*.{rs,ts,tsx,js,jsx,py,toml}';
 const WORKSPACE_EXCLUDE_GLOB = '**/{.git,node_modules,target,out,dist,build,.next,coverage}/**';
 const BOOTSTRAP_WORKSPACE_ENV = 'BRIDGE_AGENT_BOOTSTRAP_WORKSPACE';
+const execAsync = promisify(exec);
 
 type SnippetCandidate = {
     term: string;
@@ -302,6 +457,41 @@ async function startBridgeServer(bridge: BridgeContext): Promise<void> {
                 return;
             }
 
+            if (req.method === 'POST' && req.url === AGENT_START_PATH) {
+                const payload = await readJsonBody<AgentStartRequest>(req);
+                const result = await handleAgentStart(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === AGENT_CONTINUE_PATH) {
+                const payload = await readJsonBody<AgentContinueRequest>(req);
+                const result = await handleAgentContinue(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === AGENT_STATUS_PATH) {
+                const payload = await readJsonBody<AgentStatusRequest>(req);
+                const result = handleAgentStatus(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === AGENT_APPROVE_PATH) {
+                const payload = await readJsonBody<AgentApproveRequest>(req);
+                const result = await handleAgentApprove(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === AGENT_CANCEL_PATH) {
+                const payload = await readJsonBody<AgentCancelRequest>(req);
+                const result = handleAgentCancel(bridge, payload);
+                respondJson(res, 200, result);
+                return;
+            }
+
             if (req.method === 'POST' && req.url === TOOL_RESULT_PATH) {
                 const payload = await readJsonBody<ToolResultRequest>(req);
                 const result = await handleToolResult(bridge, payload);
@@ -339,75 +529,28 @@ async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<As
     }
 
     const session = bridge.sessions.get(sessionId) ?? createSession();
+    const config = runtimeConfigForMode('ask');
     const contextSummary = collectEditorContext();
     const workspaceContext = await collectWorkspaceContext(prompt);
     const sessionSummary = buildSessionSummary(session);
-    const promptContext = [sessionSummary, contextSummary, workspaceContext.summary]
-        .filter((value) => value && value.trim().length > 0)
-        .join('\n\n');
-    const userPrompt = promptContext
-        ? `${promptContext}\n\nUser request:\n${prompt}`
-        : prompt;
-
-    session.messages.push(vscode.LanguageModelChatMessage.User(userPrompt));
     session.currentTask = prompt;
-
-    const model = await selectChatModel();
-    const plannerDecision = await decideAgentAction(model, prompt, promptContext, workspaceContext.files);
 
     rememberRecentPrompt(session, prompt);
     rememberRecentWorkspaceFiles(session, workspaceContext.files);
     session.updatedAt = Date.now();
-
-    if (plannerDecision?.status === 'needs_tool' && plannerDecision.toolRequest) {
-        session.pendingToolRequest = {
-            prompt,
-            toolRequest: plannerDecision.toolRequest,
-            requestedAt: Date.now(),
-        };
-        trimSessionMessages(session);
-        bridge.sessions.set(sessionId, session);
-
-        const relatedFiles = dedupeStrings([
-            ...plannerDecision.relatedFiles,
-            ...workspaceContext.files,
-            ...extractRelatedFilesFromToolRequest(plannerDecision.toolRequest),
-        ]);
-        const taskState = buildToolRequestTaskState(plannerDecision, relatedFiles);
-
-        return {
-            sessionId,
-            status: taskState.status,
-            message: plannerDecision.message,
-            summary: plannerDecision.summary,
-            currentAction: taskState.currentAction,
-            nextAction: taskState.nextAction,
-            relatedFiles: taskState.relatedFiles,
-            toolCall: taskState.toolCall,
-            toolResultSummary: taskState.toolResultSummary,
-            toolRequest: plannerDecision.toolRequest,
-            taskState,
-            context: [sessionSummary, contextSummary, workspaceContext.summary]
-                .filter((value) => value && value.trim().length > 0)
-                .join('\n\n'),
-        };
-    }
-
-    const text = await sendModelRequest(model, session.messages);
-    const summary = summarize(text);
-    const taskState = buildAnsweredTaskState(prompt, summary, workspaceContext.files);
-
     session.pendingToolRequest = undefined;
-    session.messages.push(vscode.LanguageModelChatMessage.Assistant(text));
-    session.lastResponseSummary = summary;
-    trimSessionMessages(session);
+    const run = createAgentRunState(sessionId, prompt, null, config);
     bridge.sessions.set(sessionId, session);
+
+    const result = await runAgentRuntimeLoop(bridge, sessionId, session, run, prompt, 'start', config);
+    const relatedFiles = dedupeStrings(session.recentWorkspaceFiles);
+    const taskState = buildTaskStateFromRuntimeRun(prompt, result.run, relatedFiles);
 
     return {
         sessionId,
         status: taskState.status,
-        message: text,
-        summary,
+        message: result.message,
+        summary: result.run.summary,
         currentAction: taskState.currentAction,
         nextAction: taskState.nextAction,
         relatedFiles: taskState.relatedFiles,
@@ -418,6 +561,7 @@ async function handleAsk(bridge: BridgeContext, payload: AskRequest): Promise<As
         context: [sessionSummary, contextSummary, workspaceContext.summary]
             .filter((value) => value && value.trim().length > 0)
             .join('\n\n'),
+        run: result.run,
     };
 }
 
@@ -478,6 +622,7 @@ async function handleToolResult(bridge: BridgeContext, payload: ToolResultReques
             context: [sessionSummary, contextSummary]
                 .filter((value) => value && value.trim().length > 0)
                 .join('\n\n'),
+            run: session.agentRun,
         };
     }
 
@@ -512,6 +657,276 @@ async function handleToolResult(bridge: BridgeContext, payload: ToolResultReques
         context: [sessionSummary, contextSummary]
             .filter((value) => value && value.trim().length > 0)
             .join('\n\n'),
+        run: session.agentRun,
+    };
+}
+
+async function handleAgentStart(bridge: BridgeContext, payload: AgentStartRequest): Promise<AgentRunResponse> {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    const prompt = payload.prompt?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+    if (!prompt) {
+        throw new Error('prompt is required');
+    }
+
+    const session = bridge.sessions.get(sessionId) ?? createSession();
+    const config = runtimeConfigForMode('agent');
+    const run = createAgentRunState(sessionId, prompt, payload.currentProject ?? null, config);
+
+    session.currentTask = prompt;
+    session.updatedAt = Date.now();
+    rememberRecentPrompt(session, prompt);
+    bridge.sessions.set(sessionId, session);
+
+    const result = await runAgentRuntimeLoop(bridge, sessionId, session, run, prompt, 'start', config);
+
+    return {
+        sessionId,
+        message: result.message,
+        run: result.run,
+    };
+}
+
+async function handleAgentContinue(bridge: BridgeContext, payload: AgentContinueRequest): Promise<AgentRunResponse> {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    const runId = payload.runId?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+    if (!runId) {
+        throw new Error('runId is required');
+    }
+
+    const session = getAgentSession(bridge, sessionId);
+    const run = assertAgentRun(session, runId);
+    const config = runtimeConfigForMode(run.mode);
+    const prompt = payload.prompt?.trim();
+
+    if (prompt) {
+        session.currentTask = prompt;
+        rememberRecentPrompt(session, prompt);
+    }
+
+    const result = await runAgentRuntimeLoop(bridge, sessionId, session, run, prompt ?? null, 'continue', config);
+
+    return {
+        sessionId,
+        message: result.message,
+        run: result.run,
+    };
+}
+
+function handleAgentStatus(bridge: BridgeContext, payload: AgentStatusRequest): AgentRunResponse {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    const runId = payload.runId?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+    if (!runId) {
+        throw new Error('runId is required');
+    }
+
+    const session = getAgentSession(bridge, sessionId);
+    const run = assertAgentRun(session, runId);
+    return {
+        sessionId,
+        message: 'Agent runtime state retrieved.',
+        run,
+    };
+}
+
+async function handleAgentApprove(bridge: BridgeContext, payload: AgentApproveRequest): Promise<AgentRunResponse> {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    const runId = payload.runId?.trim();
+    const decisionId = payload.decisionId?.trim();
+    const optionId = payload.optionId?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+    if (!runId) {
+        throw new Error('runId is required');
+    }
+    if (!decisionId) {
+        throw new Error('decisionId is required');
+    }
+    if (!optionId) {
+        throw new Error('optionId is required');
+    }
+
+    const session = getAgentSession(bridge, sessionId);
+    const run = assertAgentRun(session, runId);
+    const pending = run.pendingUserDecision;
+    if (!pending || pending.decisionId !== decisionId) {
+        throw new Error(`No matching pending decision for run: ${runId}`);
+    }
+
+    const selected = pending.options.find((option) => option.optionId === optionId);
+    if (!selected) {
+        throw new Error(`Unknown optionId for decision ${decisionId}: ${optionId}`);
+    }
+
+    if (pending.controlKind === 'authorization' && selected.optionId === 'reject_tool') {
+        session.pendingRuntimeToolRequest = undefined;
+        run.pendingUserDecision = undefined;
+        run.status = 'waiting_user';
+        run.currentAction = 'Rejected the pending runtime tool request';
+        run.nextAction = 'Continue with a narrower instruction, or approve a different write action later.';
+        run.currentStep = 'authorization_rejected';
+        run.summary = 'The pending write action was rejected and not executed.';
+        run.checkpoints.push(createCheckpoint('authorization-rejected', run.summary));
+        session.agentRun = run;
+        session.updatedAt = Date.now();
+        bridge.sessions.set(sessionId, session);
+
+        return {
+            sessionId,
+            message: run.summary,
+            run,
+        };
+    }
+
+    if (pending.controlKind === 'result_disposition') {
+        run.pendingUserDecision = undefined;
+
+        if (selected.optionId === 'keep_result') {
+            run.resultDisposition = 'kept';
+            run.status = 'completed';
+            run.currentAction = 'Marked the current runtime result as kept';
+            run.nextAction = 'You can continue the run with a follow-up request, or start a new task.';
+            run.currentStep = 'result_kept';
+            run.summary = 'The runtime result was kept.';
+            run.checkpoints.push(createCheckpoint('result-kept', run.summary));
+            session.agentRun = run;
+            session.updatedAt = Date.now();
+            bridge.sessions.set(sessionId, session);
+
+            return {
+                sessionId,
+                message: run.summary,
+                run,
+            };
+        }
+
+        if (selected.optionId === 'revert_result') {
+            const reverted = await revertRuntimeArtifacts(session, run);
+            if (!reverted.success) {
+                run.status = 'failed';
+                run.currentAction = 'Failed to revert the current runtime result';
+                run.nextAction = 'Inspect the workspace state and retry or recover manually.';
+                run.currentStep = 'result_revert_failed';
+                run.summary = reverted.summary;
+                run.checkpoints.push(createCheckpoint('result-revert-failed', reverted.summary));
+            } else {
+                run.resultDisposition = 'reverted';
+                run.status = 'completed';
+                run.currentAction = 'Reverted the current runtime result';
+                run.nextAction = 'You can continue with a narrower follow-up request or start a new task.';
+                run.currentStep = 'result_reverted';
+                run.summary = reverted.summary;
+                run.checkpoints.push(createCheckpoint('result-reverted', reverted.summary));
+            }
+
+            session.agentRun = run;
+            session.updatedAt = Date.now();
+            bridge.sessions.set(sessionId, session);
+
+            return {
+                sessionId,
+                message: run.summary,
+                run,
+            };
+        }
+
+        if (selected.optionId === 'abandon_result') {
+            run.resultDisposition = 'abandoned';
+            run.status = 'completed';
+            run.currentAction = 'Marked the current runtime result as abandoned';
+            run.nextAction = 'Start a fresh run if you want to retry with a different approach.';
+            run.currentStep = 'result_abandoned';
+            run.summary = 'The runtime result was abandoned without being kept.';
+            run.checkpoints.push(createCheckpoint('result-abandoned', run.summary));
+            session.agentRun = run;
+            session.updatedAt = Date.now();
+            bridge.sessions.set(sessionId, session);
+
+            return {
+                sessionId,
+                message: run.summary,
+                run,
+            };
+        }
+    }
+
+    run.pendingUserDecision = undefined;
+    run.checkpoints.push(createCheckpoint('approval', `Approved decision ${decisionId} with ${selected.label}`));
+
+    if (selected.optionId === 'cancel_run') {
+        session.pendingRuntimeToolRequest = undefined;
+        run.status = 'cancelled';
+        run.currentAction = 'Cancelled agent runtime from approval decision';
+        run.nextAction = 'Start a new run when ready.';
+        run.currentStep = 'cancelled';
+        session.agentRun = run;
+        session.updatedAt = Date.now();
+        bridge.sessions.set(sessionId, session);
+
+        return {
+            sessionId,
+            message: 'Agent runtime cancelled.',
+            run,
+        };
+    }
+
+    const config = runtimeConfigForMode(run.mode);
+    const result = await runAgentRuntimeLoop(bridge, sessionId, session, run, null, 'approve', config);
+
+    return {
+        sessionId,
+        message: result.message,
+        run: result.run,
+    };
+}
+
+function handleAgentCancel(bridge: BridgeContext, payload: AgentCancelRequest): AgentRunResponse {
+    pruneExpiredSessions(bridge);
+
+    const sessionId = payload.sessionId?.trim();
+    const runId = payload.runId?.trim();
+    if (!sessionId) {
+        throw new Error('sessionId is required');
+    }
+    if (!runId) {
+        throw new Error('runId is required');
+    }
+
+    const session = getAgentSession(bridge, sessionId);
+    const run = assertAgentRun(session, runId);
+
+    run.pendingUserDecision = undefined;
+    session.pendingRuntimeToolRequest = undefined;
+    run.status = 'cancelled';
+    run.currentAction = 'Cancelled agent runtime skeleton';
+    run.nextAction = 'Start a new run when ready.';
+    run.currentStep = 'runtime_scaffold_cancelled';
+    run.checkpoints.push(createCheckpoint('cancel', 'Cancelled by user request'));
+    session.agentRun = run;
+    session.updatedAt = Date.now();
+    bridge.sessions.set(sessionId, session);
+
+    return {
+        sessionId,
+        message: 'Agent runtime cancelled.',
+        run,
     };
 }
 
@@ -569,17 +984,28 @@ async function handleSemanticPlan(
     bridge.sessions.set(sessionId, session);
 
     const model = await selectChatModel();
-    const decision = await decideSemanticPlan(model, prompt, promptContext, workspaceContext.files, payload.currentProject ?? null);
+    const decision = await decideSemanticPlan(
+        model,
+        prompt,
+        promptContext,
+        workspaceContext.files,
+        payload.currentProject ?? null,
+        runtimeConfigForMode('plan'),
+    );
 
     if (decision) {
         return decision;
     }
 
     return {
-        status: 'unsupported',
+        decision: 'clarify',
         message: '当前还不能稳定判断这句话对应的 VS Code 动作，请补充目标项目、文件或预期结果。',
         summary: 'semantic planner could not classify the request',
+        summaryForUser: '还需要更多上下文才能安全决定下一步。',
+        confidence: null,
+        risk: 'unknown',
         actions: [],
+        options: [],
     };
 }
 
@@ -613,7 +1039,123 @@ function createSession(): SessionState {
         ],
         recentUserPrompts: [],
         recentWorkspaceFiles: [],
+        runtimeArtifactSnapshots: {},
         updatedAt: Date.now(),
+    };
+}
+
+function runtimeConfigForMode(mode: AgentRunMode): AgentRuntimeConfig {
+    if (mode === 'ask') {
+        return {
+            mode,
+            maxIterations: 3,
+            maxToolCalls: 2,
+            maxWriteOperations: 0,
+            allowWriteTools: false,
+            allowTestTool: false,
+            summaryLabel: 'Ask runtime',
+        };
+    }
+
+    if (mode === 'plan') {
+        return {
+            mode,
+            maxIterations: 2,
+            maxToolCalls: 1,
+            maxWriteOperations: 0,
+            allowWriteTools: false,
+            allowTestTool: false,
+            summaryLabel: 'Plan runtime',
+        };
+    }
+
+    return {
+        mode,
+        maxIterations: 12,
+        maxToolCalls: 24,
+        maxWriteOperations: 6,
+        allowWriteTools: true,
+        allowTestTool: true,
+        summaryLabel: 'Agent runtime',
+    };
+}
+
+function createAgentRunState(
+    sessionId: string,
+    prompt: string,
+    currentProject: string | null,
+    config: AgentRuntimeConfig,
+): AgentRunState {
+    const now = Date.now();
+    const runId = `${sessionId}-${now}`;
+    const scopeSuffix = currentProject ? ` in ${currentProject}` : '';
+
+    return {
+        runId,
+        mode: config.mode,
+        status: 'initialized',
+        summary: `${config.summaryLabel} created for ${summarize(prompt)}${scopeSuffix}`,
+        currentAction: `Initialized ${config.summaryLabel.toLowerCase()} and persisted the initial goal`,
+        nextAction: 'The configured runtime loop will start immediately.',
+        currentStep: 'initialized',
+        authorizationPolicy: {
+            requireWriteApproval: config.allowWriteTools,
+            requireShellApproval: true,
+            requireDestructiveApproval: true,
+            allowBypassForSession: false,
+        },
+        resultDisposition: 'pending',
+        pendingUserDecision: undefined,
+        budget: {
+            maxIterations: config.maxIterations,
+            maxToolCalls: config.maxToolCalls,
+            maxWriteOperations: config.maxWriteOperations,
+        },
+        checkpoints: [
+            {
+                checkpointId: `initialized-${now}`,
+                label: 'initialized',
+                statusSummary: `Created ${config.summaryLabel.toLowerCase()} for ${summarize(prompt)}`,
+                timestampMs: now,
+            },
+        ],
+        reversibleArtifacts: [],
+    };
+}
+
+function getAgentSession(bridge: BridgeContext, sessionId: string): SessionState {
+    const session = bridge.sessions.get(sessionId);
+    if (!session) {
+        throw new Error(`Unknown sessionId: ${sessionId}`);
+    }
+    return session;
+}
+
+function assertAgentRun(session: SessionState, runId: string): AgentRunState {
+    const run = session.agentRun;
+    if (!run || run.runId !== runId) {
+        throw new Error(`Unknown runId: ${runId}`);
+    }
+
+    return {
+        ...run,
+        checkpoints: [...run.checkpoints],
+        reversibleArtifacts: [...run.reversibleArtifacts],
+        pendingUserDecision: run.pendingUserDecision
+            ? {
+                ...run.pendingUserDecision,
+                options: [...run.pendingUserDecision.options],
+            }
+            : undefined,
+    };
+}
+
+function createCheckpoint(label: string, statusSummary: string): RunCheckpoint {
+    return {
+        checkpointId: `${label}-${Date.now()}`,
+        label,
+        statusSummary,
+        timestampMs: Date.now(),
     };
 }
 
@@ -667,18 +1209,26 @@ async function decideSemanticPlan(
     promptContext: string,
     relatedFiles: string[],
     currentProject: string | null,
+    config: AgentRuntimeConfig,
 ): Promise<SemanticPlanResponse | null> {
     const plannerPrompt = [
         'You are the semantic planning layer for a Feishu -> VS Code local agent bridge.',
-        'Your job is to convert arbitrary natural language into executable VS Code actions.',
-        'Return JSON only with this shape: {"status":"planned"|"clarify"|"unsupported","message":"...","summary":"...","actions":[{"name":"...","args":{...}}]}.',
-        'Use status=planned only when you can map the request to one or more concrete actions from the supported action set.',
-        'Use status=clarify when the request is actionable but missing a required target such as a path, file, repo, or intended operation.',
-        'Use status=unsupported when the request should not execute directly and should instead be handled later by a richer agent path.',
+        `Current runtime mode: ${config.mode}.`,
+        'Your job is to convert arbitrary natural language into a structured routing decision for the bridge.',
+        'Return JSON only with this shape: {"decision":"execute"|"confirm"|"clarify","message":"...","summary":"...","summaryForUser":"...","confidence":0.0,"risk":"low"|"medium"|"high"|"unknown","actions":[{"name":"...","args":{...}}],"options":[{"label":"...","command":"...","note":"...","primary":true|false}]}.',
+        'Use decision=execute only for high-confidence, low-risk requests that map cleanly to one or more concrete supported actions.',
+        'Use decision=confirm for ambiguous, medium-risk, or high-risk requests where the user should choose among candidate actions before anything executes.',
+        'Use decision=clarify when the request is missing required information such as a path, file, repo, or intended outcome.',
         'Prefer deterministic project/git/navigation actions when the user is clearly asking for project selection, browsing, current project, git status, git sync, git pull, or git push.',
-        'For general coding work like analyzing code, fixing bugs, continuing unfinished work, checking README/docs, or implementing changes, prefer a single ask_agent action with the original prompt.',
+        'For general coding work like analyzing code, fixing bugs, continuing unfinished work, checking README/docs, or implementing changes, do not force a single direct execution action when the user intent is broad or risky. Prefer decision=confirm with safe candidate commands, or decision=clarify if the target is missing.',
+        'Important: phrases like “把本地改动同步到 GitHub 上” or “同步到 github” are ambiguous. Do not map them directly to git pull. Prefer decision=confirm with candidates such as git push, git push with auto-commit, and git status.',
+        'Important: requests like “帮我修一下这个问题”, “把这个改了然后提交”, or “继续把没完成的工作做完” should usually be decision=confirm unless the scope is already narrow and explicitly safe.',
         'Do not emit shell, apply_patch, write_file, install_extension, or uninstall_extension actions in this planner.',
-        'If the request combines multiple clear operations, you may return multiple actions in sequence.',
+        'Plan mode is a restricted runtime configuration. Keep the output focused on planning, confirmation, clarification, or narrowly scoped read-only execution.',
+        'If the request combines multiple clear operations and is still low-risk, you may return multiple actions in sequence for decision=execute.',
+        'For decision=confirm, prefer options that use existing explicit bridge commands in the command field, for example: "git push", "git push auto commit via feishu-bridge", "同步 Git 状态", "问 Copilot 分析这个问题并给出最小修复建议".',
+        'Set summaryForUser to a concise Chinese sentence suitable for a confirmation card header/body.',
+        'Set confidence to a number between 0 and 1.',
         'Supported actions and args:',
         '- ask_agent {"prompt":"string"}',
         '- continue_agent {"prompt":"optional string"}',
@@ -738,25 +1288,47 @@ function parseSemanticPlanDecision(raw: string, originalPrompt: string): Semanti
 
     try {
         const parsed = JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>;
-        const rawStatus = parsed.status === 'planned' || parsed.status === 'clarify' ? parsed.status : 'unsupported';
+        const rawDecision = parsed.decision === 'execute' || parsed.decision === 'confirm' || parsed.decision === 'clarify'
+            ? parsed.decision
+            : 'clarify';
         const actions = Array.isArray(parsed.actions)
             ? parsed.actions
                 .map(sanitizeSemanticAction)
                 .filter((value): value is SemanticPlannedAction => value !== null)
             : [];
+        const options = Array.isArray(parsed.options)
+            ? parsed.options
+                .map(sanitizeSemanticConfirmOption)
+                .filter((value): value is SemanticConfirmOption => value !== null)
+            : [];
         const message = typeof parsed.message === 'string' && parsed.message.trim()
             ? parsed.message.trim()
-            : defaultSemanticPlannerMessage(rawStatus, originalPrompt);
+            : defaultSemanticPlannerMessage(rawDecision, originalPrompt);
         const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
             ? parsed.summary.trim()
             : summarize(message);
-        const status = rawStatus === 'planned' && actions.length === 0 ? 'unsupported' : rawStatus;
+        const summaryForUser = typeof parsed.summaryForUser === 'string' && parsed.summaryForUser.trim()
+            ? parsed.summaryForUser.trim()
+            : summary;
+        const confidence = typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
+            ? Math.max(0, Math.min(1, parsed.confidence))
+            : null;
+        const risk = sanitizeSemanticRisk(parsed.risk);
+        const decision = rawDecision === 'execute' && actions.length === 0
+            ? 'clarify'
+            : rawDecision === 'confirm' && options.length === 0
+                ? 'clarify'
+                : rawDecision;
 
         return {
-            status,
+            decision,
             message,
             summary,
-            actions: status === 'planned' ? actions : [],
+            summaryForUser,
+            confidence,
+            risk,
+            actions: decision === 'execute' ? actions : [],
+            options: decision === 'confirm' ? options : [],
         };
     } catch {
         return null;
@@ -781,16 +1353,45 @@ function sanitizeSemanticAction(value: unknown): SemanticPlannedAction | null {
     return { name, args };
 }
 
-function defaultSemanticPlannerMessage(status: 'planned' | 'clarify' | 'unsupported', originalPrompt: string): string {
-    if (status === 'planned') {
+function sanitizeSemanticConfirmOption(value: unknown): SemanticConfirmOption | null {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+
+    const candidate = value as Record<string, unknown>;
+    const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
+    const command = typeof candidate.command === 'string' ? candidate.command.trim() : '';
+    if (!label || !command) {
+        return null;
+    }
+
+    const note = typeof candidate.note === 'string' ? candidate.note.trim() : '';
+    const primary = candidate.primary === true;
+    return { label, command, note, primary };
+}
+
+function sanitizeSemanticRisk(value: unknown): 'low' | 'medium' | 'high' | 'unknown' {
+    if (value === 'low' || value === 'medium' || value === 'high') {
+        return value;
+    }
+
+    return 'unknown';
+}
+
+function defaultSemanticPlannerMessage(decision: 'execute' | 'confirm' | 'clarify', originalPrompt: string): string {
+    if (decision === 'execute') {
         return `已将这句自然语言映射为可执行动作: ${originalPrompt}`;
     }
 
-    if (status === 'clarify') {
+    if (decision === 'confirm') {
+        return '这句话存在歧义或执行风险，建议先确认要采取的动作。';
+    }
+
+    if (decision === 'clarify') {
         return '还需要更具体的目标，例如项目路径、文件路径、仓库或预期结果。';
     }
 
-    return '当前还不能稳定把这句自然语言映射为现有动作。';
+    return '还需要更具体的目标，例如项目路径、文件路径、仓库或预期结果。';
 }
 
 async function decideAgentAction(
@@ -798,16 +1399,28 @@ async function decideAgentAction(
     prompt: string,
     promptContext: string,
     relatedFiles: string[],
+    config: AgentRuntimeConfig,
 ): Promise<AgentPlannerDecision | null> {
     const plannerPrompt = [
-        'You are planning the next step for a coding agent that can perform at most one read-only tool call before answering.',
-        'Return JSON only with this shape: {"status":"answered"|"needs_tool","message":"...","summary":"...","currentAction":"...","nextAction":"...","relatedFiles":["..."],"toolRequest":null|{"name":"read_file"|"search_text","args":{...},"summary":"..."}}.',
-        'Only choose needs_tool when the answer depends on repository code that is still missing from the current context.',
+        `Current runtime mode: ${config.mode}.`,
+        'You are planning the next step for a coding agent that can perform at most one tool call before replanning or answering.',
+        'Return JSON only with this shape: {"status":"answered"|"needs_tool","message":"...","summary":"...","currentAction":"...","nextAction":"...","relatedFiles":["..."],"toolRequest":null|{"name":"read_file"|"search_text"|"run_tests"|"write_file"|"apply_patch","args":{},"summary":"..."}}.',
+        'Choose needs_tool when the answer depends on repository inspection, validation, or a narrowly scoped code change that is still missing from the current context.',
         'Prefer search_text before read_file unless you already know the exact file to inspect.',
         'When using read_file with line numbers, always provide both startLine and endLine.',
         'Keep read_file ranges focused and no longer than 200 lines.',
         'Use read_file args: {"path":"relative/or/absolute","startLine":number,"endLine":number}.',
         'Use search_text args: {"query":"text","path":"optional/path","isRegex":false}.',
+        config.allowTestTool
+            ? 'Use run_tests args: {"command":"optional explicit test command"}. Prefer a repo-wide validation command only when it is the smallest safe next check.'
+            : 'Do not request run_tests in this mode.',
+        config.allowWriteTools
+            ? 'Use write_file args: {"path":"relative/or/absolute","content":"full new file content"}. Only use this for small, targeted file writes.'
+            : 'Do not request write_file in this mode.',
+        config.allowWriteTools
+            ? 'Use apply_patch args: {"path":"relative/or/absolute","search":"exact existing text","replace":"new text"}. Only use this for precise targeted replacements.'
+            : 'Do not request apply_patch in this mode.',
+        'Never propose broad rewrites. For write tools, keep changes minimal and localized.',
         relatedFiles.length > 0 ? `Known related files: ${relatedFiles.join(', ')}` : 'Known related files: none yet.',
         'Current context:',
         promptContext || '(no extra context)',
@@ -877,7 +1490,7 @@ function sanitizeToolRequest(value: unknown): AgentToolCall | null {
 
     const record = value as Record<string, unknown>;
     const name = record.name;
-    if (name !== 'read_file' && name !== 'search_text') {
+    if (name !== 'read_file' && name !== 'search_text' && name !== 'run_tests' && name !== 'write_file' && name !== 'apply_patch') {
         return null;
     }
 
@@ -904,6 +1517,54 @@ function sanitizeToolRequest(value: unknown): AgentToolCall | null {
             summary: typeof record.summary === 'string' && record.summary.trim()
                 ? record.summary.trim()
                 : `读取文件 ${path}`,
+        };
+    }
+
+    if (name === 'run_tests') {
+        const sanitizedArgs: Record<string, unknown> = {};
+        if (typeof args.command === 'string' && args.command.trim()) {
+            sanitizedArgs.command = args.command.trim();
+        }
+
+        return {
+            name,
+            args: sanitizedArgs,
+            summary: typeof record.summary === 'string' && record.summary.trim()
+                ? record.summary.trim()
+                : '运行测试以验证当前改动或假设',
+        };
+    }
+
+    if (name === 'write_file') {
+        const path = typeof args.path === 'string' ? args.path.trim() : '';
+        const content = typeof args.content === 'string' ? args.content : '';
+        if (!path) {
+            return null;
+        }
+
+        return {
+            name,
+            args: { path, content },
+            summary: typeof record.summary === 'string' && record.summary.trim()
+                ? record.summary.trim()
+                : `写入文件 ${path}`,
+        };
+    }
+
+    if (name === 'apply_patch') {
+        const path = typeof args.path === 'string' ? args.path.trim() : '';
+        const search = typeof args.search === 'string' ? args.search : '';
+        const replace = typeof args.replace === 'string' ? args.replace : '';
+        if (!path || !search) {
+            return null;
+        }
+
+        return {
+            name,
+            args: { path, search, replace },
+            summary: typeof record.summary === 'string' && record.summary.trim()
+                ? record.summary.trim()
+                : `补丁更新 ${path}`,
         };
     }
 
@@ -1026,7 +1687,7 @@ function buildToolResultPrompt(
     toolResult: ToolResultPayload,
 ): string {
     return [
-        'Continue the current Feishu coding-agent task using the read-only tool result below.',
+        'Continue the current Feishu coding-agent task using the tool result below.',
         'Ground the answer in the provided tool output. If the tool output is still insufficient, say exactly what is missing instead of guessing.',
         'Original task:',
         prompt,
@@ -1050,6 +1711,23 @@ function formatToolRequest(toolRequest: AgentToolCall): string {
         return `read_file(${path})`;
     }
 
+    if (toolRequest.name === 'run_tests') {
+        const command = typeof toolRequest.args.command === 'string' && toolRequest.args.command.trim()
+            ? toolRequest.args.command.trim()
+            : 'default';
+        return `run_tests(${command})`;
+    }
+
+    if (toolRequest.name === 'write_file') {
+        const path = typeof toolRequest.args.path === 'string' ? toolRequest.args.path : '(unknown path)';
+        return `write_file(${path})`;
+    }
+
+    if (toolRequest.name === 'apply_patch') {
+        const path = typeof toolRequest.args.path === 'string' ? toolRequest.args.path : '(unknown path)';
+        return `apply_patch(${path})`;
+    }
+
     const query = typeof toolRequest.args.query === 'string' ? toolRequest.args.query : '(empty query)';
     const path = typeof toolRequest.args.path === 'string' && toolRequest.args.path.trim()
         ? `, path=${toolRequest.args.path}`
@@ -1059,6 +1737,10 @@ function formatToolRequest(toolRequest: AgentToolCall): string {
 }
 
 function extractRelatedFilesFromToolRequest(toolRequest: AgentToolCall): string[] {
+    if (toolRequest.name === 'run_tests') {
+        return [];
+    }
+
     const path = toolRequest.args.path;
     if (typeof path === 'string' && path.trim()) {
         return [path.trim()];
@@ -1105,6 +1787,28 @@ function buildAnsweredTaskState(prompt: string, summary: string, relatedFiles: s
             : '已基于当前会话上下文生成回答',
         resultSummary: summary,
         nextAction: `可以继续追问、要求读取更多代码，或直接基于当前结果推进任务：${prompt.trim()}`,
+        relatedFiles,
+        toolCall: null,
+        toolResultSummary: null,
+    };
+}
+
+function buildTaskStateFromRuntimeRun(prompt: string, run: AgentRunState, relatedFiles: string[]): AgentTaskState {
+    const status: AgentStatus = run.status === 'completed'
+        ? 'answered'
+        : run.status === 'waiting_user'
+            ? 'waiting_user'
+            : run.status === 'failed'
+                ? 'blocked'
+                : run.status === 'cancelled'
+                    ? 'blocked'
+                    : 'working';
+
+    return {
+        status,
+        currentAction: run.currentAction,
+        resultSummary: run.summary,
+        nextAction: run.nextAction || `可以继续推进当前任务：${prompt.trim()}`,
         relatedFiles,
         toolCall: null,
         toolResultSummary: null,
@@ -1404,4 +2108,809 @@ async function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
 
 export function deactivate(): void {
     // Disposable server shutdown is handled through context subscriptions.
+}
+
+async function runAgentRuntimeLoop(
+    bridge: BridgeContext,
+    sessionId: string,
+    session: SessionState,
+    run: AgentRunState,
+    promptOverride: string | null,
+    reason: 'start' | 'continue' | 'approve',
+    config: AgentRuntimeConfig,
+): Promise<AgentRuntimeLoopResult> {
+    const goal = (promptOverride?.trim() || session.currentTask || '').trim();
+    if (!goal) {
+        throw new Error('agent runtime requires a current goal');
+    }
+
+    const model = await selectChatModel();
+    const isFreshRun = run.currentStep === 'initialized';
+
+    if (isFreshRun) {
+        const initialContext = buildAgentRuntimeUserPrompt(goal, session, config);
+        session.messages.push(vscode.LanguageModelChatMessage.User(initialContext));
+    } else if (promptOverride?.trim()) {
+        session.messages.push(vscode.LanguageModelChatMessage.User([
+            'Continue the current autonomous coding task with this new user instruction.',
+            promptOverride.trim(),
+        ].join('\n\n')));
+    }
+
+    trimSessionMessages(session);
+    run.status = 'running';
+    run.pendingUserDecision = undefined;
+    run.currentAction = reason === 'start'
+        ? `Starting the ${config.mode} runtime loop`
+        : reason === 'continue'
+            ? `Continuing the ${config.mode} runtime loop`
+            : 'Resuming after user decision';
+    run.nextAction = 'Planning the next best step.';
+    run.currentStep = 'planning';
+
+    const existingToolSteps = run.checkpoints.filter((checkpoint) => checkpoint.label.startsWith('tool-')).length;
+    const existingWriteSteps = run.checkpoints.filter((checkpoint) => checkpoint.label.startsWith('write-')).length;
+    let toolSteps = existingToolSteps;
+    let writeSteps = existingWriteSteps;
+    let iteration = 0;
+    let finalMessage = run.summary;
+
+    while (iteration < run.budget.maxIterations) {
+        iteration += 1;
+
+        if (session.pendingRuntimeToolRequest) {
+            if (toolSteps >= run.budget.maxToolCalls) {
+                break;
+            }
+
+            const pendingTool = session.pendingRuntimeToolRequest.toolRequest;
+            const isWriteTool = pendingTool.name === 'write_file' || pendingTool.name === 'apply_patch';
+            if (isWriteTool && writeSteps >= run.budget.maxWriteOperations) {
+                break;
+            }
+
+            const toolResult = await executeAgentRuntimeTool(session.pendingRuntimeToolRequest.toolRequest);
+            session.pendingRuntimeToolRequest = undefined;
+            toolSteps += 1;
+            if (isWriteTool) {
+                writeSteps += 1;
+            }
+
+            const relatedFiles = dedupeStrings([
+                ...toolResult.relatedFiles,
+                ...extractRelatedFilesFromToolRequest(pendingTool),
+            ]);
+            rememberRecentWorkspaceFiles(session, relatedFiles);
+
+            if (!toolResult.success) {
+                run.status = 'failed';
+                run.currentAction = `Tool execution failed: ${pendingTool.summary}`;
+                run.nextAction = 'Adjust the task or tool arguments and continue the run.';
+                run.currentStep = 'tool_failed';
+                run.summary = toolResult.summary;
+                run.checkpoints.push(createCheckpoint(`tool-failed-${iteration}`, toolResult.summary));
+                session.agentRun = run;
+                session.updatedAt = Date.now();
+                bridge.sessions.set(sessionId, session);
+                return {
+                    message: toolResult.output,
+                    run,
+                };
+            }
+
+            if (isWriteTool) {
+                const artifactId = `${run.runId}:artifact:${Date.now()}`;
+                run.reversibleArtifacts.push({
+                    artifactId,
+                    kind: pendingTool.name === 'apply_patch' ? 'patch' : 'file_write',
+                    summary: toolResult.summary,
+                    filePaths: relatedFiles,
+                });
+                if (toolResult.artifactSnapshots && toolResult.artifactSnapshots.length > 0) {
+                    session.runtimeArtifactSnapshots[artifactId] = toolResult.artifactSnapshots;
+                }
+                run.checkpoints.push(createCheckpoint(`write-${writeSteps}`, toolResult.summary));
+            } else {
+                run.checkpoints.push(createCheckpoint(`tool-${toolSteps}`, toolResult.summary));
+            }
+
+            session.messages.push(vscode.LanguageModelChatMessage.User(
+                buildToolResultPrompt(goal, pendingTool, toolResult),
+            ));
+            trimSessionMessages(session);
+            run.currentAction = `Executed ${pendingTool.summary}`;
+            run.nextAction = 'Observing the tool result and replanning the next step.';
+            run.currentStep = isWriteTool ? `write_${writeSteps}` : `tool_${toolSteps}`;
+            finalMessage = toolResult.summary;
+            continue;
+        }
+
+        const contextSummary = collectEditorContext();
+        const workspaceContext = await collectWorkspaceContext(goal);
+        const sessionSummary = buildSessionSummary(session);
+        const promptContext = [sessionSummary, contextSummary, workspaceContext.summary]
+            .filter((value) => value && value.trim().length > 0)
+            .join('\n\n');
+
+        rememberRecentWorkspaceFiles(session, workspaceContext.files);
+        const decision = await decideAgentAction(model, goal, promptContext, dedupeStrings([
+            ...session.recentWorkspaceFiles,
+            ...workspaceContext.files,
+        ]), config);
+
+        if (!decision) {
+            run.status = 'failed';
+            run.currentAction = 'Failed to plan the next autonomous step';
+            run.nextAction = 'Try continuing the run with a narrower task or inspect the backend state.';
+            run.currentStep = 'failed';
+            run.summary = 'The runtime could not obtain a valid planning decision from the model.';
+            run.checkpoints.push(createCheckpoint(`failed-${iteration}`, run.summary));
+            session.agentRun = run;
+            session.updatedAt = Date.now();
+            bridge.sessions.set(sessionId, session);
+            return {
+                message: run.summary,
+                run,
+            };
+        }
+
+        run.currentAction = decision.currentAction;
+        run.nextAction = decision.nextAction;
+        run.summary = decision.summary;
+        run.currentStep = `iteration_${iteration}`;
+        run.checkpoints.push(createCheckpoint(`plan-${iteration}`, decision.summary));
+
+        if (decision.status === 'needs_tool' && decision.toolRequest) {
+            if (toolSteps >= run.budget.maxToolCalls) {
+                break;
+            }
+
+            if ((decision.toolRequest.name === 'write_file' || decision.toolRequest.name === 'apply_patch') && writeSteps >= run.budget.maxWriteOperations) {
+                break;
+            }
+
+            const requiresAuthorization = requiresAuthorizationForTool(run, decision.toolRequest, config);
+            if (requiresAuthorization) {
+                session.pendingRuntimeToolRequest = {
+                    prompt: goal,
+                    toolRequest: decision.toolRequest,
+                    requestedAt: Date.now(),
+                };
+                run.status = 'waiting_user';
+                run.currentAction = `Waiting for authorization to execute ${decision.toolRequest.summary}`;
+                run.nextAction = 'Approve the pending tool request to continue, reject it, or cancel the run.';
+                run.currentStep = 'waiting_authorization';
+                run.pendingUserDecision = {
+                    decisionId: `${run.runId}:authorization:${Date.now()}`,
+                    controlKind: 'authorization',
+                    summary: `The agent wants to execute ${formatToolRequest(decision.toolRequest)}. This action can change workspace state and requires approval.`,
+                    options: [
+                        {
+                            optionId: 'approve_tool',
+                            label: 'Approve tool',
+                            note: 'Allow this pending tool call and continue the run.',
+                            primary: true,
+                        },
+                        {
+                            optionId: 'reject_tool',
+                            label: 'Reject tool',
+                            note: 'Do not execute this write action. Keep the run paused.',
+                            primary: false,
+                        },
+                        {
+                            optionId: 'cancel_run',
+                            label: 'Cancel run',
+                            note: 'Stop the current autonomous run entirely.',
+                            primary: false,
+                        },
+                    ],
+                    recommendedOptionId: 'approve_tool',
+                };
+                run.checkpoints.push(createCheckpoint(`authorization-${iteration}`, decision.summary));
+                session.agentRun = run;
+                session.updatedAt = Date.now();
+                bridge.sessions.set(sessionId, session);
+
+                return {
+                    message: decision.message,
+                    run,
+                };
+            }
+
+            const toolResult = await executeAgentRuntimeTool(decision.toolRequest);
+            toolSteps += 1;
+
+            const relatedFiles = dedupeStrings([
+                ...toolResult.relatedFiles,
+                ...extractRelatedFilesFromToolRequest(decision.toolRequest),
+                ...decision.relatedFiles,
+            ]);
+            rememberRecentWorkspaceFiles(session, relatedFiles);
+
+            if (!toolResult.success) {
+                run.status = 'failed';
+                run.currentAction = `Tool execution failed: ${decision.toolRequest.summary}`;
+                run.nextAction = 'Adjust the task or file path and continue the run.';
+                run.currentStep = 'tool_failed';
+                run.summary = toolResult.summary;
+                run.checkpoints.push(createCheckpoint(`tool-failed-${iteration}`, toolResult.summary));
+                session.agentRun = run;
+                session.updatedAt = Date.now();
+                bridge.sessions.set(sessionId, session);
+                return {
+                    message: toolResult.output,
+                    run,
+                };
+            }
+
+            session.messages.push(vscode.LanguageModelChatMessage.User(
+                buildToolResultPrompt(goal, decision.toolRequest, toolResult),
+            ));
+            trimSessionMessages(session);
+            run.currentAction = `Executed ${decision.toolRequest.summary}`;
+            run.nextAction = 'Observing the tool result and replanning the next step.';
+            run.currentStep = `tool_${toolSteps}`;
+            run.checkpoints.push(createCheckpoint(`tool-${toolSteps}`, toolResult.summary));
+            finalMessage = toolResult.summary;
+            continue;
+        }
+
+        const finalText = await sendModelRequest(model, session.messages);
+        const summary = summarize(finalText);
+        session.messages.push(vscode.LanguageModelChatMessage.Assistant(finalText));
+        session.lastResponseSummary = summary;
+        trimSessionMessages(session);
+
+        if (run.reversibleArtifacts.length > 0 && run.resultDisposition === 'pending') {
+            run.status = 'waiting_user';
+            run.currentAction = 'Waiting for result disposition after applying workspace changes';
+            run.nextAction = 'Keep the result, revert the applied changes, or abandon this run result.';
+            run.currentStep = 'waiting_result_disposition';
+            run.summary = summary;
+            run.pendingUserDecision = {
+                decisionId: `${run.runId}:result:${Date.now()}`,
+                controlKind: 'result_disposition',
+                summary: 'This run changed the workspace. Decide whether to keep the result, revert the changes, or abandon this result snapshot.',
+                options: [
+                    {
+                        optionId: 'keep_result',
+                        label: 'Keep result',
+                        note: 'Accept the current workspace changes and keep this run result.',
+                        primary: true,
+                    },
+                    {
+                        optionId: 'revert_result',
+                        label: 'Revert result',
+                        note: 'Restore the previous file contents recorded before this run wrote to the workspace.',
+                        primary: false,
+                    },
+                    {
+                        optionId: 'abandon_result',
+                        label: 'Abandon result',
+                        note: 'Do not keep relying on this result snapshot. Leave the run completed without accepting it.',
+                        primary: false,
+                    },
+                ],
+                recommendedOptionId: 'keep_result',
+            };
+            run.checkpoints.push(createCheckpoint(`result-disposition-${iteration}`, summary));
+            session.agentRun = run;
+            session.updatedAt = Date.now();
+            bridge.sessions.set(sessionId, session);
+
+            return {
+                message: finalText,
+                run,
+            };
+        }
+
+        run.status = 'completed';
+        run.currentAction = `Completed the ${config.mode} runtime loop`;
+        run.nextAction = config.mode === 'ask'
+            ? 'You can ask a follow-up question or continue the same task with a narrower instruction.'
+            : 'You can continue the run with a follow-up request, or start a new agent task.';
+        run.currentStep = 'completed';
+        run.summary = summary;
+        run.checkpoints.push(createCheckpoint(`completed-${iteration}`, summary));
+        session.agentRun = run;
+        session.updatedAt = Date.now();
+        bridge.sessions.set(sessionId, session);
+
+        return {
+            message: finalText,
+            run,
+        };
+    }
+
+    run.status = 'waiting_user';
+    run.currentAction = 'Reached the current loop budget';
+    run.nextAction = 'Approve the pacing decision to continue, or cancel the run.';
+    run.currentStep = 'waiting_user';
+    run.summary = 'The agent paused after exhausting the current planning, tool, or write budget.';
+    run.pendingUserDecision = {
+        decisionId: `${run.runId}:pacing:${Date.now()}`,
+        controlKind: 'pacing',
+        summary: 'The run reached its current budget. Continue for another batch, or stop here.',
+        options: [
+            {
+                optionId: 'continue_run',
+                label: 'Continue run',
+                note: 'Allow another batch of autonomous planning, validation, and controlled execution.',
+                primary: true,
+            },
+            {
+                optionId: 'cancel_run',
+                label: 'Stop here',
+                note: 'Cancel this run and keep the current state snapshot.',
+                primary: false,
+            },
+        ],
+        recommendedOptionId: 'continue_run',
+    };
+    run.checkpoints.push(createCheckpoint('waiting-user', run.summary));
+    session.agentRun = run;
+    session.updatedAt = Date.now();
+    bridge.sessions.set(sessionId, session);
+
+    return {
+        message: finalMessage || run.summary,
+        run,
+    };
+}
+
+function buildAgentRuntimeUserPrompt(goal: string, session: SessionState, config: AgentRuntimeConfig): string {
+    const sessionSummary = buildSessionSummary(session);
+    return [
+        `You are running the ${config.mode} mode of an autonomous coding loop for a Feishu remote agent bridge.`,
+        'Stay grounded in repository context. Use the planning/tool loop to inspect code before answering when needed.',
+        config.allowWriteTools
+            ? 'You may request read_file, search_text, run_tests, write_file, or apply_patch. Write actions must be narrowly scoped and will require explicit approval before execution.'
+            : config.allowTestTool
+                ? 'You may request read_file, search_text, and run_tests. Do not request write_file or apply_patch in this mode.'
+                : 'You may request read_file and search_text only. Do not request run_tests, write_file, or apply_patch in this mode.',
+        sessionSummary || '',
+        'Current autonomous task:',
+        goal,
+    ]
+        .filter((value) => value && value.trim().length > 0)
+        .join('\n\n');
+}
+
+async function executeAgentRuntimeTool(toolRequest: AgentToolCall): Promise<ToolResultPayload> {
+    if (toolRequest.name === 'read_file') {
+        return executeReadFileTool(toolRequest);
+    }
+
+    if (toolRequest.name === 'search_text') {
+        return executeSearchTextTool(toolRequest);
+    }
+
+    if (toolRequest.name === 'run_tests') {
+        return executeRunTestsTool(toolRequest);
+    }
+
+    if (toolRequest.name === 'write_file') {
+        return executeWriteFileTool(toolRequest);
+    }
+
+    return executeApplyPatchTool(toolRequest);
+}
+
+function requiresAuthorizationForTool(run: AgentRunState, toolRequest: AgentToolCall, config: AgentRuntimeConfig): boolean {
+    const policy = run.authorizationPolicy;
+    if (!policy) {
+        return false;
+    }
+
+    if (!config.allowWriteTools && (toolRequest.name === 'write_file' || toolRequest.name === 'apply_patch')) {
+        return true;
+    }
+
+    if ((toolRequest.name === 'write_file' || toolRequest.name === 'apply_patch') && policy.requireWriteApproval) {
+        return true;
+    }
+
+    if (toolRequest.name === 'run_tests' && policy.requireShellApproval) {
+        return false;
+    }
+
+    return false;
+}
+
+async function executeReadFileTool(toolRequest: AgentToolCall): Promise<ToolResultPayload> {
+    const path = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim() : '';
+    if (!path) {
+        return {
+            success: false,
+            output: 'read_file tool requires a path',
+            summary: 'Missing file path for read_file tool.',
+            relatedFiles: [],
+        };
+    }
+
+    const target = await resolveWorkspaceFile(path);
+    if (!target) {
+        return {
+            success: false,
+            output: `Unable to resolve file path: ${path}`,
+            summary: `Could not resolve file path ${path}.`,
+            relatedFiles: [],
+        };
+    }
+
+    try {
+        const raw = await vscode.workspace.fs.readFile(target);
+        const text = Buffer.from(raw).toString('utf8');
+        const lines = text.split(/\r?\n/);
+        const lineRange = normalizeReadFileRange(toolRequest.args);
+        const startLine = lineRange?.startLine ?? 1;
+        const endLine = Math.min(lineRange?.endLine ?? Math.min(lines.length, DEFAULT_READ_FILE_LINE_SPAN), lines.length);
+        const excerpt = lines
+            .slice(startLine - 1, endLine)
+            .map((line, index) => `${startLine + index}: ${line}`)
+            .join('\n');
+        const relativePath = vscode.workspace.asRelativePath(target, false);
+
+        return {
+            success: true,
+            output: [`File: ${target.fsPath}`, `Lines: ${startLine}-${endLine} / ${lines.length}`, '', excerpt].join('\n'),
+            summary: `Read ${relativePath} lines ${startLine}-${endLine}.`,
+            relatedFiles: [relativePath],
+        };
+    } catch (error) {
+        return {
+            success: false,
+            output: error instanceof Error ? error.message : String(error),
+            summary: `Failed to read ${path}.`,
+            relatedFiles: [],
+        };
+    }
+}
+
+async function executeSearchTextTool(toolRequest: AgentToolCall): Promise<ToolResultPayload> {
+    const query = typeof toolRequest.args.query === 'string' ? toolRequest.args.query.trim() : '';
+    const pathScope = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim() : '';
+    if (!query) {
+        return {
+            success: false,
+            output: 'search_text tool requires a query',
+            summary: 'Missing query for search_text tool.',
+            relatedFiles: [],
+        };
+    }
+
+    const files = await vscode.workspace.findFiles(WORKSPACE_FILE_GLOB, WORKSPACE_EXCLUDE_GLOB, 200);
+    const matches: string[] = [];
+    const relatedFiles: string[] = [];
+    const regex = toolRequest.args.isRegex === true ? new RegExp(query, 'i') : null;
+    const lowered = query.toLowerCase();
+
+    for (const file of files) {
+        if (matches.length >= 20) {
+            break;
+        }
+
+        const relativePath = vscode.workspace.asRelativePath(file, false);
+        if (pathScope && !relativePath.replace(/\\/g, '/').includes(pathScope.replace(/\\/g, '/'))) {
+            continue;
+        }
+
+        try {
+            const stat = await vscode.workspace.fs.stat(file);
+            if (stat.size > MAX_FILE_BYTES) {
+                continue;
+            }
+
+            const raw = await vscode.workspace.fs.readFile(file);
+            const text = Buffer.from(raw).toString('utf8');
+            const lines = text.split(/\r?\n/);
+
+            for (let index = 0; index < lines.length; index += 1) {
+                const line = lines[index] ?? '';
+                const matched = regex ? regex.test(line) : line.toLowerCase().includes(lowered);
+                if (!matched) {
+                    continue;
+                }
+
+                if (!relatedFiles.includes(relativePath)) {
+                    relatedFiles.push(relativePath);
+                }
+                matches.push(`${relativePath}:${index + 1}: ${line}`);
+                if (matches.length >= 20) {
+                    break;
+                }
+            }
+        } catch {
+            // Best-effort search; unreadable files are skipped.
+        }
+    }
+
+    if (matches.length === 0) {
+        return {
+            success: true,
+            output: `No matches found for ${query}.`,
+            summary: `No matches found for ${query}.`,
+            relatedFiles: [],
+        };
+    }
+
+    return {
+        success: true,
+        output: matches.join('\n'),
+        summary: `Found ${matches.length} matches for ${query}.`,
+        relatedFiles,
+    };
+}
+
+async function resolveWorkspaceFile(path: string): Promise<vscode.Uri | null> {
+    if (!path.trim()) {
+        return null;
+    }
+
+    if (/^[A-Za-z]:[\\/]/.test(path) || path.startsWith('/')) {
+        return vscode.Uri.file(path);
+    }
+
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    for (const folder of folders) {
+        const candidate = vscode.Uri.joinPath(folder.uri, ...path.replace(/\\/g, '/').split('/').filter(Boolean));
+        try {
+            await vscode.workspace.fs.stat(candidate);
+            return candidate;
+        } catch {
+            // Try next folder.
+        }
+    }
+
+    const basename = nodePath.basename(path.replace(/\\/g, '/'));
+    if (!basename) {
+        return null;
+    }
+
+    const matches = await vscode.workspace.findFiles(`**/${basename}`, WORKSPACE_EXCLUDE_GLOB, 5);
+    return matches[0] ?? null;
+}
+
+async function executeRunTestsTool(toolRequest: AgentToolCall): Promise<ToolResultPayload> {
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+        return {
+            success: false,
+            output: 'run_tests requires an open workspace folder',
+            summary: 'No workspace folder is available for run_tests.',
+            relatedFiles: [],
+        };
+    }
+
+    const command = typeof toolRequest.args.command === 'string' && toolRequest.args.command.trim()
+        ? toolRequest.args.command.trim()
+        : await detectDefaultTestCommand(folder.uri);
+    if (!command) {
+        return {
+            success: false,
+            output: 'Unable to infer a default test command. Provide args.command explicitly.',
+            summary: 'Could not determine how to run tests for this workspace.',
+            relatedFiles: [],
+        };
+    }
+
+    try {
+        const { stdout, stderr } = await execAsync(command, {
+            cwd: folder.uri.fsPath,
+            windowsHide: true,
+            timeout: 120000,
+            maxBuffer: 1024 * 1024,
+        });
+        const output = [stdout.trim(), stderr.trim()].filter((value) => value.length > 0).join('\n\n');
+        return {
+            success: true,
+            output: output || `(Command completed successfully: ${command})`,
+            summary: `Ran tests with \"${command}\" successfully.`,
+            relatedFiles: [],
+        };
+    } catch (error) {
+        const execError = error as { stdout?: string; stderr?: string; message?: string };
+        const output = [execError.stdout?.trim(), execError.stderr?.trim(), execError.message?.trim()]
+            .filter((value): value is string => Boolean(value && value.length > 0))
+            .join('\n\n');
+        return {
+            success: false,
+            output: output || `Test command failed: ${command}`,
+            summary: `Running tests with \"${command}\" failed.`,
+            relatedFiles: [],
+        };
+    }
+}
+
+async function executeWriteFileTool(toolRequest: AgentToolCall): Promise<ToolResultPayload> {
+    const targetPath = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim() : '';
+    const content = typeof toolRequest.args.content === 'string' ? toolRequest.args.content : null;
+    if (!targetPath || content === null) {
+        return {
+            success: false,
+            output: 'write_file requires args.path and args.content',
+            summary: 'Missing path or content for write_file.',
+            relatedFiles: [],
+        };
+    }
+
+    const target = await resolveWritableWorkspaceFile(targetPath);
+    if (!target) {
+        return {
+            success: false,
+            output: `Unable to resolve writable file path: ${targetPath}`,
+            summary: `Could not resolve writable file path ${targetPath}.`,
+            relatedFiles: [],
+        };
+    }
+
+    let previousContent = '';
+    let existed = false;
+    try {
+        const existing = await vscode.workspace.fs.readFile(target);
+        previousContent = Buffer.from(existing).toString('utf8');
+        existed = true;
+    } catch {
+        existed = false;
+    }
+
+    await vscode.workspace.fs.writeFile(target, Buffer.from(content, 'utf8'));
+    const relativePath = vscode.workspace.asRelativePath(target, false);
+    return {
+        success: true,
+        output: `Wrote ${content.length} characters to ${relativePath}.`,
+        summary: `Updated ${relativePath}.`,
+        relatedFiles: [relativePath],
+        artifactSnapshots: [
+            {
+                path: relativePath,
+                existed,
+                previousContent,
+            },
+        ],
+    };
+}
+
+async function executeApplyPatchTool(toolRequest: AgentToolCall): Promise<ToolResultPayload> {
+    const targetPath = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim() : '';
+    const search = typeof toolRequest.args.search === 'string' ? toolRequest.args.search : null;
+    const replace = typeof toolRequest.args.replace === 'string' ? toolRequest.args.replace : null;
+    if (!targetPath || search === null || replace === null) {
+        return {
+            success: false,
+            output: 'apply_patch requires args.path, args.search, and args.replace',
+            summary: 'Missing patch arguments for apply_patch.',
+            relatedFiles: [],
+        };
+    }
+
+    const target = await resolveWorkspaceFile(targetPath);
+    if (!target) {
+        return {
+            success: false,
+            output: `Unable to resolve file path: ${targetPath}`,
+            summary: `Could not resolve file path ${targetPath}.`,
+            relatedFiles: [],
+        };
+    }
+
+    const raw = await vscode.workspace.fs.readFile(target);
+    const current = Buffer.from(raw).toString('utf8');
+    if (!current.includes(search)) {
+        return {
+            success: false,
+            output: 'apply_patch search text was not found in the target file',
+            summary: `Patch anchor was not found in ${targetPath}.`,
+            relatedFiles: [],
+        };
+    }
+
+    const updated = current.replace(search, replace);
+    await vscode.workspace.fs.writeFile(target, Buffer.from(updated, 'utf8'));
+    const relativePath = vscode.workspace.asRelativePath(target, false);
+    return {
+        success: true,
+        output: `Applied a targeted replacement in ${relativePath}.`,
+        summary: `Patched ${relativePath}.`,
+        relatedFiles: [relativePath],
+        artifactSnapshots: [
+            {
+                path: relativePath,
+                existed: true,
+                previousContent: current,
+            },
+        ],
+    };
+}
+
+async function revertRuntimeArtifacts(
+    session: SessionState,
+    run: AgentRunState,
+): Promise<{ success: boolean; summary: string }> {
+    const snapshots = run.reversibleArtifacts.flatMap((artifact) => session.runtimeArtifactSnapshots[artifact.artifactId] ?? []);
+    if (snapshots.length === 0) {
+        return {
+            success: false,
+            summary: 'No local artifact snapshots were available to revert this runtime result.',
+        };
+    }
+
+    for (const snapshot of snapshots.reverse()) {
+        const target = await resolveWritableWorkspaceFile(snapshot.path);
+        if (!target) {
+            return {
+                success: false,
+                summary: `Failed to resolve ${snapshot.path} while reverting the runtime result.`,
+            };
+        }
+
+        if (!snapshot.existed) {
+            try {
+                await vscode.workspace.fs.delete(target);
+            } catch {
+                // Ignore missing file during cleanup.
+            }
+            continue;
+        }
+
+        await vscode.workspace.fs.writeFile(target, Buffer.from(snapshot.previousContent, 'utf8'));
+    }
+
+    for (const artifact of run.reversibleArtifacts) {
+        delete session.runtimeArtifactSnapshots[artifact.artifactId];
+    }
+
+    return {
+        success: true,
+        summary: `Reverted ${snapshots.length} recorded file snapshot(s) from the current runtime result.`,
+    };
+}
+
+async function resolveWritableWorkspaceFile(targetPath: string): Promise<vscode.Uri | null> {
+    const resolved = await resolveWorkspaceFile(targetPath);
+    if (resolved) {
+        return resolved;
+    }
+
+    if (/^[A-Za-z]:[\\/]/.test(targetPath) || targetPath.startsWith('/')) {
+        return vscode.Uri.file(targetPath);
+    }
+
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) {
+        return null;
+    }
+
+    const parts = targetPath.replace(/\\/g, '/').split('/').filter(Boolean);
+    return vscode.Uri.joinPath(folder.uri, ...parts);
+}
+
+async function detectDefaultTestCommand(folder: vscode.Uri): Promise<string | null> {
+    const packageJson = vscode.Uri.joinPath(folder, 'package.json');
+    const cargoToml = vscode.Uri.joinPath(folder, 'Cargo.toml');
+    const pyprojectToml = vscode.Uri.joinPath(folder, 'pyproject.toml');
+    const pytestIni = vscode.Uri.joinPath(folder, 'pytest.ini');
+
+    if (await pathExists(cargoToml)) {
+        return 'cargo test';
+    }
+
+    if (await pathExists(packageJson)) {
+        return 'npm test';
+    }
+
+    if (await pathExists(pyprojectToml) || await pathExists(pytestIni)) {
+        return 'pytest';
+    }
+
+    return null;
+}
+
+async function pathExists(target: vscode.Uri): Promise<boolean> {
+    try {
+        await vscode.workspace.fs.stat(target);
+        return true;
+    } catch {
+        return false;
+    }
 }

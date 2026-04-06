@@ -4,6 +4,7 @@ use crate::bridge::BridgeResponse;
 use crate::plan::PlanProgress;
 use crate::reply;
 use crate::session::StoredSession;
+use crate::vscode;
 use crate::ApprovalPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,669 @@ pub struct DirectoryChoice {
     pub label: String,
     pub path: String,
     pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticConfirmChoice {
+    pub label: String,
+    pub command: String,
+    pub note: Option<String>,
+    pub is_primary: bool,
+}
+
+pub fn format_semantic_plan_reply(
+    task_text: &str,
+    decision: &str,
+    summary_for_user: &str,
+    message: &str,
+    action_lines: &[String],
+    choices: &[SemanticConfirmChoice],
+    confidence: Option<f32>,
+    risk: Option<&str>,
+) -> BridgeResponse {
+    let template = match decision.trim().to_ascii_lowercase().as_str() {
+        "confirm" => "orange",
+        "clarify" => "red",
+        _ => "blue",
+    };
+
+    let mut fallback_lines = vec![format!("🧭 Plan 模式\n\n任务: {}", task_text.trim())];
+    fallback_lines.push(format!("结果: {}", summary_for_user.trim()));
+    if !message.trim().is_empty() && message.trim() != summary_for_user.trim() {
+        fallback_lines.push(message.trim().to_string());
+    }
+    if !action_lines.is_empty() {
+        fallback_lines.push(format!("候选动作:\n{}", action_lines.join("\n")));
+    }
+
+    let mut elements = vec![json!({
+        "tag": "div",
+        "fields": [
+            {
+                "is_short": true,
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**任务**\n{}", task_text.trim())
+                }
+            },
+            {
+                "is_short": true,
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**决策**\n{}", decision)
+                }
+            }
+        ]
+    })];
+
+    elements.push(json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": format!("**规划摘要**\n{}", summary_for_user.trim())
+        }
+    }));
+
+    if !message.trim().is_empty() && message.trim() != summary_for_user.trim() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**说明**\n{}", message.trim())
+            }
+        }));
+    }
+
+    let mut meta_fields = Vec::new();
+    if let Some(risk) = risk_label(risk) {
+        meta_fields.push(json!({
+            "is_short": true,
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**风险**\n{}", risk)
+            }
+        }));
+    }
+    if let Some(confidence_label) = confidence_label(confidence) {
+        meta_fields.push(json!({
+            "is_short": true,
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**置信度**\n{}", confidence_label)
+            }
+        }));
+    }
+    if !meta_fields.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "fields": meta_fields
+        }));
+    }
+
+    if !action_lines.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**候选动作**\n{}", action_lines.join("\n"))
+            }
+        }));
+    }
+
+    if !choices.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**可选下一步**"
+            }
+        }));
+
+        for chunk in choices.chunks(3) {
+            let actions = chunk
+                .iter()
+                .map(|choice| {
+                    let mut action = json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": choice.label
+                        },
+                        "value": {
+                            "command": choice.command
+                        }
+                    });
+
+                    if choice.is_primary {
+                        action["type"] = json!("primary");
+                    }
+
+                    action
+                })
+                .collect::<Vec<_>>();
+
+            elements.push(json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+    }
+
+    BridgeResponse::Card {
+        fallback_text: fallback_lines.join("\n\n"),
+        card: json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "template": template,
+                "title": {
+                    "tag": "plain_text",
+                    "content": "Plan 模式"
+                }
+            },
+            "elements": elements
+        }),
+    }
+}
+
+pub fn format_agent_reply_card(
+    task_text: &str,
+    action_label: &str,
+    result: &vscode::AgentAskResult,
+) -> BridgeResponse {
+    let fallback_text = reply::format_agent_reply_with_action(task_text, action_label, result);
+    let template = match result.status.trim().to_ascii_lowercase().as_str() {
+        "blocked" => "red",
+        "waiting_user" => "orange",
+        "completed" | "answered" => "green",
+        _ => "blue",
+    };
+
+    let mut elements = vec![json!({
+        "tag": "div",
+        "fields": [
+            {
+                "is_short": true,
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**任务**\n{}", task_text.trim())
+                }
+            },
+            {
+                "is_short": true,
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**上次动作**\n{}", action_label)
+                }
+            },
+            {
+                "is_short": true,
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**状态**\n{}", reply::format_agent_status(&result.status))
+                }
+            }
+        ]
+    })];
+
+    if let Some(current_action) = result.current_action.as_deref().filter(|value| !value.trim().is_empty()) {
+        let summary = result.summary.as_deref().unwrap_or(result.message.as_str()).trim();
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**当前动作**\n{}\n\n**摘要**\n{}", current_action.trim(), summary)
+            }
+        }));
+    }
+
+    if !result.related_files.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**相关文件**\n{}", result.related_files.join("、"))
+            }
+        }));
+    }
+
+    if let Some(tool_call) = result.tool_call.as_deref().filter(|value| !value.trim().is_empty()) {
+        let tool_summary = result.tool_result_summary.as_deref().unwrap_or("");
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**工具动作**\n{}\n\n**工具结果**\n{}", tool_call.trim(), tool_summary.trim())
+            }
+        }));
+    }
+
+    if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**下一步**\n{}", next_action.trim())
+            }
+        }));
+        elements.push(json!({
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "type": "primary",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": "按建议继续"
+                    },
+                    "value": {
+                        "command": "按建议继续"
+                    }
+                }
+            ]
+        }));
+    }
+
+    if let Some(run) = result.run.as_ref().and_then(|run| run.pending_user_decision.as_ref()) {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**待决策**\n{}", run.summary.trim())
+            }
+        }));
+        for chunk in run.options.chunks(3) {
+            let actions = chunk
+                .iter()
+                .map(|option| {
+                    let command = match option.option_id.as_str() {
+                        "keep_result" => "保留 agent 结果".to_string(),
+                        "revert_result" => "回滚 agent 结果".to_string(),
+                        "abandon_result" => "放弃 agent 结果".to_string(),
+                        _ => format!("批准 agent {}", option.option_id),
+                    };
+                    let mut action = json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": option.label
+                        },
+                        "value": {
+                            "command": command
+                        }
+                    });
+                    if option.primary {
+                        action["type"] = json!("primary");
+                    }
+                    action
+                })
+                .collect::<Vec<_>>();
+
+            elements.push(json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+    }
+
+    BridgeResponse::Card {
+        fallback_text,
+        card: json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "template": template,
+                "title": {
+                    "tag": "plain_text",
+                    "content": "Agent 任务更新"
+                }
+            },
+            "elements": elements
+        }),
+    }
+}
+
+pub fn format_agent_run_reply_card(
+    task_text: &str,
+    action_label: &str,
+    result: &vscode::AgentRunResult,
+) -> BridgeResponse {
+    let fallback_text = reply::format_agent_run_reply(task_text, action_label, result);
+    let Some(run) = result.run.as_ref() else {
+        return BridgeResponse::Text(fallback_text);
+    };
+
+    let template = match run.status.as_str() {
+        "failed" => "red",
+        "waiting_user" => "orange",
+        "completed" => "green",
+        "cancelled" => "grey",
+        _ => "blue",
+    };
+
+    let mut elements = vec![
+        json!({
+            "tag": "div",
+            "fields": [
+                {
+                    "is_short": true,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": format!("**任务**\n{}", task_text.trim())
+                    }
+                },
+                {
+                    "is_short": true,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": format!("**上次动作**\n{}", action_label)
+                    }
+                },
+                {
+                    "is_short": true,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": format!("**状态**\n{}", reply::format_agent_run_status(run.status.as_str()))
+                    }
+                },
+                {
+                    "is_short": true,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": format!("**结果处置**\n{}", match run.result_disposition {
+                            crate::agent_runtime::ResultDisposition::Pending => "待决定",
+                            crate::agent_runtime::ResultDisposition::Kept => "已保留",
+                            crate::agent_runtime::ResultDisposition::Reverted => "已回滚",
+                            crate::agent_runtime::ResultDisposition::Abandoned => "已放弃",
+                        })
+                    }
+                }
+            ]
+        }),
+        json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**当前动作**\n{}\n\n**摘要**\n{}", run.current_action.trim(), run.summary.trim())
+            }
+        }),
+    ];
+
+    if !run.next_action.trim().is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**下一步**\n{}", run.next_action.trim())
+            }
+        }));
+    }
+
+    if let Some(decision) = run.pending_user_decision.as_ref() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**待决策**\n{}", decision.summary.trim())
+            }
+        }));
+
+        for chunk in decision.options.chunks(3) {
+            let actions = chunk
+                .iter()
+                .map(|option| {
+                    let command = match option.option_id.as_str() {
+                        "keep_result" => "保留 agent 结果".to_string(),
+                        "revert_result" => "回滚 agent 结果".to_string(),
+                        "abandon_result" => "放弃 agent 结果".to_string(),
+                        _ => format!("批准 agent {}", option.option_id),
+                    };
+                    let mut action = json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": option.label
+                        },
+                        "value": {
+                            "command": command
+                        }
+                    });
+
+                    if option.primary {
+                        action["type"] = json!("primary");
+                    }
+
+                    action
+                })
+                .collect::<Vec<_>>();
+
+            elements.push(json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+    }
+
+    if !run.reversible_artifacts.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!(
+                    "**可回滚产物**\n{}",
+                    run.reversible_artifacts
+                        .iter()
+                        .map(|artifact| artifact.summary.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            }
+        }));
+    }
+
+    BridgeResponse::Card {
+        fallback_text,
+        card: json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "template": template,
+                "title": {
+                    "tag": "plain_text",
+                    "content": "Agent Runtime 更新"
+                }
+            },
+            "elements": elements
+        }),
+    }
+}
+
+pub fn format_semantic_confirm_reply(
+    summary_for_user: &str,
+    message: &str,
+    choices: &[SemanticConfirmChoice],
+    confidence: Option<f32>,
+    risk: Option<&str>,
+) -> BridgeResponse {
+    let mut fallback_lines = vec![format!("🤔 需要先确认\n\n{}", summary_for_user.trim())];
+
+    if !message.trim().is_empty() && message.trim() != summary_for_user.trim() {
+        fallback_lines.push(message.trim().to_string());
+    }
+
+    if let Some(risk) = risk_label(risk) {
+        fallback_lines.push(format!("⚠️ 风险等级: {risk}"));
+    }
+
+    if let Some(confidence_label) = confidence_label(confidence) {
+        fallback_lines.push(format!("🎯 置信度: {confidence_label}"));
+    }
+
+    if !choices.is_empty() {
+        fallback_lines.push("可选动作:".to_string());
+        fallback_lines.extend(choices.iter().map(|choice| {
+            let note = choice
+                .note
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!(" ({})", value.trim()))
+                .unwrap_or_default();
+            format!("- {} -> {}{}", choice.label, choice.command, note)
+        }));
+    }
+
+    let mut elements = vec![json!({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": format!("**解析结果**\n{}", summary_for_user.trim())
+        }
+    })];
+
+    if !message.trim().is_empty() && message.trim() != summary_for_user.trim() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**说明**\n{}", message.trim())
+            }
+        }));
+    }
+
+    let mut meta_fields = Vec::new();
+    if let Some(risk) = risk_label(risk) {
+        meta_fields.push(json!({
+            "is_short": true,
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**风险**\n{}", risk)
+            }
+        }));
+    }
+    if let Some(confidence_label) = confidence_label(confidence) {
+        meta_fields.push(json!({
+            "is_short": true,
+            "text": {
+                "tag": "lark_md",
+                "content": format!("**置信度**\n{}", confidence_label)
+            }
+        }));
+    }
+    if !meta_fields.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "fields": meta_fields
+        }));
+    }
+
+    if !choices.is_empty() {
+        elements.push(json!({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "**候选动作**\n请选择一个更符合你意图的动作。"
+            }
+        }));
+
+        for chunk in choices.chunks(3) {
+            let actions = chunk
+                .iter()
+                .map(|choice| {
+                    let mut action = json!({
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": choice.label
+                        },
+                        "value": {
+                            "command": choice.command
+                        }
+                    });
+
+                    if choice.is_primary {
+                        action["type"] = json!("primary");
+                    }
+
+                    action
+                })
+                .collect::<Vec<_>>();
+
+            elements.push(json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+
+        let note_lines = choices
+            .iter()
+            .filter_map(|choice| {
+                choice.note
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|note| format!("- {}: {}", choice.label, note.trim()))
+            })
+            .collect::<Vec<_>>();
+
+        if !note_lines.is_empty() {
+            elements.push(json!({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**不确定点 / 说明**\n{}", note_lines.join("\n"))
+                }
+            }));
+        }
+    }
+
+    BridgeResponse::Card {
+        fallback_text: fallback_lines.join("\n\n"),
+        card: json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "template": semantic_confirm_template(risk),
+                "title": {
+                    "tag": "plain_text",
+                    "content": "请确认下一步"
+                }
+            },
+            "elements": elements
+        }),
+    }
+}
+
+fn semantic_confirm_template(risk: Option<&str>) -> &'static str {
+    match risk.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "high" => "red",
+        "medium" => "orange",
+        _ => "blue",
+    }
+}
+
+fn risk_label(risk: Option<&str>) -> Option<&'static str> {
+    match risk.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "low" => Some("低"),
+        "medium" => Some("中"),
+        "high" => Some("高"),
+        _ => None,
+    }
+}
+
+fn confidence_label(confidence: Option<f32>) -> Option<&'static str> {
+    let value = confidence?;
+    if value >= 0.85 {
+        Some("高")
+    } else if value >= 0.6 {
+        Some("中")
+    } else if value >= 0.0 {
+        Some("低")
+    } else {
+        None
+    }
 }
 
 pub fn format_project_picker_reply(choices: &[ProjectChoice]) -> BridgeResponse {
@@ -885,9 +1549,15 @@ fn build_follow_up_actions(stored: &StoredSession) -> Vec<serde_json::Value> {
 mod tests {
     use super::*;
 
+    use crate::agent_runtime::{
+        AgentDecisionOption, AgentRunMode, AgentRunState, AgentRunStatus, ControlPointKind,
+        PendingUserDecision, ResultDisposition, ReversibleArtifact, ReversibleArtifactKind,
+        RunBudget, RunCheckpoint,
+    };
     use crate::plan::{ApprovalRequest, ExecutionOutcome};
     use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredSession, StoredSessionKind};
     use crate::Intent;
+    use crate::vscode::AgentRunResult;
 
     fn shell_intent(cmd: &str) -> Intent {
         Intent::RunShell {
@@ -1111,6 +1781,209 @@ mod tests {
                 assert!(card_text.contains("浏览文件夹"));
                 assert!(card_text.contains("点击下面的按钮即可切换项目"));
                 assert!(!card_text.contains("\"type\":\"default\""));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn semantic_confirm_reply_returns_confirmation_card() {
+        let choices = vec![
+            SemanticConfirmChoice {
+                label: "仅推送已提交内容".to_string(),
+                command: "git push".to_string(),
+                note: Some("不会自动创建 commit。".to_string()),
+                is_primary: true,
+            },
+            SemanticConfirmChoice {
+                label: "自动提交并推送".to_string(),
+                command: "git push auto commit via feishu-bridge".to_string(),
+                note: Some("会自动 add/commit/push。".to_string()),
+                is_primary: false,
+            },
+            SemanticConfirmChoice {
+                label: "先看状态".to_string(),
+                command: "同步 Git 状态".to_string(),
+                note: Some("先确认是否存在未提交改动。".to_string()),
+                is_primary: false,
+            },
+        ];
+
+        match format_semantic_confirm_reply(
+            "准备把当前项目的本地改动同步到 GitHub",
+            "这句话可能表示只推送已提交内容，也可能表示自动提交后再推送。",
+            &choices,
+            Some(0.72),
+            Some("medium"),
+        ) {
+            BridgeResponse::Card { fallback_text, card } => {
+                let card_text = card.to_string();
+                assert!(fallback_text.contains("需要先确认"));
+                assert!(fallback_text.contains("git push"));
+                assert!(card_text.contains("请确认下一步"));
+                assert!(card_text.contains("仅推送已提交内容"));
+                assert!(card_text.contains("同步 Git 状态"));
+                assert!(card_text.contains("不确定点 / 说明"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn semantic_plan_reply_returns_planner_card() {
+        let choices = vec![
+            SemanticConfirmChoice {
+                label: "直接执行".to_string(),
+                command: "执行计划 修复当前测试失败".to_string(),
+                note: Some("按当前理解直接开跑。".to_string()),
+                is_primary: true,
+            },
+            SemanticConfirmChoice {
+                label: "先确认范围".to_string(),
+                command: "先只修 parser 相关测试".to_string(),
+                note: Some("缩小执行范围，避免误改。".to_string()),
+                is_primary: false,
+            },
+        ];
+
+        let action_lines = vec![
+            "1. 查看失败测试输出".to_string(),
+            "2. 定位 parser 分支".to_string(),
+            "3. 修改后回归验证".to_string(),
+        ];
+
+        match format_semantic_plan_reply(
+            "修复当前测试失败",
+            "confirm",
+            "我建议先确认修复范围，再开始改代码。",
+            "当前请求可能涉及多个失败点，直接执行风险偏高。",
+            &action_lines,
+            &choices,
+            Some(0.68),
+            Some("medium"),
+        ) {
+            BridgeResponse::Card { fallback_text, card } => {
+                let card_text = card.to_string();
+                assert!(fallback_text.contains("Plan 模式"));
+                assert!(fallback_text.contains("候选动作"));
+                assert_eq!(card["header"]["title"]["content"], "Plan 模式");
+                assert_eq!(card["header"]["template"], "orange");
+                assert!(card_text.contains("规划摘要"));
+                assert!(card_text.contains("查看失败测试输出"));
+                assert!(card_text.contains("执行计划 修复当前测试失败"));
+                assert!(card_text.contains("先只修 parser 相关测试"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn ask_agent_reply_card_contains_follow_up_action() {
+        let result = AgentRunResult {
+            success: true,
+            session_id: "unused".to_string(),
+            message: "unused".to_string(),
+            run: None,
+            error: None,
+        };
+
+        let ask_result = crate::vscode::AgentAskResult {
+            success: true,
+            session_id: Some("session-1".to_string()),
+            status: "waiting_user".to_string(),
+            message: "已经完成第一轮分析。".to_string(),
+            summary: Some("已经完成第一轮分析。".to_string()),
+            current_action: Some("分析当前代码上下文".to_string()),
+            next_action: Some("继续检查 src/lib.rs 里的 parse_intent 分支".to_string()),
+            related_files: vec!["src/lib.rs".to_string()],
+            tool_call: Some("read_file(src/lib.rs:1-120)".to_string()),
+            tool_result_summary: Some("已读取关键代码片段。".to_string()),
+            run: result.run,
+            duration_ms: 123,
+            error: None,
+        };
+
+        match format_agent_reply_card("问 Copilot parse_intent 这个函数是干什么的", "问 Copilot", &ask_result) {
+            BridgeResponse::Card { fallback_text, card } => {
+                let card_text = card.to_string();
+                assert!(fallback_text.contains("按建议继续"));
+                assert!(card_text.contains("Agent 任务更新"));
+                assert!(card_text.contains("按建议继续"));
+                assert!(card_text.contains("src/lib.rs"));
+                assert!(card_text.contains("read_file(src/lib.rs:1-120)"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn agent_runtime_reply_card_contains_result_disposition_actions() {
+        let result = AgentRunResult {
+            success: true,
+            session_id: "session-1".to_string(),
+            message: "The run changed the workspace and is waiting for result disposition.".to_string(),
+            run: Some(AgentRunState {
+                run_id: "run-1".to_string(),
+                mode: AgentRunMode::Agent,
+                status: AgentRunStatus::WaitingUser,
+                summary: "Applied a targeted patch and now waiting for result disposition.".to_string(),
+                current_action: "Waiting for result disposition after applying workspace changes".to_string(),
+                next_action: "Keep the result, revert the applied changes, or abandon this run result.".to_string(),
+                current_step: Some("waiting_result_disposition".to_string()),
+                authorization_policy: None,
+                result_disposition: ResultDisposition::Pending,
+                pending_user_decision: Some(PendingUserDecision {
+                    decision_id: "decision-1".to_string(),
+                    control_kind: ControlPointKind::ResultDisposition,
+                    summary: "This run changed the workspace. Decide what to do with the result.".to_string(),
+                    options: vec![
+                        AgentDecisionOption {
+                            option_id: "keep_result".to_string(),
+                            label: "Keep result".to_string(),
+                            note: None,
+                            primary: true,
+                        },
+                        AgentDecisionOption {
+                            option_id: "revert_result".to_string(),
+                            label: "Revert result".to_string(),
+                            note: None,
+                            primary: false,
+                        },
+                        AgentDecisionOption {
+                            option_id: "abandon_result".to_string(),
+                            label: "Abandon result".to_string(),
+                            note: None,
+                            primary: false,
+                        },
+                    ],
+                    recommended_option_id: Some("keep_result".to_string()),
+                }),
+                budget: RunBudget::default(),
+                checkpoints: vec![RunCheckpoint {
+                    checkpoint_id: "cp-1".to_string(),
+                    label: "result-disposition".to_string(),
+                    status_summary: "waiting for result disposition".to_string(),
+                    timestamp_ms: 1,
+                }],
+                reversible_artifacts: vec![ReversibleArtifact {
+                    artifact_id: "artifact-1".to_string(),
+                    kind: ReversibleArtifactKind::Patch,
+                    summary: "Patched src/lib.rs".to_string(),
+                    file_paths: vec!["src/lib.rs".to_string()],
+                }],
+            }),
+            error: None,
+        };
+
+        match format_agent_run_reply_card("修复当前测试失败", "查看 Agent Runtime 状态", &result) {
+            BridgeResponse::Card { fallback_text, card } => {
+                let card_text = card.to_string();
+                assert!(fallback_text.contains("结果处置"));
+                assert!(card_text.contains("Agent Runtime 更新"));
+                assert!(card_text.contains("保留 agent 结果"));
+                assert!(card_text.contains("回滚 agent 结果"));
+                assert!(card_text.contains("放弃 agent 结果"));
+                assert!(card_text.contains("可回滚产物"));
             }
             BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
         }

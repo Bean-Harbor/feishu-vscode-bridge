@@ -2,6 +2,7 @@ use crate::card::{self, DirectoryChoice, ProjectChoice};
 use crate::bridge::BridgeResponse;
 use crate::bridge_context::BridgeContext;
 use crate::plan::ExecutionOutcome;
+use crate::agent_backend;
 use crate::reply;
 use crate::session;
 use crate::vscode;
@@ -41,6 +42,38 @@ pub fn execute_direct_command(
             &intent,
             "问 Copilot",
         );
+    }
+
+    if let Intent::StartAgentRun { prompt } = &intent {
+        return execute_agent_runtime_start(context, session_key, task_text, prompt, &intent);
+    }
+
+    if let Intent::ContinueAgentRun { prompt } = &intent {
+        return execute_agent_runtime_continue(
+            context,
+            session_key,
+            task_text,
+            prompt.as_deref(),
+            &intent,
+        );
+    }
+
+    if let Intent::ShowAgentRunStatus = &intent {
+        return execute_agent_runtime_status(context, session_key, task_text, &intent);
+    }
+
+    if let Intent::ApproveAgentRun { option_id } = &intent {
+        return execute_agent_runtime_approve(
+            context,
+            session_key,
+            task_text,
+            option_id.as_deref(),
+            &intent,
+        );
+    }
+
+    if let Intent::CancelAgentRun = &intent {
+        return execute_agent_runtime_cancel(context, session_key, task_text, &intent);
     }
 
     if let Intent::ShowCurrentProject = &intent {
@@ -97,7 +130,7 @@ pub fn execute_direct_command(
     }
 
     if let Intent::ResetAgentSession = &intent {
-        let result = vscode::reset_agent_session(session_key);
+        let result = agent_backend::reset_agent_session(session_key);
         let outcome = ExecutionOutcome {
             success: result.success,
             reply: result.to_reply("重置 Copilot 会话"),
@@ -121,11 +154,157 @@ pub fn execute_agent_turn(
         prompt,
         selected_project_path(context, session_key).as_deref(),
     );
-    let result = vscode::ask_agent(session_key, &prompt);
+    let result = agent_backend::ask_agent(session_key, &prompt);
     let reply = reply::format_agent_reply_with_action(task_text, action_label, &result);
     let stored = session::stored_session_from_agent_result(task_text, intent, &result, &reply);
     let _ = session::persist_session(context.session_store_path(), session_key, &stored);
-    BridgeResponse::Text(reply)
+    card::format_agent_reply_card(task_text, action_label, &result)
+}
+
+fn execute_agent_runtime_start(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    prompt: &str,
+    intent: &Intent,
+) -> BridgeResponse {
+    let current_project = selected_project_path(context, session_key).or_else(default_workspace_path);
+    let prompt = augment_agent_prompt_with_project(prompt, current_project.as_deref());
+    let result = agent_backend::start_agent_run(session_key, &prompt, current_project.as_deref());
+    let reply_text = reply::format_agent_run_reply(task_text, "启动 Agent Runtime", &result);
+    let stored = session::stored_session_from_agent_run_result(
+        task_text,
+        intent,
+        &result,
+        &reply_text,
+        current_project,
+    );
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
+    card::format_agent_run_reply_card(task_text, "启动 Agent Runtime", &result)
+}
+
+fn execute_agent_runtime_continue(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    prompt: Option<&str>,
+    intent: &Intent,
+) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+        return BridgeResponse::Text("⚠️ 当前没有可继续的 agent runtime。请先发送「/agent <任务>」。".to_string());
+    };
+
+    let Some(run_id) = session::current_agent_run_id(&stored) else {
+        return BridgeResponse::Text("⚠️ 当前没有 active agent runtime。请先发送「/agent <任务>」。".to_string());
+    };
+
+    let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
+    let result = agent_backend::continue_agent_run(session_key, &run_id, prompt);
+    let reply_text = reply::format_agent_run_reply(task_text, "继续 Agent Runtime", &result);
+    let stored = session::stored_session_from_agent_run_result(
+        task_text,
+        intent,
+        &result,
+        &reply_text,
+        current_project,
+    );
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
+    card::format_agent_run_reply_card(task_text, "继续 Agent Runtime", &result)
+}
+
+fn execute_agent_runtime_status(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    intent: &Intent,
+) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+        return BridgeResponse::Text("⚠️ 当前没有 agent runtime 记录。请先发送「/agent <任务>」。".to_string());
+    };
+
+    let Some(run_id) = session::current_agent_run_id(&stored) else {
+        return BridgeResponse::Text("⚠️ 当前没有 active agent runtime。请先发送「/agent <任务>」。".to_string());
+    };
+
+    let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
+    let result = agent_backend::get_agent_run_status(session_key, &run_id);
+    let reply_text = reply::format_agent_run_reply(task_text, "查看 Agent Runtime 状态", &result);
+    let stored = session::stored_session_from_agent_run_result(
+        task_text,
+        intent,
+        &result,
+        &reply_text,
+        current_project,
+    );
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
+    card::format_agent_run_reply_card(task_text, "查看 Agent Runtime 状态", &result)
+}
+
+fn execute_agent_runtime_approve(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    option_id: Option<&str>,
+    intent: &Intent,
+) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+        return BridgeResponse::Text("⚠️ 当前没有可批准的 agent runtime 决策。请先发送「/agent <任务>」。".to_string());
+    };
+
+    let Some((run, decision)) = session::current_agent_decision(&stored) else {
+        return BridgeResponse::Text("⚠️ 当前 agent runtime 没有待处理的用户决策。可以先发送「agent 状态」查看当前状态。".to_string());
+    };
+
+    let chosen_option = option_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| session::suggested_agent_decision_option(&stored));
+
+    let Some(chosen_option) = chosen_option else {
+        return BridgeResponse::Text("⚠️ 当前 agent runtime 决策没有可批准的选项。".to_string());
+    };
+
+    let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
+    let result = agent_backend::approve_agent_run(session_key, &run.run_id, &decision.decision_id, &chosen_option);
+    let reply_text = reply::format_agent_run_reply(task_text, "批准 Agent Runtime 决策", &result);
+    let stored = session::stored_session_from_agent_run_result(
+        task_text,
+        intent,
+        &result,
+        &reply_text,
+        current_project,
+    );
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
+    card::format_agent_run_reply_card(task_text, "批准 Agent Runtime 决策", &result)
+}
+
+fn execute_agent_runtime_cancel(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    intent: &Intent,
+) -> BridgeResponse {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+        return BridgeResponse::Text("⚠️ 当前没有可取消的 agent runtime。".to_string());
+    };
+
+    let Some(run_id) = session::current_agent_run_id(&stored) else {
+        return BridgeResponse::Text("⚠️ 当前没有 active agent runtime。".to_string());
+    };
+
+    let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
+    let result = agent_backend::cancel_agent_run(session_key, &run_id);
+    let reply_text = reply::format_agent_run_reply(task_text, "取消 Agent Runtime", &result);
+    let stored = session::stored_session_from_agent_run_result(
+        task_text,
+        intent,
+        &result,
+        &reply_text,
+        current_project,
+    );
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
+    card::format_agent_run_reply_card(task_text, "取消 Agent Runtime", &result)
 }
 
 fn persist_direct_outcome(
@@ -476,10 +655,10 @@ fn normalize_project_path_string(path: &str) -> String {
     #[cfg(target_os = "windows")]
     {
         if let Some(stripped) = path.strip_prefix("\\\\?\\") {
-            return stripped.replace('\\', "/");
+            return stripped.to_string();
         }
 
-        return path.replace('\\', "/");
+        return path.to_string();
     }
 
     #[cfg(not(target_os = "windows"))]

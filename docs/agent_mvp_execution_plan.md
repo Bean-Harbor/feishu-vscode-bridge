@@ -1,5 +1,11 @@
 # Agent MVP Execution Plan
 
+> Note
+>
+> 这份文档描述的是旧的 `agent MVP` 主线，重点是把 `问 Copilot` 从一次性问答推进到“可连续追问、可带最小只读工具”的最小闭环。
+>
+> 如果当前目标已经升级为完整映射 VS Code Copilot Chat 的 `/ask /plan /agent`，并把飞书里的 `agent` 做成真正的 autonomous agent，请优先看 `docs/copilot_modes_autonomous_agent_plan.md`。
+
 ## Objective
 
 把当前“能问、能连续追问”的 agent bootstrap，推进成一个最小可发布的 `agent MVP`：

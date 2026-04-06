@@ -34,6 +34,16 @@ pub fn continue_agent_task(
         return BridgeResponse::Text("⚠️ 当前没有可继续的 agent 任务。请先发送「问 Copilot <问题>」。".to_string());
     };
 
+    if session::current_agent_run(&stored).is_some() {
+        let intent = Intent::ContinueAgentRun {
+            prompt: prompt_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+        };
+        return direct_command::execute_direct_command(context, session_key, task_text, intent);
+    }
+
     if !session::is_agent_task_session(&stored) {
         return BridgeResponse::Text(reply::format_stored_session_summary(&stored));
     }
@@ -452,6 +462,7 @@ mod tests {
                 next_action: Some("给我最小修复建议".to_string()),
                 tool_call: None,
                 tool_result_summary: None,
+                run: None,
             }),
             current_project_path: None,
             plan: None,

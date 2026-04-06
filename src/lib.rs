@@ -171,6 +171,12 @@ pub enum Intent {
         mode: ExecutionMode,
     },
     ContinuePlan,
+    ShowPlanPrompt { prompt: String },
+    StartAgentRun { prompt: String },
+    ContinueAgentRun { prompt: Option<String> },
+    ShowAgentRunStatus,
+    ApproveAgentRun { option_id: Option<String> },
+    CancelAgentRun,
     ContinueAgent { prompt: Option<String> },
     ContinueAgentSuggested,
     RetryFailedStep,
@@ -243,6 +249,8 @@ pub enum Intent {
 }
 
 pub mod executor;
+pub mod agent_runtime;
+pub mod agent_backend;
 pub mod bridge_context;
 pub mod direct_command;
 pub mod follow_up;
@@ -300,7 +308,15 @@ fn parse_intent_internal(text: &str, allow_natural_language: bool) -> Intent {
         return Intent::ContinuePlan;
     }
 
+    if let Some(prompt) = parse_plan_prompt_intent(text, &lower) {
+        return Intent::ShowPlanPrompt { prompt };
+    }
+
     if let Some(intent) = parse_agent_continue_intent(text, &lower) {
+        return intent;
+    }
+
+    if let Some(intent) = parse_agent_runtime_action_intent(text, &lower) {
         return intent;
     }
 
@@ -462,6 +478,27 @@ fn parse_plan(text: &str, mode: ExecutionMode) -> Option<Intent> {
     }
 
     Some(Intent::RunPlan { steps, mode })
+}
+
+fn parse_plan_prompt_intent(text: &str, lower: &str) -> Option<String> {
+    let prompt = strip_command_prefix(
+        text,
+        lower,
+        &[
+            "/plan",
+            "规划",
+            "给我计划",
+            "帮我规划",
+            "plan prompt",
+        ],
+    )?
+    .trim();
+
+    if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt.to_string())
+    }
 }
 
 fn split_plan_steps(text: &str) -> Vec<&str> {
@@ -774,7 +811,11 @@ impl Intent {
         matches!(
             self,
             Intent::ExplainLastFailure
+                | Intent::ShowPlanPrompt { .. }
                 | Intent::ShowLastResult
+                | Intent::ShowAgentRunStatus
+                | Intent::ApproveAgentRun { .. }
+                | Intent::CancelAgentRun
                 | Intent::ContinueAgentSuggested
                 | Intent::ShowProjectPicker
                 | Intent::ShowProjectBrowser { .. }
@@ -802,6 +843,8 @@ impl Intent {
                     | Intent::RunTestFile { .. }
                     | Intent::WriteFile { .. }
                     | Intent::AskAgent { .. }
+                    | Intent::StartAgentRun { .. }
+                    | Intent::ContinueAgentRun { .. }
                     | Intent::ContinueAgent { .. }
                     | Intent::ResetAgentSession
                 | Intent::GitStatus { .. }
@@ -1205,6 +1248,136 @@ fn parse_agent_ask_intent(text: &str, lower: &str) -> Option<Intent> {
     })
 }
 
+fn parse_agent_runtime_action_intent(text: &str, lower: &str) -> Option<Intent> {
+    if matches_command_any(
+        lower,
+        &[
+            "agent 状态",
+            "agent状态",
+            "查看 agent 状态",
+            "查看agent状态",
+            "show agent status",
+            "agent status",
+        ],
+    ) {
+        return Some(Intent::ShowAgentRunStatus);
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "取消 agent",
+            "取消agent",
+            "停止 agent",
+            "停止agent",
+            "cancel agent",
+            "stop agent",
+        ],
+    ) {
+        return Some(Intent::CancelAgentRun);
+    }
+
+    if let Some(rest) = strip_command_prefix(
+        text,
+        lower,
+        &[
+            "继续 agent",
+            "继续agent",
+            "continue agent",
+            "agent continue",
+        ],
+    ) {
+        let prompt = rest.trim();
+        return Some(Intent::ContinueAgentRun {
+            prompt: (!prompt.is_empty()).then(|| prompt.to_string()),
+        });
+    }
+
+    if let Some(rest) = strip_command_prefix(
+        text,
+        lower,
+        &[
+            "批准 agent",
+            "批准agent",
+            "同意 agent",
+            "同意agent",
+            "approve agent",
+        ],
+    ) {
+        let option_id = rest.trim();
+        return Some(Intent::ApproveAgentRun {
+            option_id: (!option_id.is_empty()).then(|| option_id.to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "保留 agent 结果",
+            "保留agent结果",
+            "keep agent result",
+            "keep result",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("keep_result".to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "回滚 agent 结果",
+            "回滚agent结果",
+            "撤销 agent 结果",
+            "撤销agent结果",
+            "revert agent result",
+            "undo agent result",
+            "revert result",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("revert_result".to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "放弃 agent 结果",
+            "放弃agent结果",
+            "abandon agent result",
+            "abandon result",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("abandon_result".to_string()),
+        });
+    }
+
+    if let Some(prompt) = strip_command_prefix(
+        text,
+        lower,
+        &[
+            "/agent",
+            "agent",
+            "让 agent 做",
+            "让agent做",
+            "自动完成",
+            "start agent",
+        ],
+    ) {
+        let prompt = prompt.trim();
+        if !prompt.is_empty() {
+            return Some(Intent::StartAgentRun {
+                prompt: prompt.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
 fn parse_agent_continue_intent(text: &str, lower: &str) -> Option<Intent> {
     const PREFIXES: &[&str] = &[
         "继续，",
@@ -1316,6 +1489,8 @@ pub fn help_text() -> &'static str {
 📋 飞书 × VS Code Bridge 指令
 
 ▸ 计划
+    /plan <任务>                  — 只展示 planner 结果，不直接执行
+    规划 <任务> / 给我计划 <任务> — 同上，走显式 plan mode
     执行计划 <命令1>; <命令2>   — 一步一步执行
     执行全部 <命令1>; <命令2>   — 连续执行到结束或失败
     继续                        — 做下一步
@@ -1358,6 +1533,14 @@ pub fn help_text() -> &'static str {
     运行测试文件 <路径>      — 按测试文件执行测试
     写入文件 <路径>\n<内容>  — 创建或覆盖文件（需审批）
     问 Copilot <问题>        — 通过 companion extension 发起一次 ask-style agent 会话
+    /agent <任务>            — 启动 autonomous agent runtime
+    agent 状态              — 查看当前 agent runtime 状态
+    继续 agent [要求]       — 在当前 agent runtime 中继续推进
+    批准 agent [option_id]  — 批准当前 agent runtime 决策；不传时默认用推荐选项
+    保留 agent 结果         — 显式保留当前 runtime 结果快照
+    回滚 agent 结果         — 显式回滚当前 runtime 结果快照
+    放弃 agent 结果         — 显式放弃当前 runtime 结果快照
+    取消 agent              — 取消当前 agent runtime
     继续刚才的任务          — 无待执行计划时，优先继续最近一次 agent 任务
     继续，<新的推进要求>    — 在同一 agent 会话里继续追问，例如「继续，给我最小修复建议」
     重置 Copilot 会话        — 清空当前飞书会话对应的 extension ask 历史
@@ -1544,6 +1727,69 @@ mod tests {
     fn parse_reset_agent_session() {
         assert_eq!(parse_intent("重置 Copilot 会话"), Intent::ResetAgentSession);
         assert_eq!(parse_intent("reset agent session"), Intent::ResetAgentSession);
+    }
+
+    #[test]
+    fn parse_start_agent_run() {
+        assert_eq!(
+            parse_intent("/agent 修复当前测试失败"),
+            Intent::StartAgentRun {
+                prompt: "修复当前测试失败".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_explicit_plan_prompt() {
+        assert_eq!(
+            parse_intent("/plan 修复当前测试失败应该怎么做"),
+            Intent::ShowPlanPrompt {
+                prompt: "修复当前测试失败应该怎么做".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_intent("规划 当前 parser 入口还缺什么"),
+            Intent::ShowPlanPrompt {
+                prompt: "当前 parser 入口还缺什么".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_runtime_status() {
+        assert_eq!(parse_intent("agent 状态"), Intent::ShowAgentRunStatus);
+    }
+
+    #[test]
+    fn parse_agent_runtime_continue() {
+        assert_eq!(
+            parse_intent("继续 agent 给我最小修复"),
+            Intent::ContinueAgentRun {
+                prompt: Some("给我最小修复".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_agent_result_disposition_aliases() {
+        assert_eq!(
+            parse_intent("保留 agent 结果"),
+            Intent::ApproveAgentRun {
+                option_id: Some("keep_result".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_intent("回滚 agent 结果"),
+            Intent::ApproveAgentRun {
+                option_id: Some("revert_result".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_intent("放弃 agent 结果"),
+            Intent::ApproveAgentRun {
+                option_id: Some("abandon_result".to_string()),
+            }
+        );
     }
 
     #[test]

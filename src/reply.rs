@@ -2,6 +2,19 @@ use crate::session::StoredSession;
 use crate::vscode;
 use crate::Intent;
 
+pub fn format_agent_run_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "initialized" => "已初始化".to_string(),
+        "running" => "运行中".to_string(),
+        "waiting_user" => "等待用户".to_string(),
+        "completed" => "已完成".to_string(),
+        "cancelled" => "已取消".to_string(),
+        "failed" => "失败".to_string(),
+        other if other.is_empty() => "已初始化".to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub fn format_agent_status(status: &str) -> String {
     match status.trim().to_ascii_lowercase().as_str() {
         "answered" => "已回答".to_string(),
@@ -106,6 +119,74 @@ pub fn format_agent_reply_with_action(
     }
 
     blocks.push(format!("💬 Agent 回复:\n{}", result.message.trim()));
+    blocks.join("\n\n")
+}
+
+pub fn format_agent_run_reply(task_text: &str, action_label: &str, result: &vscode::AgentRunResult) -> String {
+    let mut blocks = vec!["🧭 Agent Runtime 更新".to_string()];
+
+    blocks.push(format!("🎯 当前任务: {}", task_text.trim().trim_end_matches('\n')));
+    blocks.push(format!("🧾 上次动作: {}", action_label));
+
+    if !result.session_id.trim().is_empty() {
+        blocks.push(format!("🆔 session: {}", result.session_id.trim()));
+    }
+
+    if let Some(run) = result.run.as_ref() {
+        blocks.push(format!("🏃 run: {}", run.run_id));
+        blocks.push(format!("📌 最近状态: {}", format_agent_run_status(run.status.as_str())));
+        blocks.push(format!("⚙️ 当前动作: {}", run.current_action.trim()));
+        blocks.push(format!("📌 结果摘要: {}", run.summary.trim()));
+        blocks.push(format!("🧾 结果处置: {}", match run.result_disposition {
+            crate::agent_runtime::ResultDisposition::Pending => "待决定",
+            crate::agent_runtime::ResultDisposition::Kept => "已保留",
+            crate::agent_runtime::ResultDisposition::Reverted => "已回滚",
+            crate::agent_runtime::ResultDisposition::Abandoned => "已放弃",
+        }));
+
+        if !run.next_action.trim().is_empty() {
+            blocks.push(format!("➡️ 下一步: {}", run.next_action.trim()));
+        }
+
+        if let Some(decision) = run.pending_user_decision.as_ref() {
+            blocks.push(format!("⏸ 待决策: {}", decision.summary.trim()));
+            if !decision.options.is_empty() {
+                blocks.push(format!(
+                    "🪪 可选项: {}",
+                    decision
+                        .options
+                        .iter()
+                        .map(|option| {
+                            let suffix = if option.primary { " (recommended)" } else { "" };
+                            format!("{}={}{}", option.label, option.option_id, suffix)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("；")
+                ));
+                blocks.push("🤝 可直接发送：批准 agent 或 批准 agent <option_id>".to_string());
+            }
+        }
+
+        if !run.reversible_artifacts.is_empty() {
+            blocks.push(format!(
+                "🧩 可回滚产物: {}",
+                run.reversible_artifacts
+                    .iter()
+                    .map(|artifact| artifact.summary.clone())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+    }
+
+    if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
+        blocks.push(format!("❌ 错误: {}", error.trim()));
+    }
+
+    if !result.message.trim().is_empty() {
+        blocks.push(format!("💬 Runtime 回复:\n{}", result.message.trim()));
+    }
+
     blocks.join("\n\n")
 }
 
@@ -293,6 +374,7 @@ pub fn describe_intent(intent: &Intent) -> String {
             None => format!("打开文件 {path}"),
         },
         Intent::OpenFolder { path } => format!("打开目录 {path}"),
+        Intent::ShowPlanPrompt { prompt } => format!("Plan 模式：{prompt}"),
         Intent::InstallExtension { ext_id } => format!("安装扩展 {ext_id}"),
         Intent::UninstallExtension { ext_id } => format!("卸载扩展 {ext_id}"),
         Intent::ListExtensions => "列出扩展".to_string(),
@@ -334,6 +416,17 @@ pub fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::StartAgentRun { prompt } => format!("启动 Agent Runtime：{prompt}"),
+        Intent::ContinueAgentRun { prompt } => match prompt {
+            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent Runtime：{}", prompt.trim()),
+            _ => "继续 Agent Runtime".to_string(),
+        },
+        Intent::ShowAgentRunStatus => "查看 Agent Runtime 状态".to_string(),
+        Intent::ApproveAgentRun { option_id } => match option_id {
+            Some(option_id) if !option_id.trim().is_empty() => format!("批准 Agent Runtime 决策 {}", option_id.trim()),
+            _ => "批准当前 Agent Runtime 决策".to_string(),
+        },
+        Intent::CancelAgentRun => "取消 Agent Runtime".to_string(),
         Intent::ContinueAgent { prompt } => match prompt {
             Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent 任务：{}", prompt.trim()),
             _ => "继续 Agent 任务".to_string(),
