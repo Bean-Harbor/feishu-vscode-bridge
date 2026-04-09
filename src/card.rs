@@ -226,8 +226,16 @@ pub fn format_agent_reply_card(
         ]
     })];
 
-    if let Some(current_action) = result.current_action.as_deref().filter(|value| !value.trim().is_empty()) {
-        let summary = result.summary.as_deref().unwrap_or(result.message.as_str()).trim();
+    if let Some(current_action) = result
+        .current_action
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let summary = result
+            .summary
+            .as_deref()
+            .unwrap_or(result.message.as_str())
+            .trim();
         elements.push(json!({
             "tag": "div",
             "text": {
@@ -247,7 +255,11 @@ pub fn format_agent_reply_card(
         }));
     }
 
-    if let Some(tool_call) = result.tool_call.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(tool_call) = result
+        .tool_call
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         let tool_summary = result.tool_result_summary.as_deref().unwrap_or("");
         elements.push(json!({
             "tag": "div",
@@ -258,7 +270,11 @@ pub fn format_agent_reply_card(
         }));
     }
 
-    if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(next_action) = result
+        .next_action
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         elements.push(json!({
             "tag": "div",
             "text": {
@@ -284,7 +300,11 @@ pub fn format_agent_reply_card(
         }));
     }
 
-    if let Some(run) = result.run.as_ref().and_then(|run| run.pending_user_decision.as_ref()) {
+    if let Some(run) = result
+        .run
+        .as_ref()
+        .and_then(|run| run.pending_user_decision.as_ref())
+    {
         elements.push(json!({
             "tag": "div",
             "text": {
@@ -296,12 +316,7 @@ pub fn format_agent_reply_card(
             let actions = chunk
                 .iter()
                 .map(|option| {
-                    let command = match option.option_id.as_str() {
-                        "keep_result" => "保留 agent 结果".to_string(),
-                        "revert_result" => "回滚 agent 结果".to_string(),
-                        "abandon_result" => "放弃 agent 结果".to_string(),
-                        _ => format!("批准 agent {}", option.option_id),
-                    };
+                    let command = reply::agent_decision_command(run, option);
                     let mut action = json!({
                         "tag": "button",
                         "text": {
@@ -420,6 +435,21 @@ pub fn format_agent_run_reply_card(
         }));
     }
 
+    if run.status == crate::agent_runtime::AgentRunStatus::WaitingUser {
+        if let Some(waiting_reason) = reply::format_agent_waiting_reason(
+            run.waiting_reason.as_deref(),
+            run.pending_user_decision.as_ref(),
+        ) {
+            elements.push(json!({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**等待类型**\n{}", waiting_reason)
+                }
+            }));
+        }
+    }
+
     if let Some(decision) = run.pending_user_decision.as_ref() {
         elements.push(json!({
             "tag": "div",
@@ -429,16 +459,22 @@ pub fn format_agent_run_reply_card(
             }
         }));
 
+        let quick_commands = reply::agent_decision_quick_commands(decision);
+        if !quick_commands.is_empty() {
+            elements.push(json!({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": format!("**可直接发送**\n{}", quick_commands.join(" / "))
+                }
+            }));
+        }
+
         for chunk in decision.options.chunks(3) {
             let actions = chunk
                 .iter()
                 .map(|option| {
-                    let command = match option.option_id.as_str() {
-                        "keep_result" => "保留 agent 结果".to_string(),
-                        "revert_result" => "回滚 agent 结果".to_string(),
-                        "abandon_result" => "放弃 agent 结果".to_string(),
-                        _ => format!("批准 agent {}", option.option_id),
-                    };
+                    let command = reply::agent_decision_command(decision, option);
                     let mut action = json!({
                         "tag": "button",
                         "text": {
@@ -619,7 +655,8 @@ pub fn format_semantic_confirm_reply(
         let note_lines = choices
             .iter()
             .filter_map(|choice| {
-                choice.note
+                choice
+                    .note
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
                     .map(|note| format!("- {}: {}", choice.label, note.trim()))
@@ -694,7 +731,11 @@ pub fn format_project_picker_reply(choices: &[ProjectChoice]) -> BridgeResponse 
     let fallback_lines = choices
         .iter()
         .map(|choice| {
-            let suffix = if choice.is_current { " (当前项目)" } else { "" };
+            let suffix = if choice.is_current {
+                " (当前项目)"
+            } else {
+                ""
+            };
             format!("- {}{}: {}", choice.label, suffix, choice.path)
         })
         .collect::<Vec<_>>()
@@ -891,7 +932,10 @@ pub fn format_project_browser_reply(
     let summary = if choices.is_empty() {
         "当前目录下没有可继续浏览的子目录。可以直接选择当前目录，或返回上一级。".to_string()
     } else if truncated {
-        format!("当前仅展示前 {} 个子目录。若没看到目标目录，请逐步缩小范围后再进入。", choices.len())
+        format!(
+            "当前仅展示前 {} 个子目录。若没看到目标目录，请逐步缩小范围后再进入。",
+            choices.len()
+        )
     } else {
         format!("当前可继续进入 {} 个子目录。", choices.len())
     };
@@ -964,8 +1008,7 @@ pub fn format_project_browser_reply(
     BridgeResponse::Card {
         fallback_text: format!(
             "📂 浏览项目\n\n当前位置: {}\n\n{}\n\n可直接发送「选择项目 <路径>」选择当前目录。",
-            current_label,
-            fallback_lines
+            current_label, fallback_lines
         ),
         card: json!({
             "config": {
@@ -1003,7 +1046,10 @@ pub fn format_plan_reply(
     }
 
     let mut lines = vec![format!("🧭 状态: {}", plan_status_label(progress))];
-    lines.push(format!("✅ 已完成: {} / {} 步", progress.next_step, progress.total_steps));
+    lines.push(format!(
+        "✅ 已完成: {} / {} 步",
+        progress.next_step, progress.total_steps
+    ));
 
     if progress.completed {
         lines.push("⏭ 当前步骤: 无，计划已完成。".to_string());
@@ -1031,9 +1077,7 @@ pub fn format_plan_reply(
     if let Some(approval_request) = progress.approval_request.as_ref() {
         lines.push(format!(
             "🔐 待审批步骤: 第 {} / {} 步 - {}",
-            approval_request.step_number,
-            progress.total_steps,
-            approval_request.action_label
+            approval_request.step_number, progress.total_steps, approval_request.action_label
         ));
         lines.push(format!("📝 审批原因: {}", approval_request.reason));
         lines.push(format!("⚠️ 风险提示: {}", approval_request.risk_summary));
@@ -1120,7 +1164,11 @@ fn plan_status_label(progress: &PlanProgress) -> &'static str {
 }
 
 fn plan_failed_step(progress: &PlanProgress) -> Option<&crate::plan::StepExecution> {
-    progress.executed.iter().rev().find(|step| !step.outcome.success)
+    progress
+        .executed
+        .iter()
+        .rev()
+        .find(|step| !step.outcome.success)
 }
 
 fn build_plan_card(
@@ -1146,7 +1194,11 @@ fn build_plan_card(
     let current_step = if progress.completed {
         "无".to_string()
     } else {
-        format!("第 {} / {} 步", progress.next_step + 1, progress.total_steps)
+        format!(
+            "第 {} / {} 步",
+            progress.next_step + 1,
+            progress.total_steps
+        )
     };
     let remaining_steps = progress.total_steps.saturating_sub(progress.next_step);
     let current_task = stored
@@ -1261,7 +1313,11 @@ fn build_plan_card(
             .map(|step| {
                 format!(
                     "- {} 第 {}/{} 步：{}",
-                    if step.outcome.success { "成功" } else { "失败" },
+                    if step.outcome.success {
+                        "成功"
+                    } else {
+                        "失败"
+                    },
                     step.step_number,
                     progress.total_steps,
                     reply::describe_intent(&step.intent)
@@ -1441,7 +1497,11 @@ fn build_plan_card(
 fn build_follow_up_actions(stored: &StoredSession) -> Vec<serde_json::Value> {
     let mut actions = Vec::new();
 
-    if stored.last_result.as_ref().is_some_and(|result| !result.success) {
+    if stored
+        .last_result
+        .as_ref()
+        .is_some_and(|result| !result.success)
+    {
         actions.push(json!({
             "tag": "button",
             "text": {
@@ -1556,8 +1616,8 @@ mod tests {
     };
     use crate::plan::{ApprovalRequest, ExecutionOutcome};
     use crate::session::{StoredDiff, StoredPatch, StoredResult, StoredSession, StoredSessionKind};
-    use crate::Intent;
     use crate::vscode::AgentRunResult;
+    use crate::Intent;
 
     fn shell_intent(cmd: &str) -> Intent {
         Intent::RunShell {
@@ -1609,13 +1669,20 @@ mod tests {
         let stored = stored_task("执行计划 $ pwd", "已完成", "计划已完成，共执行 1 步。");
 
         match format_plan_reply(&progress, false, &ApprovalPolicy::default(), &stored) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 assert!(fallback_text.contains("状态: 已完成"));
                 assert_eq!(card["header"]["title"]["content"], "已完成");
                 assert!(card.to_string().contains("当前任务"));
                 assert!(card.to_string().contains("执行计划 $ pwd"));
                 assert!(card.to_string().contains("最近结果"));
-                assert!(card["elements"].as_array().unwrap().iter().all(|element| element["tag"] != "action"));
+                assert!(card["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|element| element["tag"] != "action"));
             }
             BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
         }
@@ -1640,10 +1707,17 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = stored_task("执行全部 $ false; $ pwd", "失败暂停", "第 2 / 3 步失败：执行命令 false");
+        let stored = stored_task(
+            "执行全部 $ false; $ pwd",
+            "失败暂停",
+            "第 2 / 3 步失败：执行命令 false",
+        );
 
         match format_plan_reply(&progress, true, &ApprovalPolicy::default(), &stored) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 assert!(fallback_text.contains("失败步骤: 第 2 / 3 步"));
                 assert_eq!(card["header"]["title"]["content"], "已暂停");
                 assert!(card.to_string().contains("执行全部 $ false; $ pwd"));
@@ -1678,7 +1752,10 @@ mod tests {
         let stored = stored_task("执行计划 git pull", "待审批", "第 1 / 1 步等待批准。");
 
         match format_plan_reply(&progress, false, &ApprovalPolicy::default(), &stored) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 assert!(fallback_text.contains("待审批步骤"));
                 assert_eq!(card["header"]["title"]["content"], "等你确认");
                 assert!(card.to_string().contains("执行计划 git pull"));
@@ -1772,7 +1849,10 @@ mod tests {
         ];
 
         match format_project_picker_reply(&choices) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("请选择项目"));
                 assert!(card_text.contains("HarborLookout"));
@@ -1816,7 +1896,10 @@ mod tests {
             Some(0.72),
             Some("medium"),
         ) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("需要先确认"));
                 assert!(fallback_text.contains("git push"));
@@ -1862,7 +1945,10 @@ mod tests {
             Some(0.68),
             Some("medium"),
         ) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("Plan 模式"));
                 assert!(fallback_text.contains("候选动作"));
@@ -1903,8 +1989,15 @@ mod tests {
             error: None,
         };
 
-        match format_agent_reply_card("问 Copilot parse_intent 这个函数是干什么的", "问 Copilot", &ask_result) {
-            BridgeResponse::Card { fallback_text, card } => {
+        match format_agent_reply_card(
+            "问 Copilot parse_intent 这个函数是干什么的",
+            "问 Copilot",
+            &ask_result,
+        ) {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("按建议继续"));
                 assert!(card_text.contains("Agent 任务更新"));
@@ -1921,21 +2014,28 @@ mod tests {
         let result = AgentRunResult {
             success: true,
             session_id: "session-1".to_string(),
-            message: "The run changed the workspace and is waiting for result disposition.".to_string(),
+            message: "The run changed the workspace and is waiting for result disposition."
+                .to_string(),
             run: Some(AgentRunState {
                 run_id: "run-1".to_string(),
                 mode: AgentRunMode::Agent,
                 status: AgentRunStatus::WaitingUser,
-                summary: "Applied a targeted patch and now waiting for result disposition.".to_string(),
-                current_action: "Waiting for result disposition after applying workspace changes".to_string(),
-                next_action: "Keep the result, revert the applied changes, or abandon this run result.".to_string(),
+                summary: "Applied a targeted patch and now waiting for result disposition."
+                    .to_string(),
+                current_action: "Waiting for result disposition after applying workspace changes"
+                    .to_string(),
+                next_action:
+                    "Keep the result, revert the applied changes, or abandon this run result."
+                        .to_string(),
                 current_step: Some("waiting_result_disposition".to_string()),
+                waiting_reason: Some("result_disposition".to_string()),
                 authorization_policy: None,
                 result_disposition: ResultDisposition::Pending,
                 pending_user_decision: Some(PendingUserDecision {
                     decision_id: "decision-1".to_string(),
                     control_kind: ControlPointKind::ResultDisposition,
-                    summary: "This run changed the workspace. Decide what to do with the result.".to_string(),
+                    summary: "This run changed the workspace. Decide what to do with the result."
+                        .to_string(),
                     options: vec![
                         AgentDecisionOption {
                             option_id: "keep_result".to_string(),
@@ -1975,8 +2075,12 @@ mod tests {
             error: None,
         };
 
-        match format_agent_run_reply_card("修复当前测试失败", "查看 Agent Runtime 状态", &result) {
-            BridgeResponse::Card { fallback_text, card } => {
+        match format_agent_run_reply_card("修复当前测试失败", "查看 Agent Runtime 状态", &result)
+        {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("结果处置"));
                 assert!(card_text.contains("Agent Runtime 更新"));
@@ -1984,6 +2088,62 @@ mod tests {
                 assert!(card_text.contains("回滚 agent 结果"));
                 assert!(card_text.contains("放弃 agent 结果"));
                 assert!(card_text.contains("可回滚产物"));
+            }
+            BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
+        }
+    }
+
+    #[test]
+    fn agent_runtime_reply_card_surfaces_pacing_commands() {
+        let result = AgentRunResult {
+            success: true,
+            session_id: "session-1".to_string(),
+            message: "The run paused after reaching the current budget.".to_string(),
+            run: Some(AgentRunState {
+                run_id: "run-1".to_string(),
+                mode: AgentRunMode::Agent,
+                status: AgentRunStatus::WaitingUser,
+                summary: "Paused after reaching current loop budget.".to_string(),
+                current_action: "Reached the current loop budget".to_string(),
+                next_action: "Approve the pacing decision to continue, or cancel the run."
+                    .to_string(),
+                current_step: Some("waiting_user".to_string()),
+                waiting_reason: Some("pacing".to_string()),
+                authorization_policy: None,
+                result_disposition: ResultDisposition::Pending,
+                pending_user_decision: Some(PendingUserDecision {
+                    decision_id: "decision-1".to_string(),
+                    control_kind: ControlPointKind::Pacing,
+                    summary: "Continue for another batch, or stop here.".to_string(),
+                    options: vec![
+                        AgentDecisionOption {
+                            option_id: "continue_run".to_string(),
+                            label: "Continue run".to_string(),
+                            note: None,
+                            primary: true,
+                        },
+                        AgentDecisionOption {
+                            option_id: "cancel_run".to_string(),
+                            label: "Stop here".to_string(),
+                            note: None,
+                            primary: false,
+                        },
+                    ],
+                    recommended_option_id: Some("continue_run".to_string()),
+                }),
+                budget: RunBudget::default(),
+                checkpoints: Vec::new(),
+                reversible_artifacts: Vec::new(),
+            }),
+            error: None,
+        };
+
+        match format_agent_run_reply_card("继续推进当前任务", "查看 Agent Runtime 状态", &result)
+        {
+            BridgeResponse::Card { card, .. } => {
+                let card_text = card.to_string();
+                assert!(card_text.contains("继续本轮 agent"));
+                assert!(card_text.contains("先停在这里"));
             }
             BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
         }
@@ -2001,8 +2161,11 @@ mod tests {
         match format_project_picker_reply(&choices) {
             BridgeResponse::Card { card, .. } => {
                 let card_text = card.to_string();
-                assert!(card_text.contains("选择项目 C:/Users/beanw/OpenSource/feishu-vscode-bridge"));
-                assert!(!card_text.contains(r#"选择项目 C:\\Users\\beanw\\OpenSource\\feishu-vscode-bridge"#));
+                assert!(
+                    card_text.contains("选择项目 C:/Users/beanw/OpenSource/feishu-vscode-bridge")
+                );
+                assert!(!card_text
+                    .contains(r#"选择项目 C:\\Users\\beanw\\OpenSource\\feishu-vscode-bridge"#));
             }
             BridgeResponse::Text(text) => panic!("expected card reply, got text: {text}"),
         }
@@ -2031,7 +2194,10 @@ mod tests {
             Some("C:/Users/beanw/OpenSource/HarborLookout"),
             false,
         ) {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("浏览项目"));
                 assert!(card_text.contains("选择当前目录"));

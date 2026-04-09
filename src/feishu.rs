@@ -1,13 +1,18 @@
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::{self, File};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use tungstenite::connect;
 use tungstenite::Message as WsMessage;
 
-const TOKEN_URL: &str =
-    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
+const TOKEN_URL: &str = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
 const WS_ENDPOINT_URL: &str = "https://open.feishu.cn/callback/ws/endpoint";
 const MSG_URL: &str = "https://open.feishu.cn/open-apis/im/v1/messages";
+const DEFAULT_ATTACHMENT_PROBE_DIR: &str = "feishu-vscode-bridge/attachments";
 
 // ──────────────────────────── protobuf types ────────────────────────────
 // 飞书 WS 协议使用 pbbp2.proto 定义的 Frame / Header
@@ -69,7 +74,23 @@ pub struct InboundMessage {
     pub message_type: String,
     pub text: String,
     pub message_id: String,
+    pub attachment: Option<InboundAttachment>,
     pub unsupported_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAttachment {
+    pub kind: String,
+    pub resource_key: String,
+    pub file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedAttachment {
+    pub local_path: PathBuf,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,9 +164,9 @@ struct MsgResp {
 fn format_http_error(prefix: &str, error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(status, response) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|read_error| format!("<failed to read response body: {read_error}>"));
+            let body = response.into_string().unwrap_or_else(|read_error| {
+                format!("<failed to read response body: {read_error}>")
+            });
             format!("{prefix}: status code {status}, body: {body}")
         }
         other => format!("{prefix}: {other}"),
@@ -156,13 +177,124 @@ fn encode_interactive_card_content(card: &Value) -> Result<String, String> {
     serde_json::to_string(card).map_err(|e| format!("序列化卡片失败: {e}"))
 }
 
+fn attachment_probe_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("BRIDGE_FEISHU_IMAGE_PROBE_DIR") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    std::env::temp_dir().join(DEFAULT_ATTACHMENT_PROBE_DIR)
+}
+
+fn build_message_resource_url(message_id: &str, resource_key: &str, kind: &str) -> String {
+    format!("{MSG_URL}/{message_id}/resources/{resource_key}?type={kind}")
+}
+
+fn derive_attachment_file_name(
+    attachment: &InboundAttachment,
+    content_disposition: Option<&str>,
+    content_type: Option<&str>,
+) -> String {
+    if let Some(file_name) = attachment
+        .file_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return sanitize_file_name(file_name);
+    }
+
+    if let Some(file_name) = parse_content_disposition_filename(content_disposition) {
+        return sanitize_file_name(&file_name);
+    }
+
+    let extension = content_type
+        .and_then(file_extension_from_content_type)
+        .unwrap_or("bin");
+    sanitize_file_name(&format!("{}.{}", attachment.resource_key, extension))
+}
+
+fn parse_content_disposition_filename(content_disposition: Option<&str>) -> Option<String> {
+    let header = content_disposition?;
+    for segment in header.split(';').map(str::trim) {
+        if let Some(value) = segment.strip_prefix("filename=") {
+            return Some(value.trim_matches('"').to_string());
+        }
+        if let Some(value) = segment.strip_prefix("filename*=") {
+            let value = value.split("''").last().unwrap_or(value);
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn file_extension_from_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type.split(';').next().unwrap_or("").trim() {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        _ => None,
+    }
+}
+
+fn sanitize_file_name(file_name: &str) -> String {
+    let cleaned = file_name
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            other => other,
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "attachment.bin".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn unique_attachment_path(base_dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = base_dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let stem = candidate
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let ext = candidate
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+
+    for index in 1..1000 {
+        let name = if ext.is_empty() {
+            format!("{stem}-{index}")
+        } else {
+            format!("{stem}-{index}.{ext}")
+        };
+        let next = base_dir.join(name);
+        if !next.exists() {
+            return next;
+        }
+    }
+
+    base_dir.join(format!("{}-fallback.bin", stem))
+}
+
 // ──────────────────────────── implementation ────────────────────────────
 
 impl FeishuClient {
     pub fn from_env() -> Result<Self, String> {
         dotenvy::dotenv().ok();
-        let app_id = std::env::var("FEISHU_APP_ID")
-            .map_err(|_| "环境变量 FEISHU_APP_ID 未设置，请先运行 setup-gui 进行配置".to_string())?;
+        let app_id = std::env::var("FEISHU_APP_ID").map_err(|_| {
+            "环境变量 FEISHU_APP_ID 未设置，请先运行 setup-gui 进行配置".to_string()
+        })?;
         let app_secret = std::env::var("FEISHU_APP_SECRET")
             .map_err(|_| "环境变量 FEISHU_APP_SECRET 未设置".to_string())?;
         Ok(Self {
@@ -185,7 +317,10 @@ impl FeishuClient {
             .map_err(|e| format!("解析 token 响应失败: {e}"))?;
 
         if resp.code != 0 {
-            return Err(format!("获取 token 失败 (code={}): {}", resp.code, resp.msg));
+            return Err(format!(
+                "获取 token 失败 (code={}): {}",
+                resp.code, resp.msg
+            ));
         }
         self.token = resp.tenant_access_token;
         Ok(())
@@ -265,6 +400,53 @@ impl FeishuClient {
         self.send_card_to(&target.receive_id, &target.receive_id_type, card)
     }
 
+    pub fn download_attachment_to_temp(
+        &self,
+        inbound: &InboundMessage,
+    ) -> Result<DownloadedAttachment, String> {
+        let token = self.token()?;
+        let attachment = inbound
+            .attachment
+            .as_ref()
+            .ok_or_else(|| "当前消息里没有可下载的附件信息".to_string())?;
+        let url = build_message_resource_url(
+            &inbound.message_id,
+            &attachment.resource_key,
+            &attachment.kind,
+        );
+
+        let response = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|error| format_http_error("下载飞书附件失败", error))?;
+
+        let content_type = response.header("Content-Type").map(str::to_string);
+        let content_disposition = response.header("Content-Disposition").map(str::to_string);
+        let file_name = derive_attachment_file_name(
+            attachment,
+            content_disposition.as_deref(),
+            content_type.as_deref(),
+        );
+
+        let target_dir = attachment_probe_dir();
+        fs::create_dir_all(&target_dir)
+            .map_err(|error| format!("创建附件临时目录失败: {error}"))?;
+
+        let target_path = unique_attachment_path(&target_dir, &file_name);
+        let mut reader = response.into_reader();
+        let mut file =
+            File::create(&target_path).map_err(|error| format!("创建附件临时文件失败: {error}"))?;
+        let size_bytes = io::copy(&mut reader, &mut file)
+            .map_err(|error| format!("写入附件临时文件失败: {error}"))?;
+
+        Ok(DownloadedAttachment {
+            local_path: target_path,
+            file_name,
+            size_bytes,
+            content_type,
+        })
+    }
+
     // ── WebSocket 长连接 ──
 
     /// 获取飞书 WebSocket 连接地址
@@ -332,75 +514,108 @@ impl FeishuClient {
     where
         F: FnMut(&FeishuClient, FeishuEvent),
     {
-        println!("🔗 正在获取 WebSocket 连接地址...");
-        let (ws_url, service_id) = self.get_ws_url()?;
-        println!("🔗 连接到飞书 WebSocket...");
-
-        let (mut socket, _response) =
-            connect(&ws_url).map_err(|e| format!("WebSocket 连接失败: {e}"))?;
-        println!("✅ WebSocket 已连接，等待飞书消息...");
-
+        let mut reconnect_attempt = 0u32;
         loop {
-            let msg = socket
-                .read()
-                .map_err(|e| format!("WebSocket 读取失败: {e}"))?;
+            println!("🔗 正在获取 WebSocket 连接地址...");
+            let (ws_url, service_id) = match self.get_ws_url() {
+                Ok(value) => value,
+                Err(error) => {
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    let delay_secs = reconnect_attempt.min(5) as u64;
+                    eprintln!("⚠️  获取 WebSocket 地址失败: {error}");
+                    println!("🔁 {delay_secs}s 后重试获取飞书 WebSocket 地址...");
+                    thread::sleep(Duration::from_secs(delay_secs));
+                    continue;
+                }
+            };
+            println!("🔗 连接到飞书 WebSocket...");
 
-            match msg {
-                WsMessage::Binary(data) => {
-                    match PbFrame::decode(data.as_slice()) {
-                        Ok(frame) => {
-                            let method = frame.method; // 0=CONTROL, 1=DATA
-                            let msg_type = frame.get_header("type").unwrap_or("");
+            let (mut socket, _response) = match connect(&ws_url) {
+                Ok(value) => value,
+                Err(error) => {
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    let delay_secs = reconnect_attempt.min(5) as u64;
+                    eprintln!("⚠️  WebSocket 连接失败: {error}");
+                    println!("🔁 {delay_secs}s 后重试连接飞书 WebSocket...");
+                    thread::sleep(Duration::from_secs(delay_secs));
+                    continue;
+                }
+            };
+            reconnect_attempt = 0;
+            println!("✅ WebSocket 已连接，等待飞书消息...");
 
-                            if method == 0 {
-                                // CONTROL frame (ping/pong)
-                                if msg_type == "ping" {
-                                    // 飞书发来 ping，不需要额外处理
-                                    // 我们主动发 ping 来保活
-                                }
-                            } else if method == 1 && msg_type == "event" {
-                                // DATA frame — 事件消息
-                                if let Some(payload) = &frame.payload {
-                                    let payload_str =
-                                        String::from_utf8_lossy(payload);
+            let disconnect_reason = loop {
+                let msg = match socket.read() {
+                    Ok(msg) => msg,
+                    Err(error) => break format!("WebSocket 读取失败: {error}"),
+                };
 
-                                    if let Some(inbound) =
-                                        Self::parse_event_payload(&payload_str)
-                                    {
-                                        handler(self, inbound);
-                                    } else {
-                                        eprintln!(
-                                            "[DEBUG] 未识别的飞书事件 payload: {}",
-                                            payload_str
-                                        );
+                match msg {
+                    WsMessage::Binary(data) => {
+                        match PbFrame::decode(data.as_slice()) {
+                            Ok(frame) => {
+                                let method = frame.method; // 0=CONTROL, 1=DATA
+                                let msg_type = frame.get_header("type").unwrap_or("");
+
+                                if method == 0 {
+                                    if msg_type == "ping" || msg_type == "pong" {
+                                        let resp_bytes = Self::build_response_frame(&frame);
+                                        if let Err(error) =
+                                            socket.send(WsMessage::Binary(resp_bytes))
+                                        {
+                                            break format!("WebSocket 心跳响应失败: {error}");
+                                        }
+                                    }
+                                } else if method == 1 && msg_type == "event" {
+                                    let resp_bytes = Self::build_response_frame(&frame);
+                                    if let Err(error) = socket.send(WsMessage::Binary(resp_bytes)) {
+                                        break format!("WebSocket ACK 发送失败: {error}");
+                                    }
+
+                                    if let Some(payload) = &frame.payload {
+                                        let payload_str = String::from_utf8_lossy(payload);
+
+                                        if let Some(inbound) =
+                                            Self::parse_event_payload(&payload_str)
+                                        {
+                                            handler(self, inbound);
+                                        } else {
+                                            eprintln!(
+                                                "[DEBUG] 未识别的飞书事件 payload: {}",
+                                                payload_str
+                                            );
+                                        }
                                     }
                                 }
-                                // 发送 ACK 响应
-                                let resp_bytes = Self::build_response_frame(&frame);
-                                let _ = socket.send(WsMessage::Binary(resp_bytes));
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[DEBUG] protobuf decode failed: {e}, raw: {:?}",
+                                    String::from_utf8_lossy(&data)
+                                );
                             }
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[DEBUG] protobuf decode failed: {e}, raw: {:?}",
-                                String::from_utf8_lossy(&data)
-                            );
+                    }
+                    WsMessage::Ping(data) => {
+                        if let Err(error) = socket.send(WsMessage::Pong(data)) {
+                            break format!("WebSocket Pong 发送失败: {error}");
                         }
                     }
+                    WsMessage::Close(reason) => {
+                        break format!("WebSocket 连接已关闭: {reason:?}");
+                    }
+                    _ => {}
                 }
-                WsMessage::Ping(data) => {
-                    let _ = socket.send(WsMessage::Pong(data));
-                }
-                WsMessage::Close(reason) => {
-                    println!("⚠️  WebSocket 连接已关闭: {reason:?}");
-                    break;
-                }
-                _ => {}
-            }
 
-            let _ = service_id;
+                let _ = service_id;
+            };
+
+            eprintln!("⚠️  {disconnect_reason}");
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            let delay_secs = reconnect_attempt.min(5) as u64;
+            println!("🔁 {delay_secs}s 后尝试重新连接飞书 WebSocket...");
+            thread::sleep(Duration::from_secs(delay_secs));
         }
-        Ok(())
     }
 
     /// 解析飞书事件 payload（JSON），提取用户消息
@@ -456,14 +671,15 @@ impl FeishuClient {
         let content_str = message.get("content")?.as_str()?;
         let content: serde_json::Value = serde_json::from_str(content_str).ok()?;
         let parsed = extract_message_body(&message_type, &content)?;
-        let (text, unsupported_reason) = match parsed {
+        let (text, attachment, unsupported_reason) = match parsed {
             ParsedMessageBody::Text(text) => {
                 if text.is_empty() {
                     return None;
                 }
-                (text, None)
+                (text, None, None)
             }
-            ParsedMessageBody::Unsupported { label, reason } => (label, Some(reason)),
+            ParsedMessageBody::Attachment { label, attachment } => (label, Some(attachment), None),
+            ParsedMessageBody::Unsupported { label, reason } => (label, None, Some(reason)),
         };
 
         Some(InboundMessage {
@@ -477,6 +693,7 @@ impl FeishuClient {
             message_type,
             text,
             message_id,
+            attachment,
             unsupported_reason,
         })
     }
@@ -534,7 +751,14 @@ impl FeishuClient {
 
 enum ParsedMessageBody {
     Text(String),
-    Unsupported { label: String, reason: String },
+    Attachment {
+        label: String,
+        attachment: InboundAttachment,
+    },
+    Unsupported {
+        label: String,
+        reason: String,
+    },
 }
 
 fn extract_message_body(message_type: &str, content: &Value) -> Option<ParsedMessageBody> {
@@ -553,6 +777,17 @@ fn extract_message_body(message_type: &str, content: &Value) -> Option<ParsedMes
             }
         }
         "post" => extract_post_message_body(content),
+        "image" => {
+            let image_key = content.get("image_key").and_then(|v| v.as_str())?;
+            Some(ParsedMessageBody::Attachment {
+                label: "飞书图片消息".to_string(),
+                attachment: InboundAttachment {
+                    kind: "image".to_string(),
+                    resource_key: image_key.to_string(),
+                    file_name: None,
+                },
+            })
+        }
         other => Some(ParsedMessageBody::Unsupported {
             label: summarize_unsupported_message(other, content),
             reason: unsupported_message_reply(other, content),
@@ -701,7 +936,10 @@ fn strip_leading_list_marker(line: &str) -> &str {
         }
     }
 
-    let digit_count = trimmed.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    let digit_count = trimmed
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
     if digit_count == 0 {
         return trimmed;
     }
@@ -785,6 +1023,7 @@ mod tests {
             FeishuEvent::Message(message) => {
                 assert_eq!(message.text, "继续");
                 assert_eq!(message.message_type, "text");
+                assert!(message.attachment.is_none());
                 assert!(message.unsupported_reason.is_none());
                 assert_eq!(message.reply_target.receive_id_type, "chat_id");
             }
@@ -792,9 +1031,9 @@ mod tests {
         }
     }
 
-        #[test]
-        fn parse_multiline_text_message_payload() {
-                let payload = r#"{
+    #[test]
+    fn parse_multiline_text_message_payload() {
+        let payload = r#"{
                     "schema": "2.0",
                     "header": { "event_id": "evt_2", "event_type": "im.message.receive_v1" },
                     "event": {
@@ -808,18 +1047,18 @@ mod tests {
                     }
                 }"#;
 
-                let event = FeishuClient::parse_event_payload(payload).unwrap();
-                match event {
-                        FeishuEvent::Message(message) => {
-                                assert_eq!(message.text, "执行计划 git status\n$ pwd");
-                        }
-                        _ => panic!("expected message event"),
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "执行计划 git status\n$ pwd");
+            }
+            _ => panic!("expected message event"),
         }
+    }
 
-        #[test]
-        fn parse_post_message_payload() {
-                let payload = r#"{
+    #[test]
+    fn parse_post_message_payload() {
+        let payload = r#"{
                     "schema": "2.0",
                     "header": { "event_id": "evt_3", "event_type": "im.message.receive_v1" },
                     "event": {
@@ -833,18 +1072,18 @@ mod tests {
                     }
                 }"#;
 
-                let event = FeishuClient::parse_event_payload(payload).unwrap();
-                match event {
-                        FeishuEvent::Message(message) => {
-                                assert_eq!(message.text, "执行计划 git status\n$ pwd");
-                        }
-                        _ => panic!("expected message event"),
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "执行计划 git status\n$ pwd");
+            }
+            _ => panic!("expected message event"),
         }
+    }
 
-                #[test]
-                fn parse_flat_post_message_payload() {
-                    let payload = r#"{
+    #[test]
+    fn parse_flat_post_message_payload() {
+        let payload = r#"{
                         "schema": "2.0",
                         "header": { "event_id": "evt_4", "event_type": "im.message.receive_v1" },
                         "event": {
@@ -859,19 +1098,19 @@ mod tests {
                         }
                     }"#;
 
-                    let event = FeishuClient::parse_event_payload(payload).unwrap();
-                    match event {
-                        FeishuEvent::Message(message) => {
-                            assert_eq!(message.text, "执行全部 读取 src/lib.rs 1-20; $ false");
-                            assert!(message.unsupported_reason.is_none());
-                        }
-                        _ => panic!("expected message event"),
-                    }
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "执行全部 读取 src/lib.rs 1-20; $ false");
+                assert!(message.unsupported_reason.is_none());
+            }
+            _ => panic!("expected message event"),
+        }
+    }
 
-        #[test]
-        fn parse_numbered_text_message_payload() {
-                let payload = r#"{
+    #[test]
+    fn parse_numbered_text_message_payload() {
+        let payload = r#"{
                     "schema": "2.0",
                     "header": { "event_id": "evt_4b", "event_type": "im.message.receive_v1" },
                     "event": {
@@ -885,19 +1124,19 @@ mod tests {
                     }
                 }"#;
 
-                let event = FeishuClient::parse_event_payload(payload).unwrap();
-                match event {
-                        FeishuEvent::Message(message) => {
-                                assert_eq!(message.text, "重置 Copilot 会话");
-                                assert!(message.unsupported_reason.is_none());
-                        }
-                        _ => panic!("expected message event"),
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "重置 Copilot 会话");
+                assert!(message.unsupported_reason.is_none());
+            }
+            _ => panic!("expected message event"),
         }
+    }
 
-        #[test]
-        fn parse_image_message_payload_as_unsupported() {
-                let payload = r#"{
+    #[test]
+    fn parse_image_message_payload_as_supported_attachment() {
+        let payload = r#"{
                     "schema": "2.0",
                     "header": { "event_id": "evt_5", "event_type": "im.message.receive_v1" },
                     "event": {
@@ -912,23 +1151,22 @@ mod tests {
                     }
                 }"#;
 
-                let event = FeishuClient::parse_event_payload(payload).unwrap();
-                match event {
-                        FeishuEvent::Message(message) => {
-                                assert_eq!(message.text, "飞书图片消息");
-                                assert!(message
-                                        .unsupported_reason
-                                        .as_deref()
-                                        .unwrap()
-                                        .contains("只自动处理纯文本命令"));
-                        }
-                        _ => panic!("expected message event"),
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "飞书图片消息");
+                assert!(message.unsupported_reason.is_none());
+                let attachment = message.attachment.expect("attachment should exist");
+                assert_eq!(attachment.kind, "image");
+                assert_eq!(attachment.resource_key, "img_xxx");
+            }
+            _ => panic!("expected message event"),
         }
+    }
 
-        #[test]
-        fn parse_file_message_payload_as_unsupported() {
-                let payload = r#"{
+    #[test]
+    fn parse_file_message_payload_as_unsupported() {
+        let payload = r#"{
                     "schema": "2.0",
                     "header": { "event_id": "evt_6", "event_type": "im.message.receive_v1" },
                     "event": {
@@ -943,23 +1181,23 @@ mod tests {
                     }
                 }"#;
 
-                let event = FeishuClient::parse_event_payload(payload).unwrap();
-                match event {
-                        FeishuEvent::Message(message) => {
-                                assert_eq!(message.text, "飞书附件消息: error.log");
-                                assert!(message
-                                        .unsupported_reason
-                                        .as_deref()
-                                        .unwrap()
-                                        .contains("文件名、关键路径"));
-                        }
-                        _ => panic!("expected message event"),
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "飞书附件消息: error.log");
+                assert!(message
+                    .unsupported_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("文件名、关键路径"));
+            }
+            _ => panic!("expected message event"),
         }
+    }
 
-        #[test]
-        fn parse_post_message_with_image_tag_as_unsupported() {
-                let payload = r#"{
+    #[test]
+    fn parse_post_message_with_image_tag_as_unsupported() {
+        let payload = r#"{
                     "schema": "2.0",
                     "header": { "event_id": "evt_7", "event_type": "im.message.receive_v1" },
                     "event": {
@@ -974,19 +1212,19 @@ mod tests {
                     }
                 }"#;
 
-                let event = FeishuClient::parse_event_payload(payload).unwrap();
-                match event {
-                        FeishuEvent::Message(message) => {
-                                assert_eq!(message.text, "飞书富文本消息（含图片）");
-                                assert!(message
-                                        .unsupported_reason
-                                        .as_deref()
-                                        .unwrap()
-                                        .contains("不自动解析这类非纯文本内容"));
-                        }
-                        _ => panic!("expected message event"),
-                }
+        let event = FeishuClient::parse_event_payload(payload).unwrap();
+        match event {
+            FeishuEvent::Message(message) => {
+                assert_eq!(message.text, "飞书富文本消息（含图片）");
+                assert!(message
+                    .unsupported_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("不自动解析这类非纯文本内容"));
+            }
+            _ => panic!("expected message event"),
         }
+    }
 
     #[test]
     fn parse_card_action_payload() {

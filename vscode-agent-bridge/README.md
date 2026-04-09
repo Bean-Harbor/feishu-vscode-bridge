@@ -102,6 +102,22 @@ Expected result:
 - Feishu receives a text response containing the bridge `session` id and model answer
 - the second turn stays on the same Feishu/extension session instead of starting a fresh ask session
 
+## Local Endpoint Smoke
+
+After the Extension Development Host is up and `http://127.0.0.1:8765/health` returns `ok`, you can run this from the repository root to validate semantic planner confirm routing and multi-round agent continuation without going through Feishu:
+
+```powershell
+.\scripts\smoke-agent-runtime.ps1
+```
+
+The default script run is now planner-first: it validates `/health` plus `/v1/chat/plan` confirm routing. Add `-IncludeAgent` only when you also want to probe `/v1/chat/agent/start` and `/v1/chat/agent/continue`, and expect that path to depend on current model availability and quota.
+
+Expected result:
+
+- default run: `/v1/chat/plan` returns `decision=confirm` for the ambiguous GitHub sync phrase
+- `-IncludeAgent`: `/v1/chat/agent/start` returns a non-failed run with checkpoints when model availability allows it
+- `-IncludeAgent`: `/v1/chat/agent/continue` returns the same `runId` with a larger checkpoint count than the start response when the agent path is available
+
 ## Current Limitations
 
 - The Rust bridge currently only uses the direct ask path: `问 Copilot <问题>`

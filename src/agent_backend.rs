@@ -14,6 +14,7 @@ use serde_json::Value;
 
 pub const AGENT_BACKEND_ENV: &str = "BRIDGE_AGENT_BACKEND";
 pub const COPILOT_CLI_PATH_ENV: &str = "BRIDGE_COPILOT_CLI_PATH";
+pub const CODEX_CLI_PATH_ENV: &str = "BRIDGE_CODEX_CLI_PATH";
 const COPILOT_CLI_RUN_STORE_FILE: &str = ".feishu-vscode-bridge-cli-runs.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,11 +56,23 @@ pub fn current_backend_kind() -> AgentBackendKind {
     AgentBackendKind::from_env()
 }
 
-pub fn ask_agent(session_id: &str, prompt: &str) -> vscode::AgentAskResult {
+pub fn ask_agent(
+    session_id: &str,
+    prompt: &str,
+    _current_project: Option<&str>,
+) -> vscode::AgentAskResult {
     match current_backend_kind() {
         AgentBackendKind::VscodeCompanion => vscode::ask_agent(session_id, prompt),
         AgentBackendKind::CopilotCli => ask_agent_via_copilot_cli(session_id, prompt),
     }
+}
+
+pub fn ask_codex(
+    session_id: &str,
+    prompt: &str,
+    current_project: Option<&str>,
+) -> vscode::AgentAskResult {
+    ask_agent_via_codex_cli(session_id, prompt, current_project)
 }
 
 pub fn reset_agent_session(session_id: &str) -> CmdResult {
@@ -91,7 +104,9 @@ pub fn start_agent_run(
         AgentBackendKind::VscodeCompanion => {
             vscode::start_agent_run(session_id, prompt, current_project)
         }
-        AgentBackendKind::CopilotCli => start_agent_run_via_copilot_cli(session_id, prompt, current_project),
+        AgentBackendKind::CopilotCli => {
+            start_agent_run_via_copilot_cli(session_id, prompt, current_project)
+        }
     }
 }
 
@@ -101,10 +116,10 @@ pub fn continue_agent_run(
     prompt: Option<&str>,
 ) -> vscode::AgentRunResult {
     match current_backend_kind() {
-        AgentBackendKind::VscodeCompanion => {
-            vscode::continue_agent_run(session_id, run_id, prompt)
+        AgentBackendKind::VscodeCompanion => vscode::continue_agent_run(session_id, run_id, prompt),
+        AgentBackendKind::CopilotCli => {
+            continue_agent_run_via_copilot_cli(session_id, run_id, prompt)
         }
-        AgentBackendKind::CopilotCli => continue_agent_run_via_copilot_cli(session_id, run_id, prompt),
     }
 }
 
@@ -125,7 +140,9 @@ pub fn approve_agent_run(
         AgentBackendKind::VscodeCompanion => {
             vscode::approve_agent_run(session_id, run_id, decision_id, option_id)
         }
-        AgentBackendKind::CopilotCli => approve_cli_agent_run(session_id, run_id, decision_id, option_id),
+        AgentBackendKind::CopilotCli => {
+            approve_cli_agent_run(session_id, run_id, decision_id, option_id)
+        }
     }
 }
 
@@ -159,14 +176,57 @@ fn ask_agent_via_copilot_cli(session_id: &str, prompt: &str) -> vscode::AgentAsk
             .session_id
             .clone()
             .or_else(|| Some(session_id.trim().to_string()).filter(|value| !value.is_empty())),
-        status: if result.cmd.success { "answered".to_string() } else { "blocked".to_string() },
+        status: if result.cmd.success {
+            "answered".to_string()
+        } else {
+            "blocked".to_string()
+        },
         message: message.clone(),
         summary: Some(summarize_text(&message)),
         current_action: Some("Executed Copilot CLI prompt".to_string()),
         next_action: Some(if result.cmd.success {
-            "You can continue the task, ask a narrower follow-up, or start an autonomous run.".to_string()
+            "You can continue the task, ask a narrower follow-up, or start an autonomous run."
+                .to_string()
         } else {
-            "Check Copilot CLI login/status or switch back to the VS Code companion backend.".to_string()
+            "Check Copilot CLI login/status or switch back to the VS Code companion backend."
+                .to_string()
+        }),
+        related_files: Vec::new(),
+        tool_call: None,
+        tool_result_summary: None,
+        run: None,
+        duration_ms: result.cmd.duration_ms,
+        error: (!result.cmd.success).then_some(message),
+    }
+}
+
+fn ask_agent_via_codex_cli(
+    session_id: &str,
+    prompt: &str,
+    current_project: Option<&str>,
+) -> vscode::AgentAskResult {
+    let project_path = current_project
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let result = run_codex_cli_prompt(prompt, project_path.as_deref());
+    let message = result.message();
+
+    vscode::AgentAskResult {
+        success: result.cmd.success,
+        session_id: Some(session_id.trim().to_string()).filter(|value| !value.is_empty()),
+        status: if result.cmd.success {
+            "answered".to_string()
+        } else {
+            "blocked".to_string()
+        },
+        message: message.clone(),
+        summary: Some(summarize_text(&message)),
+        current_action: Some("Executed Codex CLI prompt".to_string()),
+        next_action: Some(if result.cmd.success {
+            "You can continue with another /codex prompt, or switch back to Copilot/agent runtime when available.".to_string()
+        } else {
+            "Check Codex CLI authentication/configuration, or retry with a narrower prompt."
+                .to_string()
         }),
         related_files: Vec::new(),
         tool_call: None,
@@ -240,7 +300,11 @@ fn execute_cli_agent_prompt(
     let summary = summarize_text(&message);
     let checkpoint = RunCheckpoint {
         checkpoint_id: format!("cli-{}", current_timestamp_ms()),
-        label: if result.cmd.success { "completed".to_string() } else { "failed".to_string() },
+        label: if result.cmd.success {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        },
         status_summary: summary.clone(),
         timestamp_ms: current_timestamp_ms(),
     };
@@ -256,7 +320,12 @@ fn execute_cli_agent_prompt(
         } else {
             "Check Copilot CLI authentication or backend permissions before retrying.".to_string()
         },
-        current_step: Some(if result.cmd.success { "completed".to_string() } else { "failed".to_string() }),
+        current_step: Some(if result.cmd.success {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        }),
+        waiting_reason: None,
         authorization_policy: Some(AgentAuthorizationPolicy::default()),
         result_disposition: ResultDisposition::Pending,
         pending_user_decision: None,
@@ -291,8 +360,11 @@ fn unsupported_cli_run_result(
             status: AgentRunStatus::WaitingUser,
             summary: message.to_string(),
             current_action: "Copilot CLI backend needs more runtime integration".to_string(),
-            next_action: "Use continue with a new prompt, or switch to the VS Code companion backend.".to_string(),
+            next_action:
+                "Use continue with a new prompt, or switch to the VS Code companion backend."
+                    .to_string(),
             current_step: Some("waiting_user".to_string()),
+            waiting_reason: None,
             authorization_policy: Some(AgentAuthorizationPolicy::default()),
             result_disposition: ResultDisposition::Pending,
             pending_user_decision: None,
@@ -436,7 +508,8 @@ fn cancel_cli_agent_run(session_id: &str, run_id: &str) -> vscode::AgentRunResul
     run.current_action = "Cancelled Copilot CLI run".to_string();
     run.next_action = "Start a new run when ready.".to_string();
     run.current_step = Some("cancelled".to_string());
-    run.summary = "The Copilot CLI run was marked as cancelled in bridge runtime state.".to_string();
+    run.summary =
+        "The Copilot CLI run was marked as cancelled in bridge runtime state.".to_string();
     run.checkpoints.push(RunCheckpoint {
         checkpoint_id: format!("cancel-{}", current_timestamp_ms()),
         label: "cancelled".to_string(),
@@ -520,6 +593,21 @@ impl CopilotCliPromptResult {
     }
 }
 
+struct CodexCliPromptResult {
+    cmd: CmdResult,
+    assistant_message: Option<String>,
+}
+
+impl CodexCliPromptResult {
+    fn message(&self) -> String {
+        self.assistant_message
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| preferred_output(&self.cmd))
+    }
+}
+
 fn run_copilot_cli_prompt(
     prompt: &str,
     current_project: Option<&str>,
@@ -567,7 +655,10 @@ fn run_copilot_cli_prompt(
             "--no-ask-user",
         ]);
 
-        if let Some(project) = current_project.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(project) = current_project
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             command.args(["--add-dir", project]);
             command.current_dir(project);
         }
@@ -590,7 +681,10 @@ fn run_copilot_cli_prompt(
             "--no-ask-user",
         ]);
 
-        if let Some(project) = current_project.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(project) = current_project
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             command.args(["--add-dir", project]);
             command.current_dir(project);
         }
@@ -640,12 +734,19 @@ fn parse_copilot_cli_json_output(stdout: &str) -> (Option<String>, Option<String
     let mut session_id = None;
     let mut assistant_message = None;
 
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
 
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match kind {
             "assistant.message" => {
                 assistant_message = value
@@ -667,6 +768,73 @@ fn parse_copilot_cli_json_output(stdout: &str) -> (Option<String>, Option<String
     }
 
     (session_id, assistant_message)
+}
+
+fn run_codex_cli_prompt(
+    prompt: &str,
+    current_project: Option<&std::path::Path>,
+) -> CodexCliPromptResult {
+    let trimmed_prompt = prompt.trim();
+    if trimmed_prompt.is_empty() {
+        return CodexCliPromptResult {
+            cmd: CmdResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "prompt cannot be empty".to_string(),
+                exit_code: Some(2),
+                duration_ms: 0,
+            },
+            assistant_message: None,
+        };
+    }
+
+    let cli_path = std::env::var(CODEX_CLI_PATH_ENV).unwrap_or_else(|_| "codex".to_string());
+    let output_path = std::env::temp_dir().join(format!(
+        "feishu-vscode-bridge-codex-{}.txt",
+        current_timestamp_ms()
+    ));
+    let start = Instant::now();
+    let mut command = Command::new(&cli_path);
+    command.args(["exec", "--skip-git-repo-check", "--json", "-o"]);
+    command.arg(&output_path);
+
+    if let Some(project) = current_project {
+        command.args(["-C"]);
+        command.arg(project);
+        command.current_dir(project);
+    }
+
+    command.arg(trimmed_prompt);
+    let output = command.output();
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let assistant_message = std::fs::read_to_string(&output_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let _ = std::fs::remove_file(&output_path);
+
+    match output {
+        Ok(output) => CodexCliPromptResult {
+            cmd: CmdResult {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                exit_code: output.status.code(),
+                duration_ms,
+            },
+            assistant_message,
+        },
+        Err(error) => CodexCliPromptResult {
+            cmd: CmdResult {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("failed to execute Codex CLI: {error}"),
+                exit_code: None,
+                duration_ms,
+            },
+            assistant_message,
+        },
+    }
 }
 
 fn preferred_output(result: &CmdResult) -> String {

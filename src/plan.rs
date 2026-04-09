@@ -161,15 +161,17 @@ impl PlanSession {
         G: FnMut(usize, usize, &Intent, bool) -> Option<ApprovalRequest>,
     {
         let Some(pending) = self.pending_approval.take() else {
-            return self.pending_approval_progress().unwrap_or_else(|| PlanProgress {
-                executed: Vec::new(),
-                total_steps: self.total_steps(),
-                next_step: self.next_step,
-                completed: self.is_complete(),
-                paused_on_failure: false,
-                paused_on_approval: false,
-                approval_request: None,
-            });
+            return self
+                .pending_approval_progress()
+                .unwrap_or_else(|| PlanProgress {
+                    executed: Vec::new(),
+                    total_steps: self.total_steps(),
+                    next_step: self.next_step,
+                    completed: self.is_complete(),
+                    paused_on_failure: false,
+                    paused_on_approval: false,
+                    approval_request: None,
+                });
         };
 
         let max_steps = if pending.run_all_after_approval {
@@ -231,12 +233,9 @@ impl PlanSession {
             let intent = self.steps[self.next_step].clone();
 
             if Some(self.next_step) != skip_approval_for_step {
-                if let Some(request) = approval_request(
-                    self.next_step,
-                    step_number,
-                    &intent,
-                    run_all_after_approval,
-                ) {
+                if let Some(request) =
+                    approval_request(self.next_step, step_number, &intent, run_all_after_approval)
+                {
                     self.pending_approval = Some(request.clone());
                     paused_on_approval = true;
                     pending_request = Some(request);
@@ -359,7 +358,13 @@ mod tests {
         assert!(progress.executed.is_empty());
         assert!(progress.paused_on_approval);
         assert!(!progress.paused_on_failure);
-        assert_eq!(progress.approval_request.as_ref().map(|request| request.step_number), Some(1));
+        assert_eq!(
+            progress
+                .approval_request
+                .as_ref()
+                .map(|request| request.step_number),
+            Some(1)
+        );
         assert_eq!(
             progress
                 .approval_request

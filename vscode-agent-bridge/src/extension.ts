@@ -93,6 +93,7 @@ type SessionState = {
     lastResponseSummary?: string;
     recentUserPrompts: string[];
     recentWorkspaceFiles: string[];
+    recentRuntimeToolRequests: AgentToolCall[];
     currentTask?: string;
     pendingToolRequest?: PendingToolRequest;
     pendingRuntimeToolRequest?: PendingRuntimeToolRequest;
@@ -176,6 +177,7 @@ type AgentRunState = {
     currentAction: string;
     nextAction: string;
     currentStep?: string;
+    waitingReason?: string;
     authorizationPolicy?: AgentAuthorizationPolicy;
     resultDisposition: ResultDisposition;
     pendingUserDecision?: PendingUserDecision;
@@ -188,6 +190,21 @@ type AgentRunResponse = {
     sessionId: string;
     message: string;
     run: AgentRunState;
+};
+
+type AgentRunTransition = {
+    status?: AgentRunStatus;
+    currentAction?: string;
+    nextAction?: string;
+    currentStep?: string;
+    summary?: string;
+    waitingReason?: string | null;
+    pendingUserDecision?: PendingUserDecision | null;
+    resultDisposition?: ResultDisposition;
+    checkpoint?: {
+        label: string;
+        statusSummary: string;
+    };
 };
 
 type AgentStatus = 'answered' | 'working' | 'needs_tool' | 'waiting_user' | 'blocked' | 'completed';
@@ -777,16 +794,20 @@ async function handleAgentApprove(bridge: BridgeContext, payload: AgentApproveRe
 
     if (pending.controlKind === 'authorization' && selected.optionId === 'reject_tool') {
         session.pendingRuntimeToolRequest = undefined;
-        run.pendingUserDecision = undefined;
-        run.status = 'waiting_user';
-        run.currentAction = 'Rejected the pending runtime tool request';
-        run.nextAction = 'Continue with a narrower instruction, or approve a different write action later.';
-        run.currentStep = 'authorization_rejected';
-        run.summary = 'The pending write action was rejected and not executed.';
-        run.checkpoints.push(createCheckpoint('authorization-rejected', run.summary));
-        session.agentRun = run;
-        session.updatedAt = Date.now();
-        bridge.sessions.set(sessionId, session);
+        applyAgentRunTransition(run, {
+            status: 'waiting_user',
+            currentAction: 'Rejected the pending runtime tool request',
+            nextAction: 'Continue with a narrower instruction, or approve a different write action later.',
+            currentStep: 'authorization_rejected',
+            summary: 'The pending write action was rejected and not executed.',
+            waitingReason: 'authorization_rejected',
+            pendingUserDecision: null,
+            checkpoint: {
+                label: 'authorization-rejected',
+                statusSummary: 'The pending write action was rejected and not executed.',
+            },
+        });
+        persistAgentRunSession(bridge, sessionId, session, run);
 
         return {
             sessionId,
@@ -796,19 +817,22 @@ async function handleAgentApprove(bridge: BridgeContext, payload: AgentApproveRe
     }
 
     if (pending.controlKind === 'result_disposition') {
-        run.pendingUserDecision = undefined;
+        applyAgentRunTransition(run, { pendingUserDecision: null, waitingReason: null });
 
         if (selected.optionId === 'keep_result') {
-            run.resultDisposition = 'kept';
-            run.status = 'completed';
-            run.currentAction = 'Marked the current runtime result as kept';
-            run.nextAction = 'You can continue the run with a follow-up request, or start a new task.';
-            run.currentStep = 'result_kept';
-            run.summary = 'The runtime result was kept.';
-            run.checkpoints.push(createCheckpoint('result-kept', run.summary));
-            session.agentRun = run;
-            session.updatedAt = Date.now();
-            bridge.sessions.set(sessionId, session);
+            applyAgentRunTransition(run, {
+                resultDisposition: 'kept',
+                status: 'completed',
+                currentAction: 'Marked the current runtime result as kept',
+                nextAction: 'You can continue the run with a follow-up request, or start a new task.',
+                currentStep: 'result_kept',
+                summary: 'The runtime result was kept.',
+                checkpoint: {
+                    label: 'result-kept',
+                    statusSummary: 'The runtime result was kept.',
+                },
+            });
+            persistAgentRunSession(bridge, sessionId, session, run);
 
             return {
                 sessionId,
@@ -820,25 +844,33 @@ async function handleAgentApprove(bridge: BridgeContext, payload: AgentApproveRe
         if (selected.optionId === 'revert_result') {
             const reverted = await revertRuntimeArtifacts(session, run);
             if (!reverted.success) {
-                run.status = 'failed';
-                run.currentAction = 'Failed to revert the current runtime result';
-                run.nextAction = 'Inspect the workspace state and retry or recover manually.';
-                run.currentStep = 'result_revert_failed';
-                run.summary = reverted.summary;
-                run.checkpoints.push(createCheckpoint('result-revert-failed', reverted.summary));
+                applyAgentRunTransition(run, {
+                    status: 'failed',
+                    currentAction: 'Failed to revert the current runtime result',
+                    nextAction: 'Inspect the workspace state and retry or recover manually.',
+                    currentStep: 'result_revert_failed',
+                    summary: reverted.summary,
+                    checkpoint: {
+                        label: 'result-revert-failed',
+                        statusSummary: reverted.summary,
+                    },
+                });
             } else {
-                run.resultDisposition = 'reverted';
-                run.status = 'completed';
-                run.currentAction = 'Reverted the current runtime result';
-                run.nextAction = 'You can continue with a narrower follow-up request or start a new task.';
-                run.currentStep = 'result_reverted';
-                run.summary = reverted.summary;
-                run.checkpoints.push(createCheckpoint('result-reverted', reverted.summary));
+                applyAgentRunTransition(run, {
+                    resultDisposition: 'reverted',
+                    status: 'completed',
+                    currentAction: 'Reverted the current runtime result',
+                    nextAction: 'You can continue with a narrower follow-up request or start a new task.',
+                    currentStep: 'result_reverted',
+                    summary: reverted.summary,
+                    checkpoint: {
+                        label: 'result-reverted',
+                        statusSummary: reverted.summary,
+                    },
+                });
             }
 
-            session.agentRun = run;
-            session.updatedAt = Date.now();
-            bridge.sessions.set(sessionId, session);
+            persistAgentRunSession(bridge, sessionId, session, run);
 
             return {
                 sessionId,
@@ -848,16 +880,19 @@ async function handleAgentApprove(bridge: BridgeContext, payload: AgentApproveRe
         }
 
         if (selected.optionId === 'abandon_result') {
-            run.resultDisposition = 'abandoned';
-            run.status = 'completed';
-            run.currentAction = 'Marked the current runtime result as abandoned';
-            run.nextAction = 'Start a fresh run if you want to retry with a different approach.';
-            run.currentStep = 'result_abandoned';
-            run.summary = 'The runtime result was abandoned without being kept.';
-            run.checkpoints.push(createCheckpoint('result-abandoned', run.summary));
-            session.agentRun = run;
-            session.updatedAt = Date.now();
-            bridge.sessions.set(sessionId, session);
+            applyAgentRunTransition(run, {
+                resultDisposition: 'abandoned',
+                status: 'completed',
+                currentAction: 'Marked the current runtime result as abandoned',
+                nextAction: 'Start a fresh run if you want to retry with a different approach.',
+                currentStep: 'result_abandoned',
+                summary: 'The runtime result was abandoned without being kept.',
+                checkpoint: {
+                    label: 'result-abandoned',
+                    statusSummary: 'The runtime result was abandoned without being kept.',
+                },
+            });
+            persistAgentRunSession(bridge, sessionId, session, run);
 
             return {
                 sessionId,
@@ -867,18 +902,25 @@ async function handleAgentApprove(bridge: BridgeContext, payload: AgentApproveRe
         }
     }
 
-    run.pendingUserDecision = undefined;
-    run.checkpoints.push(createCheckpoint('approval', `Approved decision ${decisionId} with ${selected.label}`));
+    applyAgentRunTransition(run, {
+        pendingUserDecision: null,
+        waitingReason: null,
+        checkpoint: {
+            label: 'approval',
+            statusSummary: `Approved decision ${decisionId} with ${selected.label}`,
+        },
+    });
 
     if (selected.optionId === 'cancel_run') {
         session.pendingRuntimeToolRequest = undefined;
-        run.status = 'cancelled';
-        run.currentAction = 'Cancelled agent runtime from approval decision';
-        run.nextAction = 'Start a new run when ready.';
-        run.currentStep = 'cancelled';
-        session.agentRun = run;
-        session.updatedAt = Date.now();
-        bridge.sessions.set(sessionId, session);
+        applyAgentRunTransition(run, {
+            status: 'cancelled',
+            currentAction: 'Cancelled agent runtime from approval decision',
+            nextAction: 'Start a new run when ready.',
+            currentStep: 'cancelled',
+            waitingReason: null,
+        });
+        persistAgentRunSession(bridge, sessionId, session, run);
 
         return {
             sessionId,
@@ -912,16 +954,20 @@ function handleAgentCancel(bridge: BridgeContext, payload: AgentCancelRequest): 
     const session = getAgentSession(bridge, sessionId);
     const run = assertAgentRun(session, runId);
 
-    run.pendingUserDecision = undefined;
     session.pendingRuntimeToolRequest = undefined;
-    run.status = 'cancelled';
-    run.currentAction = 'Cancelled agent runtime skeleton';
-    run.nextAction = 'Start a new run when ready.';
-    run.currentStep = 'runtime_scaffold_cancelled';
-    run.checkpoints.push(createCheckpoint('cancel', 'Cancelled by user request'));
-    session.agentRun = run;
-    session.updatedAt = Date.now();
-    bridge.sessions.set(sessionId, session);
+    applyAgentRunTransition(run, {
+        pendingUserDecision: null,
+        status: 'cancelled',
+        currentAction: 'Cancelled agent runtime skeleton',
+        nextAction: 'Start a new run when ready.',
+        currentStep: 'runtime_scaffold_cancelled',
+        waitingReason: null,
+        checkpoint: {
+            label: 'cancel',
+            statusSummary: 'Cancelled by user request',
+        },
+    });
+    persistAgentRunSession(bridge, sessionId, session, run);
 
     return {
         sessionId,
@@ -993,8 +1039,9 @@ async function handleSemanticPlan(
         runtimeConfigForMode('plan'),
     );
 
-    if (decision) {
-        return decision;
+    const stabilizedDecision = stabilizeSemanticPlanDecision(prompt, decision);
+    if (stabilizedDecision) {
+        return stabilizedDecision;
     }
 
     return {
@@ -1007,6 +1054,71 @@ async function handleSemanticPlan(
         actions: [],
         options: [],
     };
+}
+
+function stabilizeSemanticPlanDecision(
+    prompt: string,
+    decision: SemanticPlanResponse | null,
+): SemanticPlanResponse | null {
+    if (!looksLikeAmbiguousGitSyncRequest(prompt)) {
+        return decision;
+    }
+
+    const canonicalOptions = canonicalAmbiguousGitSyncOptions();
+    const summaryForUser = decision?.summaryForUser?.trim()
+        ? decision.summaryForUser.trim()
+        : '这句话可能表示不同的 Git 同步动作，先确认更安全。';
+    const confidence = decision?.confidence ?? null;
+
+    return {
+        decision: 'confirm',
+        message: '这句话可能表示只推送已提交内容，也可能表示自动提交后再推送，先确认更安全。',
+        summary: decision?.summary?.trim()
+            ? decision.summary.trim()
+            : 'ambiguous github sync request requires confirmation',
+        summaryForUser,
+        confidence,
+        risk: 'medium',
+        actions: [],
+        options: canonicalOptions,
+    };
+}
+
+function looksLikeAmbiguousGitSyncRequest(taskText: string): boolean {
+    const trimmed = taskText.trim();
+    const lower = trimmed.toLowerCase();
+    const mentionsGithub = lower.includes('github');
+    const mentionsSync = trimmed.includes('同步') || lower.includes('sync');
+    const mentionsLocalChanges = trimmed.includes('本地')
+        || trimmed.includes('改动')
+        || trimmed.includes('变更')
+        || trimmed.includes('代码')
+        || trimmed.includes('提交');
+
+    return mentionsGithub && mentionsSync && mentionsLocalChanges;
+}
+
+function canonicalAmbiguousGitSyncOptions(): SemanticConfirmOption[] {
+    return [
+        {
+            label: '仅推送已提交内容',
+            command: 'git push',
+            note: '不会自动创建 commit。',
+            primary: true,
+        },
+        {
+            label: '自动提交并推送',
+            command: 'git push auto commit via feishu-bridge',
+            note: '会自动 add/commit/push。',
+            primary: false,
+        },
+        {
+            label: '先看状态',
+            command: '同步 Git 状态',
+            note: '先确认当前仓库里有哪些未提交改动。',
+            primary: false,
+        },
+    ];
 }
 
 function collectEditorContext(): string {
@@ -1039,6 +1151,7 @@ function createSession(): SessionState {
         ],
         recentUserPrompts: [],
         recentWorkspaceFiles: [],
+        recentRuntimeToolRequests: [],
         runtimeArtifactSnapshots: {},
         updatedAt: Date.now(),
     };
@@ -1098,6 +1211,7 @@ function createAgentRunState(
         currentAction: `Initialized ${config.summaryLabel.toLowerCase()} and persisted the initial goal`,
         nextAction: 'The configured runtime loop will start immediately.',
         currentStep: 'initialized',
+        waitingReason: undefined,
         authorizationPolicy: {
             requireWriteApproval: config.allowWriteTools,
             requireShellApproval: true,
@@ -1147,6 +1261,128 @@ function assertAgentRun(session: SessionState, runId: string): AgentRunState {
                 options: [...run.pendingUserDecision.options],
             }
             : undefined,
+    };
+}
+
+function applyAgentRunTransition(run: AgentRunState, transition: AgentRunTransition): void {
+    if (transition.status) {
+        run.status = transition.status;
+    }
+    if (transition.currentAction) {
+        run.currentAction = transition.currentAction;
+    }
+    if (transition.nextAction) {
+        run.nextAction = transition.nextAction;
+    }
+    if (transition.currentStep) {
+        run.currentStep = transition.currentStep;
+    }
+    if (transition.summary) {
+        run.summary = transition.summary;
+    }
+    if (Object.prototype.hasOwnProperty.call(transition, 'waitingReason')) {
+        run.waitingReason = transition.waitingReason ?? undefined;
+    }
+    if (Object.prototype.hasOwnProperty.call(transition, 'pendingUserDecision')) {
+        run.pendingUserDecision = transition.pendingUserDecision ?? undefined;
+    }
+    if (transition.resultDisposition) {
+        run.resultDisposition = transition.resultDisposition;
+    }
+    if (transition.checkpoint) {
+        run.checkpoints.push(createCheckpoint(transition.checkpoint.label, transition.checkpoint.statusSummary));
+    }
+}
+
+function persistAgentRunSession(
+    bridge: BridgeContext,
+    sessionId: string,
+    session: SessionState,
+    run: AgentRunState,
+): void {
+    session.agentRun = run;
+    session.updatedAt = Date.now();
+    bridge.sessions.set(sessionId, session);
+}
+
+function createAuthorizationPendingDecision(runId: string, toolRequest: AgentToolCall): PendingUserDecision {
+    return {
+        decisionId: `${runId}:authorization:${Date.now()}`,
+        controlKind: 'authorization',
+        summary: `The agent wants to execute ${formatToolRequest(toolRequest)}. This action can change workspace state and requires approval.`,
+        options: [
+            {
+                optionId: 'approve_tool',
+                label: 'Approve tool',
+                note: 'Allow this pending tool call and continue the run.',
+                primary: true,
+            },
+            {
+                optionId: 'reject_tool',
+                label: 'Reject tool',
+                note: 'Do not execute this write action. Keep the run paused.',
+                primary: false,
+            },
+            {
+                optionId: 'cancel_run',
+                label: 'Cancel run',
+                note: 'Stop the current autonomous run entirely.',
+                primary: false,
+            },
+        ],
+        recommendedOptionId: 'approve_tool',
+    };
+}
+
+function createResultDispositionPendingDecision(runId: string): PendingUserDecision {
+    return {
+        decisionId: `${runId}:result:${Date.now()}`,
+        controlKind: 'result_disposition',
+        summary: 'This run changed the workspace. Decide whether to keep the result, revert the changes, or abandon this result snapshot.',
+        options: [
+            {
+                optionId: 'keep_result',
+                label: 'Keep result',
+                note: 'Accept the current workspace changes and keep this run result.',
+                primary: true,
+            },
+            {
+                optionId: 'revert_result',
+                label: 'Revert result',
+                note: 'Restore the previous file contents recorded before this run wrote to the workspace.',
+                primary: false,
+            },
+            {
+                optionId: 'abandon_result',
+                label: 'Abandon result',
+                note: 'Do not keep relying on this result snapshot. Leave the run completed without accepting it.',
+                primary: false,
+            },
+        ],
+        recommendedOptionId: 'keep_result',
+    };
+}
+
+function createPacingPendingDecision(runId: string): PendingUserDecision {
+    return {
+        decisionId: `${runId}:pacing:${Date.now()}`,
+        controlKind: 'pacing',
+        summary: 'The run reached its current budget. Continue for another batch, or stop here.',
+        options: [
+            {
+                optionId: 'continue_run',
+                label: 'Continue run',
+                note: 'Allow another batch of autonomous planning, validation, and controlled execution.',
+                primary: true,
+            },
+            {
+                optionId: 'cancel_run',
+                label: 'Stop here',
+                note: 'Cancel this run and keep the current state snapshot.',
+                primary: false,
+            },
+        ],
+        recommendedOptionId: 'continue_run',
     };
 }
 
@@ -1201,6 +1437,11 @@ type AgentPlannerDecision = {
     nextAction: string;
     relatedFiles: string[];
     toolRequest: AgentToolCall | null;
+};
+
+type AgentPlannerOutcome = {
+    decision: AgentPlannerDecision | null;
+    error: string | null;
 };
 
 async function decideSemanticPlan(
@@ -1400,13 +1641,15 @@ async function decideAgentAction(
     promptContext: string,
     relatedFiles: string[],
     config: AgentRuntimeConfig,
-): Promise<AgentPlannerDecision | null> {
+): Promise<AgentPlannerOutcome> {
     const plannerPrompt = [
         `Current runtime mode: ${config.mode}.`,
         'You are planning the next step for a coding agent that can perform at most one tool call before replanning or answering.',
         'Return JSON only with this shape: {"status":"answered"|"needs_tool","message":"...","summary":"...","currentAction":"...","nextAction":"...","relatedFiles":["..."],"toolRequest":null|{"name":"read_file"|"search_text"|"run_tests"|"write_file"|"apply_patch","args":{},"summary":"..."}}.',
         'Choose needs_tool when the answer depends on repository inspection, validation, or a narrowly scoped code change that is still missing from the current context.',
-        'Prefer search_text before read_file unless you already know the exact file to inspect.',
+        'Prefer read_file once you already know the likely file to inspect. Use search_text mainly to discover the first relevant file or symbol location.',
+        'Do not repeat the same broad search_text query after a prior search already identified a likely target file.',
+        'If recent context already points to one likely file, inspect that file with read_file before issuing another broad search.',
         'When using read_file with line numbers, always provide both startLine and endLine.',
         'Keep read_file ranges focused and no longer than 200 lines.',
         'Use read_file args: {"path":"relative/or/absolute","startLine":number,"endLine":number}.',
@@ -1430,10 +1673,31 @@ async function decideAgentAction(
 
     try {
         const raw = await sendModelRequest(model, [vscode.LanguageModelChatMessage.User(plannerPrompt)]);
-        return parsePlannerDecision(raw);
-    } catch {
-        return null;
+        return {
+            decision: parsePlannerDecision(raw),
+            error: null,
+        };
+    } catch (error) {
+        return {
+            decision: null,
+            error: error instanceof Error ? error.message : String(error),
+        };
     }
+}
+
+function isModelAvailabilityIssue(message: string | null | undefined): boolean {
+    if (!message || !message.trim()) {
+        return false;
+    }
+
+    const normalized = message.toLowerCase();
+    return normalized.includes('premium model quota')
+        || normalized.includes('premium requests')
+        || normalized.includes('allowance to renew')
+        || normalized.includes('model unavailable')
+        || normalized.includes('provider unavailable')
+        || normalized.includes('no compatible chat model')
+        || normalized.includes('language model');
 }
 
 function parsePlannerDecision(raw: string): AgentPlannerDecision | null {
@@ -1479,8 +1743,106 @@ function parsePlannerDecision(raw: string): AgentPlannerDecision | null {
             toolRequest: status === 'needs_tool' ? toolRequest : null,
         };
     } catch {
+        return fallbackPlannerDecisionFromText(normalized);
+    }
+}
+
+function fallbackPlannerDecisionFromText(raw: string): AgentPlannerDecision | null {
+    const normalized = raw.trim();
+    if (!normalized) {
         return null;
     }
+
+    const readFileRequest = matchReadFileToolRequest(normalized);
+    if (readFileRequest) {
+        return {
+            status: 'needs_tool',
+            message: '当前上下文不足，准备读取相关代码后继续回答。',
+            summary: readFileRequest.summary ?? `读取文件 ${String(readFileRequest.args.path)}`,
+            currentAction: '根据模型提供的文本线索读取相关文件',
+            nextAction: '等待读取代码结果后继续分析。',
+            relatedFiles: [String(readFileRequest.args.path)],
+            toolRequest: readFileRequest,
+        };
+    }
+
+    const searchTextRequest = matchSearchTextToolRequest(normalized);
+    if (searchTextRequest) {
+        return {
+            status: 'needs_tool',
+            message: '当前还需要先搜索工作区里的相关代码位置。',
+            summary: searchTextRequest.summary ?? `搜索 ${String(searchTextRequest.args.query)}`,
+            currentAction: '根据模型提供的文本线索搜索相关代码',
+            nextAction: '等待搜索结果后继续分析。',
+            relatedFiles: typeof searchTextRequest.args.path === 'string' ? [searchTextRequest.args.path] : [],
+            toolRequest: searchTextRequest,
+        };
+    }
+
+    return {
+        status: 'answered',
+        message: normalized,
+        summary: summarize(normalized),
+        currentAction: '根据当前上下文直接生成回答',
+        nextAction: '可以继续追问、要求读取更多代码，或基于当前结论推进任务。',
+        relatedFiles: [],
+        toolRequest: null,
+    };
+}
+
+function matchReadFileToolRequest(raw: string): AgentToolCall | null {
+    const match = raw.match(/read_file\(\s*([^) :\n]+)(?::(\d+)-(\d+))?\s*\)/i);
+    if (!match) {
+        return null;
+    }
+
+    const path = match[1]?.trim();
+    if (!path) {
+        return null;
+    }
+
+    const args: Record<string, unknown> = { path };
+    if (match[2] && match[3]) {
+        const startLine = Number.parseInt(match[2], 10);
+        const endLine = Number.parseInt(match[3], 10);
+        if (Number.isInteger(startLine) && Number.isInteger(endLine) && startLine > 0 && endLine > 0) {
+            args.startLine = Math.min(startLine, endLine);
+            args.endLine = Math.max(startLine, endLine);
+        }
+    }
+
+    return sanitizeToolRequest({
+        name: 'read_file',
+        args,
+        summary: `读取文件 ${path}`,
+    });
+}
+
+function matchSearchTextToolRequest(raw: string): AgentToolCall | null {
+    const match = raw.match(/search_text\(\s*("?)([^,"\n)]+)\1(?:\s*,\s*path\s*=\s*("?)([^,"\n)]+)\3)?/i);
+    if (!match) {
+        return null;
+    }
+
+    const query = match[2]?.trim();
+    if (!query) {
+        return null;
+    }
+
+    const args: Record<string, unknown> = {
+        query,
+        isRegex: false,
+    };
+    const scopedPath = match[4]?.trim();
+    if (scopedPath) {
+        args.path = scopedPath;
+    }
+
+    return sanitizeToolRequest({
+        name: 'search_text',
+        args,
+        summary: `搜索 ${query}`,
+    });
 }
 
 function sanitizeToolRequest(value: unknown): AgentToolCall | null {
@@ -1632,6 +1994,207 @@ function areEquivalentToolRequests(left: AgentToolCall, right: AgentToolCall): b
     return left.name === right.name && formatToolRequest(left) === formatToolRequest(right);
 }
 
+async function normalizeRuntimeToolRequest(session: SessionState, toolRequest: AgentToolCall, goal: string): Promise<AgentToolCall> {
+    const preferredDefinitionTool = await resolvePreferredDefinitionToolRequest(goal, toolRequest);
+    if (preferredDefinitionTool) {
+        return preferredDefinitionTool;
+    }
+
+    if (toolRequest.name !== 'search_text') {
+        return toolRequest;
+    }
+
+    const hasPriorSearch = session.recentRuntimeToolRequests.some((entry) => entry.name === 'search_text');
+    const knownFile = selectPreferredRecentWorkspaceFileForSearch(session, toolRequest);
+    if (!hasPriorSearch || !knownFile) {
+        return toolRequest;
+    }
+
+    const scopedPath = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim() : '';
+    if (scopedPath && scopedPath !== knownFile) {
+        return toolRequest;
+    }
+
+    return {
+        name: 'read_file',
+        args: {
+            path: knownFile,
+            startLine: 1,
+            endLine: DEFAULT_READ_FILE_LINE_SPAN,
+        },
+        summary: `读取文件 ${knownFile}`,
+    };
+}
+
+async function resolvePreferredDefinitionToolRequest(goal: string, toolRequest: AgentToolCall): Promise<AgentToolCall | null> {
+    if (toolRequest.name !== 'search_text' && toolRequest.name !== 'read_file') {
+        return null;
+    }
+
+    const preferredLocation = await findPreferredDefinitionLocation(goal);
+    if (!preferredLocation) {
+        return null;
+    }
+
+    if (toolRequest.name === 'read_file') {
+        const requestedPath = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim().replace(/\\/g, '/') : '';
+        if (requestedPath === preferredLocation.path.replace(/\\/g, '/')) {
+            return toolRequest;
+        }
+    }
+
+    return {
+        name: 'read_file',
+        args: {
+            path: preferredLocation.path,
+            startLine: preferredLocation.startLine,
+            endLine: preferredLocation.endLine,
+        },
+        summary: `读取文件 ${preferredLocation.path}`,
+    };
+}
+
+async function findPreferredDefinitionLocation(goal: string): Promise<{ path: string; startLine: number; endLine: number } | null> {
+    const primarySymbol = extractPrimarySymbolCandidate(goal);
+    const searchTerms = primarySymbol ? [primarySymbol] : extractSearchTerms(goal);
+    if (searchTerms.length === 0) {
+        return null;
+    }
+
+    const files = await vscode.workspace.findFiles(WORKSPACE_FILE_GLOB, WORKSPACE_EXCLUDE_GLOB, 200);
+    let bestMatch: { path: string; lineNumber: number; score: number } | null = null;
+
+    for (const file of files) {
+        const relativePath = vscode.workspace.asRelativePath(file, false);
+        if (shouldSkipWorkspaceFile(relativePath)) {
+            continue;
+        }
+
+        try {
+            const stat = await vscode.workspace.fs.stat(file);
+            if (stat.size > MAX_FILE_BYTES) {
+                continue;
+            }
+
+            const raw = await vscode.workspace.fs.readFile(file);
+            const text = Buffer.from(raw).toString('utf8');
+            const lines = text.split(/\r?\n/);
+
+            for (const term of searchTerms) {
+                const definitionLine = findDefinitionLine(lines, term);
+                if (definitionLine === -1) {
+                    continue;
+                }
+
+                const matchedLine = lines[definitionLine] ?? '';
+                const score = scoreWorkspaceSnippet(relativePath, matchedLine, term) + 200;
+                if (!bestMatch || score > bestMatch.score) {
+                    bestMatch = {
+                        path: relativePath,
+                        lineNumber: definitionLine + 1,
+                        score,
+                    };
+                }
+
+                break;
+            }
+        } catch {
+            // Skip unreadable files and continue with best-effort symbol grounding.
+        }
+    }
+
+    if (!bestMatch) {
+        return null;
+    }
+
+    return {
+        path: bestMatch.path,
+        startLine: Math.max(1, bestMatch.lineNumber - 20),
+        endLine: bestMatch.lineNumber + 60,
+    };
+}
+
+function extractPrimarySymbolCandidate(goal: string): string | null {
+    const matches = goal.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? [];
+    const filtered = matches
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0)
+        .filter((value) => !['agent', 'copilot', 'function', 'read', 'file', 'code'].includes(value.toLowerCase()));
+
+    const symbolLike = filtered.find((value) => value.includes('_'))
+        ?? filtered.find((value) => /[a-z][A-Z]/.test(value))
+        ?? filtered[0];
+
+    return symbolLike ?? null;
+}
+
+function isDefinitionGroundingTask(goal: string): boolean {
+    const normalized = goal.toLowerCase();
+    return (
+        normalized.includes('这个函数是干什么')
+        || normalized.includes('what does')
+        || normalized.includes('what is')
+        || normalized.includes('analyze')
+        || normalized.includes('分析')
+        || normalized.includes('explain')
+    );
+}
+
+function findDefinitionLine(lines: string[], term: string): number {
+    const definitionPatterns = [
+        new RegExp(`^\\s*pub\\s+fn\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*fn\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*function\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*const\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*let\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*type\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*struct\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*enum\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*class\\s+${escapeForRegExp(term)}\\b`, 'i'),
+        new RegExp(`^\\s*interface\\s+${escapeForRegExp(term)}\\b`, 'i'),
+    ];
+
+    for (const pattern of definitionPatterns) {
+        const index = lines.findIndex((line) => isProbableCodeDefinitionLine(line) && pattern.test(line));
+        if (index !== -1) {
+            return index;
+        }
+    }
+
+    return -1;
+}
+
+function isProbableCodeDefinitionLine(line: string): boolean {
+    const trimmed = line.trimStart();
+    if (!trimmed) {
+        return false;
+    }
+
+    return !trimmed.startsWith('"')
+        && !trimmed.startsWith("'")
+        && !trimmed.startsWith('`');
+}
+
+function selectPreferredRecentWorkspaceFileForSearch(session: SessionState, toolRequest: AgentToolCall): string | null {
+    const recentFiles = session.recentWorkspaceFiles.filter((file) => file.trim().length > 0);
+    if (recentFiles.length === 0) {
+        return null;
+    }
+
+    if (recentFiles.length === 1) {
+        return recentFiles[0];
+    }
+
+    const scopedPath = typeof toolRequest.args.path === 'string' ? toolRequest.args.path.trim() : '';
+    if (scopedPath) {
+        const normalizedScope = scopedPath.replace(/\\/g, '/').toLowerCase();
+        const scopedMatches = recentFiles.filter((file) => file.replace(/\\/g, '/').toLowerCase().includes(normalizedScope));
+        return scopedMatches.length === 1 ? scopedMatches[0] : null;
+    }
+
+    return null;
+}
+
 function buildToolRequestTaskState(
     decision: AgentPlannerDecision,
     relatedFiles: string[],
@@ -1697,6 +2260,18 @@ function buildToolResultPrompt(
         toolResult.summary,
         'Tool result output:',
         truncateToolResult(toolResult.output),
+    ].join('\n\n');
+}
+
+function buildEvidenceOnlyAnswerPrompt(goal: string): string {
+    return [
+        'The runtime already gathered repository evidence for this task.',
+        'Do not emit planner JSON.',
+        'Answer the user directly from the current evidence in context.',
+        'If the evidence is still insufficient, say exactly what is missing and why.',
+        'Keep the answer grounded and concise.',
+        'Original task:',
+        goal,
     ].join('\n\n');
 }
 
@@ -1991,6 +2566,10 @@ function buildSessionSummary(session: SessionState): string {
         parts.push(`Recent workspace files:\n${session.recentWorkspaceFiles.map((file) => `- ${file}`).join('\n')}`);
     }
 
+    if (session.recentRuntimeToolRequests.length > 0) {
+        parts.push(`Recent runtime tool requests:\n${session.recentRuntimeToolRequests.map((tool) => `- ${formatToolRequest(tool)}`).join('\n')}`);
+    }
+
     if (parts.length === 0) {
         return '';
     }
@@ -2026,6 +2605,13 @@ function rememberRecentWorkspaceFiles(session: SessionState, files: string[]): v
     }
 
     session.recentWorkspaceFiles = deduped;
+}
+
+function rememberRecentRuntimeToolRequest(session: SessionState, toolRequest: AgentToolCall): void {
+    session.recentRuntimeToolRequests = [
+        toolRequest,
+        ...session.recentRuntimeToolRequests.filter((entry) => !areEquivalentToolRequests(entry, toolRequest)),
+    ].slice(0, 6);
 }
 
 function trimSessionMessages(session: SessionState): void {
@@ -2138,15 +2724,18 @@ async function runAgentRuntimeLoop(
     }
 
     trimSessionMessages(session);
-    run.status = 'running';
-    run.pendingUserDecision = undefined;
-    run.currentAction = reason === 'start'
-        ? `Starting the ${config.mode} runtime loop`
-        : reason === 'continue'
-            ? `Continuing the ${config.mode} runtime loop`
-            : 'Resuming after user decision';
-    run.nextAction = 'Planning the next best step.';
-    run.currentStep = 'planning';
+    applyAgentRunTransition(run, {
+        status: 'running',
+        waitingReason: null,
+        pendingUserDecision: null,
+        currentAction: reason === 'start'
+            ? `Starting the ${config.mode} runtime loop`
+            : reason === 'continue'
+                ? `Continuing the ${config.mode} runtime loop`
+                : 'Resuming after user decision',
+        nextAction: 'Planning the next best step.',
+        currentStep: 'planning',
+    });
 
     const existingToolSteps = run.checkpoints.filter((checkpoint) => checkpoint.label.startsWith('tool-')).length;
     const existingWriteSteps = run.checkpoints.filter((checkpoint) => checkpoint.label.startsWith('write-')).length;
@@ -2164,6 +2753,7 @@ async function runAgentRuntimeLoop(
             }
 
             const pendingTool = session.pendingRuntimeToolRequest.toolRequest;
+            rememberRecentRuntimeToolRequest(session, pendingTool);
             const isWriteTool = pendingTool.name === 'write_file' || pendingTool.name === 'apply_patch';
             if (isWriteTool && writeSteps >= run.budget.maxWriteOperations) {
                 break;
@@ -2183,15 +2773,19 @@ async function runAgentRuntimeLoop(
             rememberRecentWorkspaceFiles(session, relatedFiles);
 
             if (!toolResult.success) {
-                run.status = 'failed';
-                run.currentAction = `Tool execution failed: ${pendingTool.summary}`;
-                run.nextAction = 'Adjust the task or tool arguments and continue the run.';
-                run.currentStep = 'tool_failed';
-                run.summary = toolResult.summary;
-                run.checkpoints.push(createCheckpoint(`tool-failed-${iteration}`, toolResult.summary));
-                session.agentRun = run;
-                session.updatedAt = Date.now();
-                bridge.sessions.set(sessionId, session);
+                applyAgentRunTransition(run, {
+                    status: 'failed',
+                    currentAction: `Tool execution failed: ${pendingTool.summary}`,
+                    nextAction: 'Adjust the task or tool arguments and continue the run.',
+                    currentStep: 'tool_failed',
+                    summary: toolResult.summary,
+                    waitingReason: null,
+                    checkpoint: {
+                        label: `tool-failed-${iteration}`,
+                        statusSummary: toolResult.summary,
+                    },
+                });
+                persistAgentRunSession(bridge, sessionId, session, run);
                 return {
                     message: toolResult.output,
                     run,
@@ -2218,11 +2812,81 @@ async function runAgentRuntimeLoop(
                 buildToolResultPrompt(goal, pendingTool, toolResult),
             ));
             trimSessionMessages(session);
-            run.currentAction = `Executed ${pendingTool.summary}`;
-            run.nextAction = 'Observing the tool result and replanning the next step.';
-            run.currentStep = isWriteTool ? `write_${writeSteps}` : `tool_${toolSteps}`;
+            applyAgentRunTransition(run, {
+                currentAction: `Executed ${pendingTool.summary}`,
+                nextAction: 'Observing the tool result and replanning the next step.',
+                currentStep: isWriteTool ? `write_${writeSteps}` : `tool_${toolSteps}`,
+                waitingReason: null,
+            });
             finalMessage = toolResult.summary;
             continue;
+        }
+
+        if (
+            toolSteps === 0
+            && session.recentRuntimeToolRequests.length === 0
+            && session.recentWorkspaceFiles.length === 0
+            && isDefinitionGroundingTask(goal)
+        ) {
+            const preferredDefinition = await findPreferredDefinitionLocation(goal);
+            if (preferredDefinition) {
+                const initialReadRequest: AgentToolCall = {
+                    name: 'read_file',
+                    args: {
+                        path: preferredDefinition.path,
+                        startLine: preferredDefinition.startLine,
+                        endLine: Math.min(preferredDefinition.endLine, preferredDefinition.startLine + MAX_READ_FILE_LINE_SPAN - 1),
+                    },
+                    summary: `读取文件 ${preferredDefinition.path}`,
+                };
+
+                rememberRecentRuntimeToolRequest(session, initialReadRequest);
+                const toolResult = await executeAgentRuntimeTool(initialReadRequest);
+                toolSteps += 1;
+
+                const relatedFiles = dedupeStrings([
+                    ...toolResult.relatedFiles,
+                    preferredDefinition.path,
+                ]);
+                rememberRecentWorkspaceFiles(session, relatedFiles);
+
+                if (!toolResult.success) {
+                    applyAgentRunTransition(run, {
+                        status: 'failed',
+                        currentAction: `Tool execution failed: ${initialReadRequest.summary}`,
+                        nextAction: 'Adjust the task or file path and continue the run.',
+                        currentStep: 'tool_failed',
+                        summary: toolResult.summary,
+                        waitingReason: null,
+                        checkpoint: {
+                            label: `tool-failed-${iteration}`,
+                            statusSummary: toolResult.summary,
+                        },
+                    });
+                    persistAgentRunSession(bridge, sessionId, session, run);
+                    return {
+                        message: toolResult.output,
+                        run,
+                    };
+                }
+
+                session.messages.push(vscode.LanguageModelChatMessage.User(
+                    buildToolResultPrompt(goal, initialReadRequest, toolResult),
+                ));
+                trimSessionMessages(session);
+                applyAgentRunTransition(run, {
+                    currentAction: `Executed ${initialReadRequest.summary}`,
+                    nextAction: 'Observing the definition context and replanning the next step.',
+                    currentStep: `tool_${toolSteps}`,
+                    waitingReason: null,
+                    checkpoint: {
+                        label: `tool-${toolSteps}`,
+                        statusSummary: toolResult.summary,
+                    },
+                });
+                finalMessage = toolResult.summary;
+                continue;
+            }
         }
 
         const contextSummary = collectEditorContext();
@@ -2233,83 +2897,165 @@ async function runAgentRuntimeLoop(
             .join('\n\n');
 
         rememberRecentWorkspaceFiles(session, workspaceContext.files);
-        const decision = await decideAgentAction(model, goal, promptContext, dedupeStrings([
+        const plannerOutcome = await decideAgentAction(model, goal, promptContext, dedupeStrings([
             ...session.recentWorkspaceFiles,
             ...workspaceContext.files,
         ]), config);
+        const decision = plannerOutcome.decision;
 
         if (!decision) {
-            run.status = 'failed';
-            run.currentAction = 'Failed to plan the next autonomous step';
-            run.nextAction = 'Try continuing the run with a narrower task or inspect the backend state.';
-            run.currentStep = 'failed';
-            run.summary = 'The runtime could not obtain a valid planning decision from the model.';
-            run.checkpoints.push(createCheckpoint(`failed-${iteration}`, run.summary));
-            session.agentRun = run;
-            session.updatedAt = Date.now();
-            bridge.sessions.set(sessionId, session);
+            if (isModelAvailabilityIssue(plannerOutcome.error)) {
+                applyAgentRunTransition(run, {
+                    status: 'waiting_user',
+                    currentAction: 'The runtime is blocked because the configured model is currently unavailable',
+                    nextAction: 'Retry this run later, or switch the VS Code chat model to an available option before continuing.',
+                    currentStep: 'waiting_model_availability',
+                    summary: plannerOutcome.error ?? 'The configured model is currently unavailable.',
+                    waitingReason: 'model_availability',
+                    checkpoint: {
+                        label: `waiting-model-${iteration}`,
+                        statusSummary: plannerOutcome.error ?? 'The configured model is currently unavailable.',
+                    },
+                });
+                persistAgentRunSession(bridge, sessionId, session, run);
+                return {
+                    message: run.summary,
+                    run,
+                };
+            }
+
+            if (toolSteps > 0) {
+                session.messages.push(vscode.LanguageModelChatMessage.User(
+                    buildEvidenceOnlyAnswerPrompt(goal),
+                ));
+                trimSessionMessages(session);
+
+                const finalText = await sendModelRequest(model, session.messages);
+                const summary = summarize(finalText);
+                session.messages.push(vscode.LanguageModelChatMessage.Assistant(finalText));
+                session.lastResponseSummary = summary;
+                trimSessionMessages(session);
+
+                applyAgentRunTransition(run, {
+                    status: 'completed',
+                    currentAction: `Completed the ${config.mode} runtime loop from gathered evidence`,
+                    nextAction: config.mode === 'ask'
+                        ? 'You can ask a follow-up question or continue the same task with a narrower instruction.'
+                        : 'You can continue the run with a follow-up request, or start a new agent task.',
+                    currentStep: 'completed',
+                    summary,
+                    waitingReason: null,
+                    checkpoint: {
+                        label: `completed-${iteration}`,
+                        statusSummary: summary,
+                    },
+                });
+                persistAgentRunSession(bridge, sessionId, session, run);
+                return {
+                    message: finalText,
+                    run,
+                };
+            }
+
+            applyAgentRunTransition(run, {
+                status: 'failed',
+                currentAction: 'Failed to plan the next autonomous step',
+                nextAction: 'Try continuing the run with a narrower task or inspect the backend state.',
+                currentStep: 'failed',
+                summary: 'The runtime could not obtain a valid planning decision from the model.',
+                waitingReason: null,
+                checkpoint: {
+                    label: `failed-${iteration}`,
+                    statusSummary: 'The runtime could not obtain a valid planning decision from the model.',
+                },
+            });
+            persistAgentRunSession(bridge, sessionId, session, run);
             return {
                 message: run.summary,
                 run,
             };
         }
 
-        run.currentAction = decision.currentAction;
-        run.nextAction = decision.nextAction;
-        run.summary = decision.summary;
-        run.currentStep = `iteration_${iteration}`;
-        run.checkpoints.push(createCheckpoint(`plan-${iteration}`, decision.summary));
+        applyAgentRunTransition(run, {
+            currentAction: decision.currentAction,
+            nextAction: decision.nextAction,
+            summary: decision.summary,
+            currentStep: `iteration_${iteration}`,
+            waitingReason: null,
+            checkpoint: {
+                label: `plan-${iteration}`,
+                statusSummary: decision.summary,
+            },
+        });
 
         if (decision.status === 'needs_tool' && decision.toolRequest) {
+            const normalizedToolRequest = await normalizeRuntimeToolRequest(session, decision.toolRequest, goal);
+            const previousToolRequest = session.recentRuntimeToolRequests[0];
+
+            if (previousToolRequest && areEquivalentToolRequests(previousToolRequest, normalizedToolRequest)) {
+                session.messages.push(vscode.LanguageModelChatMessage.User([
+                    'The same tool request was just executed and its result is already in context.',
+                    'Do not repeat the same tool call.',
+                    'Answer the user with the current evidence, and if anything is still missing, state the exact missing detail instead of requesting the same tool again.',
+                ].join('\n')));
+                trimSessionMessages(session);
+
+                const finalText = await sendModelRequest(model, session.messages);
+                const summary = summarize(finalText);
+                session.messages.push(vscode.LanguageModelChatMessage.Assistant(finalText));
+                session.lastResponseSummary = summary;
+                trimSessionMessages(session);
+
+                applyAgentRunTransition(run, {
+                    status: 'completed',
+                    currentAction: `Completed the ${config.mode} runtime loop`,
+                    nextAction: config.mode === 'ask'
+                        ? 'You can ask a follow-up question or continue the same task with a narrower instruction.'
+                        : 'You can continue the run with a follow-up request, or start a new agent task.',
+                    currentStep: 'completed',
+                    summary,
+                    waitingReason: null,
+                    checkpoint: {
+                        label: `completed-${iteration}`,
+                        statusSummary: summary,
+                    },
+                });
+                persistAgentRunSession(bridge, sessionId, session, run);
+
+                return {
+                    message: finalText,
+                    run,
+                };
+            }
+
             if (toolSteps >= run.budget.maxToolCalls) {
                 break;
             }
 
-            if ((decision.toolRequest.name === 'write_file' || decision.toolRequest.name === 'apply_patch') && writeSteps >= run.budget.maxWriteOperations) {
+            if ((normalizedToolRequest.name === 'write_file' || normalizedToolRequest.name === 'apply_patch') && writeSteps >= run.budget.maxWriteOperations) {
                 break;
             }
 
-            const requiresAuthorization = requiresAuthorizationForTool(run, decision.toolRequest, config);
+            const requiresAuthorization = requiresAuthorizationForTool(run, normalizedToolRequest, config);
             if (requiresAuthorization) {
                 session.pendingRuntimeToolRequest = {
                     prompt: goal,
-                    toolRequest: decision.toolRequest,
+                    toolRequest: normalizedToolRequest,
                     requestedAt: Date.now(),
                 };
-                run.status = 'waiting_user';
-                run.currentAction = `Waiting for authorization to execute ${decision.toolRequest.summary}`;
-                run.nextAction = 'Approve the pending tool request to continue, reject it, or cancel the run.';
-                run.currentStep = 'waiting_authorization';
-                run.pendingUserDecision = {
-                    decisionId: `${run.runId}:authorization:${Date.now()}`,
-                    controlKind: 'authorization',
-                    summary: `The agent wants to execute ${formatToolRequest(decision.toolRequest)}. This action can change workspace state and requires approval.`,
-                    options: [
-                        {
-                            optionId: 'approve_tool',
-                            label: 'Approve tool',
-                            note: 'Allow this pending tool call and continue the run.',
-                            primary: true,
-                        },
-                        {
-                            optionId: 'reject_tool',
-                            label: 'Reject tool',
-                            note: 'Do not execute this write action. Keep the run paused.',
-                            primary: false,
-                        },
-                        {
-                            optionId: 'cancel_run',
-                            label: 'Cancel run',
-                            note: 'Stop the current autonomous run entirely.',
-                            primary: false,
-                        },
-                    ],
-                    recommendedOptionId: 'approve_tool',
-                };
-                run.checkpoints.push(createCheckpoint(`authorization-${iteration}`, decision.summary));
-                session.agentRun = run;
-                session.updatedAt = Date.now();
-                bridge.sessions.set(sessionId, session);
+                applyAgentRunTransition(run, {
+                    status: 'waiting_user',
+                    currentAction: `Waiting for authorization to execute ${normalizedToolRequest.summary}`,
+                    nextAction: 'Approve the pending tool request to continue, reject it, or cancel the run.',
+                    currentStep: 'waiting_authorization',
+                    waitingReason: 'authorization',
+                    pendingUserDecision: createAuthorizationPendingDecision(run.runId, normalizedToolRequest),
+                    checkpoint: {
+                        label: `authorization-${iteration}`,
+                        statusSummary: decision.summary,
+                    },
+                });
+                persistAgentRunSession(bridge, sessionId, session, run);
 
                 return {
                     message: decision.message,
@@ -2317,26 +3063,31 @@ async function runAgentRuntimeLoop(
                 };
             }
 
-            const toolResult = await executeAgentRuntimeTool(decision.toolRequest);
+            rememberRecentRuntimeToolRequest(session, normalizedToolRequest);
+            const toolResult = await executeAgentRuntimeTool(normalizedToolRequest);
             toolSteps += 1;
 
             const relatedFiles = dedupeStrings([
                 ...toolResult.relatedFiles,
-                ...extractRelatedFilesFromToolRequest(decision.toolRequest),
+                ...extractRelatedFilesFromToolRequest(normalizedToolRequest),
                 ...decision.relatedFiles,
             ]);
             rememberRecentWorkspaceFiles(session, relatedFiles);
 
             if (!toolResult.success) {
-                run.status = 'failed';
-                run.currentAction = `Tool execution failed: ${decision.toolRequest.summary}`;
-                run.nextAction = 'Adjust the task or file path and continue the run.';
-                run.currentStep = 'tool_failed';
-                run.summary = toolResult.summary;
-                run.checkpoints.push(createCheckpoint(`tool-failed-${iteration}`, toolResult.summary));
-                session.agentRun = run;
-                session.updatedAt = Date.now();
-                bridge.sessions.set(sessionId, session);
+                applyAgentRunTransition(run, {
+                    status: 'failed',
+                    currentAction: `Tool execution failed: ${normalizedToolRequest.summary}`,
+                    nextAction: 'Adjust the task or file path and continue the run.',
+                    currentStep: 'tool_failed',
+                    summary: toolResult.summary,
+                    waitingReason: null,
+                    checkpoint: {
+                        label: `tool-failed-${iteration}`,
+                        statusSummary: toolResult.summary,
+                    },
+                });
+                persistAgentRunSession(bridge, sessionId, session, run);
                 return {
                     message: toolResult.output,
                     run,
@@ -2344,12 +3095,15 @@ async function runAgentRuntimeLoop(
             }
 
             session.messages.push(vscode.LanguageModelChatMessage.User(
-                buildToolResultPrompt(goal, decision.toolRequest, toolResult),
+                buildToolResultPrompt(goal, normalizedToolRequest, toolResult),
             ));
             trimSessionMessages(session);
-            run.currentAction = `Executed ${decision.toolRequest.summary}`;
-            run.nextAction = 'Observing the tool result and replanning the next step.';
-            run.currentStep = `tool_${toolSteps}`;
+            applyAgentRunTransition(run, {
+                currentAction: `Executed ${normalizedToolRequest.summary}`,
+                nextAction: 'Observing the tool result and replanning the next step.',
+                currentStep: `tool_${toolSteps}`,
+                waitingReason: null,
+            });
             run.checkpoints.push(createCheckpoint(`tool-${toolSteps}`, toolResult.summary));
             finalMessage = toolResult.summary;
             continue;
@@ -2362,41 +3116,20 @@ async function runAgentRuntimeLoop(
         trimSessionMessages(session);
 
         if (run.reversibleArtifacts.length > 0 && run.resultDisposition === 'pending') {
-            run.status = 'waiting_user';
-            run.currentAction = 'Waiting for result disposition after applying workspace changes';
-            run.nextAction = 'Keep the result, revert the applied changes, or abandon this run result.';
-            run.currentStep = 'waiting_result_disposition';
-            run.summary = summary;
-            run.pendingUserDecision = {
-                decisionId: `${run.runId}:result:${Date.now()}`,
-                controlKind: 'result_disposition',
-                summary: 'This run changed the workspace. Decide whether to keep the result, revert the changes, or abandon this result snapshot.',
-                options: [
-                    {
-                        optionId: 'keep_result',
-                        label: 'Keep result',
-                        note: 'Accept the current workspace changes and keep this run result.',
-                        primary: true,
-                    },
-                    {
-                        optionId: 'revert_result',
-                        label: 'Revert result',
-                        note: 'Restore the previous file contents recorded before this run wrote to the workspace.',
-                        primary: false,
-                    },
-                    {
-                        optionId: 'abandon_result',
-                        label: 'Abandon result',
-                        note: 'Do not keep relying on this result snapshot. Leave the run completed without accepting it.',
-                        primary: false,
-                    },
-                ],
-                recommendedOptionId: 'keep_result',
-            };
-            run.checkpoints.push(createCheckpoint(`result-disposition-${iteration}`, summary));
-            session.agentRun = run;
-            session.updatedAt = Date.now();
-            bridge.sessions.set(sessionId, session);
+            applyAgentRunTransition(run, {
+                status: 'waiting_user',
+                currentAction: 'Waiting for result disposition after applying workspace changes',
+                nextAction: 'Keep the result, revert the applied changes, or abandon this run result.',
+                currentStep: 'waiting_result_disposition',
+                summary,
+                waitingReason: 'result_disposition',
+                pendingUserDecision: createResultDispositionPendingDecision(run.runId),
+                checkpoint: {
+                    label: `result-disposition-${iteration}`,
+                    statusSummary: summary,
+                },
+            });
+            persistAgentRunSession(bridge, sessionId, session, run);
 
             return {
                 message: finalText,
@@ -2404,17 +3137,21 @@ async function runAgentRuntimeLoop(
             };
         }
 
-        run.status = 'completed';
-        run.currentAction = `Completed the ${config.mode} runtime loop`;
-        run.nextAction = config.mode === 'ask'
-            ? 'You can ask a follow-up question or continue the same task with a narrower instruction.'
-            : 'You can continue the run with a follow-up request, or start a new agent task.';
-        run.currentStep = 'completed';
-        run.summary = summary;
-        run.checkpoints.push(createCheckpoint(`completed-${iteration}`, summary));
-        session.agentRun = run;
-        session.updatedAt = Date.now();
-        bridge.sessions.set(sessionId, session);
+        applyAgentRunTransition(run, {
+            status: 'completed',
+            currentAction: `Completed the ${config.mode} runtime loop`,
+            nextAction: config.mode === 'ask'
+                ? 'You can ask a follow-up question or continue the same task with a narrower instruction.'
+                : 'You can continue the run with a follow-up request, or start a new agent task.',
+            currentStep: 'completed',
+            summary,
+            waitingReason: null,
+            checkpoint: {
+                label: `completed-${iteration}`,
+                statusSummary: summary,
+            },
+        });
+        persistAgentRunSession(bridge, sessionId, session, run);
 
         return {
             message: finalText,
@@ -2422,35 +3159,20 @@ async function runAgentRuntimeLoop(
         };
     }
 
-    run.status = 'waiting_user';
-    run.currentAction = 'Reached the current loop budget';
-    run.nextAction = 'Approve the pacing decision to continue, or cancel the run.';
-    run.currentStep = 'waiting_user';
-    run.summary = 'The agent paused after exhausting the current planning, tool, or write budget.';
-    run.pendingUserDecision = {
-        decisionId: `${run.runId}:pacing:${Date.now()}`,
-        controlKind: 'pacing',
-        summary: 'The run reached its current budget. Continue for another batch, or stop here.',
-        options: [
-            {
-                optionId: 'continue_run',
-                label: 'Continue run',
-                note: 'Allow another batch of autonomous planning, validation, and controlled execution.',
-                primary: true,
-            },
-            {
-                optionId: 'cancel_run',
-                label: 'Stop here',
-                note: 'Cancel this run and keep the current state snapshot.',
-                primary: false,
-            },
-        ],
-        recommendedOptionId: 'continue_run',
-    };
-    run.checkpoints.push(createCheckpoint('waiting-user', run.summary));
-    session.agentRun = run;
-    session.updatedAt = Date.now();
-    bridge.sessions.set(sessionId, session);
+    applyAgentRunTransition(run, {
+        status: 'waiting_user',
+        currentAction: 'Reached the current loop budget',
+        nextAction: 'Approve the pacing decision to continue, or cancel the run.',
+        currentStep: 'waiting_user',
+        summary: 'The agent paused after exhausting the current planning, tool, or write budget.',
+        waitingReason: 'pacing',
+        pendingUserDecision: createPacingPendingDecision(run.runId),
+        checkpoint: {
+            label: 'waiting-user',
+            statusSummary: 'The agent paused after exhausting the current planning, tool, or write budget.',
+        },
+    });
+    persistAgentRunSession(bridge, sessionId, session, run);
 
     return {
         message: finalMessage || run.summary,
@@ -2463,6 +3185,7 @@ function buildAgentRuntimeUserPrompt(goal: string, session: SessionState, config
     return [
         `You are running the ${config.mode} mode of an autonomous coding loop for a Feishu remote agent bridge.`,
         'Stay grounded in repository context. Use the planning/tool loop to inspect code before answering when needed.',
+        'Once a search has already found the likely file, stop broad searching and read that file directly.',
         config.allowWriteTools
             ? 'You may request read_file, search_text, run_tests, write_file, or apply_patch. Write actions must be narrowly scoped and will require explicit approval before execution.'
             : config.allowTestTool
@@ -2580,16 +3303,11 @@ async function executeSearchTextTool(toolRequest: AgentToolCall): Promise<ToolRe
     }
 
     const files = await vscode.workspace.findFiles(WORKSPACE_FILE_GLOB, WORKSPACE_EXCLUDE_GLOB, 200);
-    const matches: string[] = [];
-    const relatedFiles: string[] = [];
+    const matches: Array<{ relativePath: string; lineNumber: number; line: string; score: number }> = [];
     const regex = toolRequest.args.isRegex === true ? new RegExp(query, 'i') : null;
     const lowered = query.toLowerCase();
 
     for (const file of files) {
-        if (matches.length >= 20) {
-            break;
-        }
-
         const relativePath = vscode.workspace.asRelativePath(file, false);
         if (pathScope && !relativePath.replace(/\\/g, '/').includes(pathScope.replace(/\\/g, '/'))) {
             continue;
@@ -2612,13 +3330,12 @@ async function executeSearchTextTool(toolRequest: AgentToolCall): Promise<ToolRe
                     continue;
                 }
 
-                if (!relatedFiles.includes(relativePath)) {
-                    relatedFiles.push(relativePath);
-                }
-                matches.push(`${relativePath}:${index + 1}: ${line}`);
-                if (matches.length >= 20) {
-                    break;
-                }
+                matches.push({
+                    relativePath,
+                    lineNumber: index + 1,
+                    line,
+                    score: scoreSearchMatch(relativePath, line, query, toolRequest.args.isRegex === true),
+                });
             }
         } catch {
             // Best-effort search; unreadable files are skipped.
@@ -2634,12 +3351,64 @@ async function executeSearchTextTool(toolRequest: AgentToolCall): Promise<ToolRe
         };
     }
 
+    matches.sort((left, right) => {
+        if (right.score !== left.score) {
+            return right.score - left.score;
+        }
+        if (left.relativePath !== right.relativePath) {
+            return left.relativePath.localeCompare(right.relativePath);
+        }
+        return left.lineNumber - right.lineNumber;
+    });
+
+    const topMatches = matches.slice(0, 20);
+    const relatedFiles = dedupeStrings(topMatches.map((match) => match.relativePath));
+
     return {
         success: true,
-        output: matches.join('\n'),
+        output: topMatches.map((match) => `${match.relativePath}:${match.lineNumber}: ${match.line}`).join('\n'),
         summary: `Found ${matches.length} matches for ${query}.`,
         relatedFiles,
     };
+}
+
+function scoreSearchMatch(relativePath: string, matchedLine: string, query: string, isRegex: boolean): number {
+    const normalizedPath = relativePath.replace(/\\/g, '/').toLowerCase();
+    const lowerLine = matchedLine.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+    let score = 0;
+
+    if (normalizedPath.startsWith('src/')) {
+        score += 100;
+    }
+    if (normalizedPath.endsWith('.rs')) {
+        score += 40;
+    }
+    if (normalizedPath.includes('/tests/') || normalizedPath.includes('/test/') || normalizedPath.includes('/__tests__/')) {
+        score -= 120;
+    }
+
+    if (/\b(pub\s+)?fn\s+/i.test(matchedLine) || /\bfunction\s+/i.test(matchedLine)) {
+        score += 140;
+    }
+    if (/\b(enum|struct|type|class|interface|const|let)\s+/i.test(matchedLine)) {
+        score += 80;
+    }
+
+    if (!isRegex && new RegExp(`\\b${escapeForRegExp(query)}\\b`, 'i').test(matchedLine)) {
+        score += 30;
+    }
+    if (!isRegex && lowerLine.includes(`${lowerQuery}(`)) {
+        score += 20;
+    }
+    if (!isRegex && new RegExp(`\\b(pub\\s+)?fn\\s+${escapeForRegExp(query)}\\b`, 'i').test(matchedLine)) {
+        score += 200;
+    }
+    if (!isRegex && new RegExp(`\\bfunction\\s+${escapeForRegExp(query)}\\b`, 'i').test(matchedLine)) {
+        score += 200;
+    }
+
+    return score;
 }
 
 async function resolveWorkspaceFile(path: string): Promise<vscode.Uri | null> {

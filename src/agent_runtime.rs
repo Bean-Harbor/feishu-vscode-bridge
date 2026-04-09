@@ -151,6 +151,8 @@ pub struct AgentRunState {
     #[serde(default)]
     pub current_step: Option<String>,
     #[serde(default)]
+    pub waiting_reason: Option<String>,
+    #[serde(default)]
     pub authorization_policy: Option<AgentAuthorizationPolicy>,
     pub result_disposition: ResultDisposition,
     #[serde(default)]

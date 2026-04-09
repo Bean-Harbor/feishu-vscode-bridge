@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use feishu_vscode_bridge::ApprovalPolicy;
-use feishu_vscode_bridge::Intent;
 use feishu_vscode_bridge::bridge::{BridgeApp, BridgeResponse};
 use feishu_vscode_bridge::plan::ExecutionOutcome;
+use feishu_vscode_bridge::ApprovalPolicy;
+use feishu_vscode_bridge::Intent;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -50,7 +50,9 @@ fn session_store_path(dir: &Path) -> PathBuf {
 
 #[test]
 fn execute_all_approval_flow_completes_after_approve() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp_dir = unique_temp_dir("approve");
     let session_path = session_store_path(&temp_dir);
     let app = BridgeApp::with_executor(
@@ -62,7 +64,10 @@ fn execute_all_approval_flow_completes_after_approve() {
 
     let start = app.dispatch("执行全部 git pull; git status", session_key);
     match start {
-        BridgeResponse::Card { fallback_text, card } => {
+        BridgeResponse::Card {
+            fallback_text,
+            card,
+        } => {
             assert!(fallback_text.contains("待审批步骤"));
             assert!(card.to_string().contains("确认继续"));
             assert!(card.to_string().contains("取消这步"));
@@ -73,7 +78,10 @@ fn execute_all_approval_flow_completes_after_approve() {
 
     let approved = app.dispatch("批准", session_key);
     match approved {
-        BridgeResponse::Card { fallback_text, card } => {
+        BridgeResponse::Card {
+            fallback_text,
+            card,
+        } => {
             assert!(fallback_text.contains("计划执行完成"));
             assert_eq!(card["header"]["title"]["content"], "已完成");
             assert!(card.to_string().contains("fake git pull ok"));
@@ -99,7 +107,9 @@ fn execute_all_approval_flow_completes_after_approve() {
 
 #[test]
 fn approval_reject_clears_pending_session() {
-    let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp_dir = unique_temp_dir("reject");
     let session_path = session_store_path(&temp_dir);
     let app = BridgeApp::with_executor(
@@ -111,7 +121,10 @@ fn approval_reject_clears_pending_session() {
 
     let start = app.dispatch("执行计划 git pull; git status", session_key);
     match start {
-        BridgeResponse::Card { fallback_text, card } => {
+        BridgeResponse::Card {
+            fallback_text,
+            card,
+        } => {
             assert!(fallback_text.contains("待审批步骤"));
             assert!(card.to_string().contains("确认继续"));
         }

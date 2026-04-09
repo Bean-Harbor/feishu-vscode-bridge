@@ -137,6 +137,8 @@ If `/health` is down after install, treat the blocker as the companion extension
 
 For the full live regression standard, including failure recovery and card callbacks, use [docs/feishu_live_regression_checklist.md](docs/feishu_live_regression_checklist.md).
 
+For a faster local endpoint-only smoke of semantic planning plus multi-round agent runtime, run `./scripts/smoke-agent-runtime.ps1` after `F5` starts the companion extension and `/health` is up.
+
 ## Current Scope
 
 - Core command parsing, plan execution, and bridge runtime engine (Rust)
@@ -167,6 +169,8 @@ One-page quick ref: see `docs/feishu_quick_ref.md` for a condensed cheat sheet s
 Ultra-short group notice: see `docs/feishu_group_notice.md` for a minimal pinned-message version.
 
 Live regression checklist: see `docs/feishu_live_regression_checklist.md` for a repeatable real-Feishu validation pass before or after shipping bridge changes.
+
+Local endpoint smoke: run `scripts/smoke-agent-runtime.ps1` to validate `/health` plus `/v1/chat/plan` confirm routing without going through Feishu. Add `-IncludeAgent` when you also want to probe `/v1/chat/agent/start` and `/v1/chat/agent/continue`, and expect that path to depend on current model availability and quota.
 
 MVP release plan: see `docs/mvp_release_plan.md` for the current product framing, scope boundaries, and release sequence.
 

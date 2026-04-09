@@ -453,12 +453,40 @@ Feishu 入口继续复用当前 Rust bridge：
 
 没有这一层，就还不是你要的那种 Copilot Chat 风格 autonomous agent。
 
+## Current Runtime Baseline
+
+当前仓库不是从零开始进入 runtime 主线，而是已经有一层可运行但还不完整的 runtime 骨架：
+
+- Rust 侧已有 runtime domain structs：`AgentRunMode`、`AgentRunStatus`、`PendingUserDecision`、`RunBudget`、`RunCheckpoint`、`AgentRunState`
+- extension 侧已有独立 endpoint：
+  - `POST /v1/chat/agent/start`
+  - `POST /v1/chat/agent/continue`
+  - `POST /v1/chat/agent/status`
+  - `POST /v1/chat/agent/approve`
+  - `POST /v1/chat/agent/cancel`
+- bridge/parser/session/reply 已有第一版 runtime surface：
+  - `/agent <任务>`
+  - `继续 agent`
+  - `agent 状态`
+  - `批准 agent`
+  - `取消 agent`
+- extension runtime 已能做多轮只读推进和 checkpoint 增长
+- Feishu 侧已能展示 waiting-state、待决策选项和下一步
+
+但当前还不能把它视为“runtime 主线已经完成”，因为还缺下面这些关键条件：
+
+- ask / plan / agent 仍是并行能力，不是统一 runtime 上的三种受限模式
+- 当前 runtime 还偏向 endpoint-level continuation，不是完整的 run state machine
+- 控制面还没有抽象完整：授权策略、结果处置、节奏控制、目标修正仍未统一进同一套协议
+- 多轮 loop 仍以只读路径为主，没有受控写入和写后处置闭环
+- waiting-state 虽然已有文案和按钮，但其上层 runtime 语义仍不够稳定
+
 ## Phased Implementation
 
 ### Execution Status
 
-- Phase A. Runtime Domain Model — completed
-- Phase B. Agent Runtime Skeleton — completed
+- Phase A. Runtime Domain Model — started, first contract landed
+- Phase B. Agent Runtime Skeleton — started, first runnable slice landed
 - Phase C. Multi-Hop Agent Loop — not started
 - Phase D. Ask / Plan As Restricted Agent Modes — not started
 - Phase E. Mode Surface — not started
@@ -491,6 +519,9 @@ Feishu 入口继续复用当前 Rust bridge：
 - [x] extension 侧新增对应 runtime types
 - [x] session schema 为 agent runtime 预留字段
 - [x] 定义 Rust <-> extension 的 agent runtime JSON contract
+- [ ] 把 waiting-state 和 approval-state 收敛到统一 control-point schema
+- [ ] 把 result disposition 从文案能力提升成 run-level state
+- [ ] 把 authorization policy 从布尔字段整理成 runtime policy object
 
 ### Phase B. Agent Runtime Skeleton
 
@@ -537,6 +568,10 @@ Feishu 入口继续复用当前 Rust bridge：
 - [x] extension 注册 `/v1/chat/agent/cancel`
 - [x] Rust 侧新增 agent runtime client 占位
 - [x] Rust 侧新增 session 持久化骨架
+- [x] Rust bridge 已接入 runtime direct-command surface
+- [ ] 把 extension pending state 收敛成独立 run store，而不是 ask 风格会话结构的扩展
+- [ ] 让 approve / cancel / continue 基于统一 run reducer 更新状态，而不是各 endpoint 各自推进
+- [ ] 把 runtime checkpoint、tool history、waiting reason 统一成稳定持久化字段
 
 补充进展：
 
@@ -563,9 +598,10 @@ Feishu 入口继续复用当前 Rust bridge：
 当前执行清单：
 
 - [ ] planner 输出升级为 agent loop decision
-- [ ] 支持多轮 tool -> observe -> replan
-- [ ] 增加 iteration budget 和停止条件
+- [ ] 把单次 continuation 串成稳定的 `plan -> tool -> observe -> replan` reducer
+- [ ] 增加 iteration budget、stop reason、recoverable failure 分类
 - [ ] 把阶段状态持续同步回飞书
+- [ ] 让工具历史参与 replanning，而不是只作为附加上下文
 
 ### Phase D. Ask / Plan As Restricted Agent Modes
 
@@ -643,20 +679,39 @@ Feishu 入口继续复用当前 Rust bridge：
 
 ## Immediate Next Slice
 
-下一步建议不再是直接写 runtime endpoint，而是先把 runtime domain model 定义完整，再进入 runtime skeleton：
+现在已经进入 runtime 主线，下一段不该再做“是否起 runtime”的讨论，而是把现有骨架推进成真正可扩展的 runtime 主干。
 
-1. 定义 `AgentRun`、`ControlPoint`、`AuthorizationPolicy`、`ResultDisposition`、`PendingUserDecision`
-2. 定义 extension <-> Rust 的共享 runtime contract
-3. 再为 `/agent` 新增独立 endpoint 和 run state 骨架
-4. 然后先让 agent 支持多轮只读工具循环
-5. 再把 `/ask` 和 `/plan` 折叠成 agent runtime 上的受限运行模式
-6. 最后补正式 `/ask /plan /agent` surface 与中文 alias
+建议按下面顺序推进：
 
-这样做的直接好处是：
+1. 统一 runtime 状态归约层
 
-- runtime 不会被当前几个例子绑死
-- 后续 `/ask` 和 `/plan` 只是对同一 runtime 的约束包装，不会把架构做散
-- 以后再加新的控制方式时，优先改协议对象，而不是大改状态机和 UI 命令
+- 给 extension 侧 agent run 引入单一 reducer / transition 入口
+- 把 `start / continue / approve / cancel / tool-result` 都改成对同一 run state 的状态变换
+- 明确每次状态变换输出：`status`、`waitingReason`、`pendingUserDecision`、`checkpoints`、`toolHistory`
+
+2. 收敛 control-plane schema
+
+- 把现有 waiting-state 文案、批准选项、暂停语义收敛到 `ControlPoint` / `PendingUserDecision`
+- 区分四类控制：授权、结果处置、目标修正、节奏控制
+- 避免继续把“批准本次写入”“先停在这里”这类 surface 文案写死成底层状态
+
+3. 跑通真正的 multi-hop read-only runtime
+
+- 让 `/agent` 在同一个 run 内稳定执行多轮 `plan -> tool -> observe -> replan`
+- 让 run budget、stop reason、recoverable failure 成为一等字段
+- 让 Feishu 回复展示 run 在第几轮、当前因为什么暂停、下一步在等什么
+
+4. 再折叠 ask / plan
+
+- `/ask` 变成小预算、只读、快速收敛的 runtime policy
+- `/plan` 变成偏规划、偏确认、默认不写的 runtime policy
+- 这一步之前，不再继续增强 ask-only 和 planner-only 的平行协议
+
+这样推进的直接好处是：
+
+- 保留已经落地的 endpoint 和 parser 成果，不回退重来
+- 把真正的工程重心放在 runtime state machine，而不是表层命令扩展
+- 为后续 controlled write、keep / undo / bypass approvals 留出正确的抽象位置
 
 ## Acceptance Standard
 

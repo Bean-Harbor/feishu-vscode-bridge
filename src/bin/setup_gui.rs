@@ -149,9 +149,7 @@ fn vscode_cli_candidates() -> Vec<String> {
             candidates.push(format!(
                 "{local}\\Programs\\Microsoft VS Code\\bin\\code.cmd"
             ));
-            candidates.push(format!(
-                "{local}\\Programs\\Microsoft VS Code\\Code.exe"
-            ));
+            candidates.push(format!("{local}\\Programs\\Microsoft VS Code\\Code.exe"));
         }
         candidates.push(r"C:\Program Files\Microsoft VS Code\bin\code.cmd".to_string());
         candidates.push(r"C:\Program Files\Microsoft VS Code\Code.exe".to_string());
@@ -331,7 +329,10 @@ fn launch_vscode_workspace_and_check_health() -> SetupTaskStatus {
             return SetupTaskStatus {
                 ok: false,
                 label: "本地 bridge 健康检查失败".to_string(),
-                detail: format!("无法打开 VS Code 工作区。{}", format_command_output(&output)),
+                detail: format!(
+                    "无法打开 VS Code 工作区。{}",
+                    format_command_output(&output)
+                ),
             };
         }
         Err(err) => {
@@ -470,7 +471,12 @@ fn macos_notify_cancelled(message: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_prompt_required(title: &str, message: &str, field_name: &str, hidden: bool) -> Result<String, String> {
+fn macos_prompt_required(
+    title: &str,
+    message: &str,
+    field_name: &str,
+    hidden: bool,
+) -> Result<String, String> {
     loop {
         match macos_prompt(title, message, hidden) {
             Ok(value) if !value.trim().is_empty() => return Ok(value),
@@ -711,7 +717,10 @@ fn launch_vscode_for_workspace() -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!("无法启动 VS Code：{}", format_command_output(&output)))
+        Err(format!(
+            "无法启动 VS Code：{}",
+            format_command_output(&output)
+        ))
     }
 }
 
@@ -1082,8 +1091,7 @@ impl SetupWizard {
             ui.add_space(8.0);
         }
 
-        let can_proceed =
-            !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty();
+        let can_proceed = !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty();
 
         ui.horizontal(|ui| {
             if ui.button("← 上一步").clicked() {
@@ -1214,7 +1222,10 @@ fn main() -> eframe::Result<()> {
     } else {
         match run_macos_native_setup() {
             Ok(()) => Ok(()),
-            Err(err) if err.starts_with("无法启动 osascript") || err.starts_with("无法运行 macOS 原生对话框") => {
+            Err(err)
+                if err.starts_with("无法启动 osascript")
+                    || err.starts_with("无法运行 macOS 原生对话框") =>
+            {
                 eprintln!("macOS 原生对话框不可用，切换到终端模式：{err}");
                 run_terminal_setup()
             }

@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900">
+  <defs>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #111; }
+      .label { font: 18px Arial, sans-serif; fill: #222; }
+      .dim { font: 16px Arial, sans-serif; fill: #0b4f6c; }
+      .outline { fill: none; stroke: #222; stroke-width: 3; }
+      .port { fill: none; stroke: #b33; stroke-width: 2.5; }
+      .dimline { stroke: #0b4f6c; stroke-width: 2; marker-start: url(#a); marker-end: url(#a); }
+      .help { stroke: #0b4f6c; stroke-width: 1.5; stroke-dasharray: 6 6; }
+      .thin { stroke: #444; stroke-width: 1.5; }
+    </style>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+      <path d="M0,4 L8,0 L8,8 z" fill="#0b4f6c" />
+    </marker>
+  </defs>
+
+  <text x="40" y="55" class="title">AX8850 AI BOX ID Drawing (3D Print Mockup)</text>
+
+  <!-- Top view -->
+  <text x="40" y="110" class="label">Top View</text>
+  <rect x="80" y="140" rx="45" ry="45" width="620" height="312" class="outline"/>
+
+  <!-- Side ports indicators in top view -->
+  <rect x="80" y="255" width="20" height="82" class="port"/>
+  <text x="110" y="300" class="label">RJ45</text>
+
+  <rect x="680" y="260" width="20" height="62" class="port"/>
+  <text x="620" y="245" class="label">TF</text>
+
+  <circle cx="685" cy="220" r="7" class="port"/>
+  <text x="710" y="225" class="label">Reset</text>
+
+  <circle cx="685" cy="365" r="10" class="port"/>
+  <text x="710" y="370" class="label">LED</text>
+
+  <!-- Main dimensions top -->
+  <line x1="80" y1="120" x2="700" y2="120" class="dimline"/>
+  <line x1="80" y1="140" x2="80" y2="120" class="help"/>
+  <line x1="700" y1="140" x2="700" y2="120" class="help"/>
+  <text x="350" y="110" class="dim">155 mm</text>
+
+  <line x1="730" y1="140" x2="730" y2="452" class="dimline"/>
+  <line x1="700" y1="140" x2="730" y2="140" class="help"/>
+  <line x1="700" y1="452" x2="730" y2="452" class="help"/>
+  <text x="742" y="302" class="dim" transform="rotate(90 742 302)">78 mm</text>
+
+  <!-- Front/side view -->
+  <text x="40" y="530" class="label">Side View</text>
+  <rect x="80" y="560" rx="12" ry="12" width="620" height="72" class="outline"/>
+
+  <rect x="110" y="572" width="64.8" height="59.2" class="port"/>
+  <text x="110" y="562" class="label">RJ45 16.2 x 14.8</text>
+
+  <rect x="630" y="598" width="56" height="10.4" class="port"/>
+  <text x="555" y="590" class="label">TF 14.0 x 2.6</text>
+
+  <circle cx="675" cy="580" r="5.6" class="port"/>
+  <text x="700" y="584" class="label">Reset 1.4</text>
+
+  <circle cx="675" cy="620" r="8" class="port"/>
+  <text x="700" y="624" class="label">LED 2.0</text>
+
+  <line x1="80" y1="540" x2="700" y2="540" class="dimline"/>
+  <line x1="80" y1="560" x2="80" y2="540" class="help"/>
+  <line x1="700" y1="560" x2="700" y2="540" class="help"/>
+  <text x="350" y="532" class="dim">155 mm</text>
+
+  <line x1="735" y1="560" x2="735" y2="632" class="dimline"/>
+  <line x1="700" y1="560" x2="735" y2="560" class="help"/>
+  <line x1="700" y1="632" x2="735" y2="632" class="help"/>
+  <text x="748" y="596" class="dim" transform="rotate(90 748 596)">18 mm</text>
+
+  <text x="40" y="700" class="label">Notes:</text>
+  <text x="40" y="730" class="label">1) Drawing is for ID mockup and 3D print shell validation.</text>
+  <text x="40" y="760" class="label">2) Port positions should be tuned with final PCB and connector stack-up.</text>
+  <text x="40" y="790" class="label">3) Recommended print tolerance gap: 0.25 mm (lid/base fit).</text>
+</svg>

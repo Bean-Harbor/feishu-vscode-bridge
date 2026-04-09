@@ -1,6 +1,6 @@
 use crate::plan::ExecutionOutcome;
 use crate::vscode;
-use crate::{Intent, help_text};
+use crate::{help_text, Intent};
 
 pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
     match intent {
@@ -88,7 +88,11 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
             let result = vscode::search_text(query, path.as_deref(), *is_regex);
             ExecutionOutcome {
                 success: result.success,
-                reply: result.to_reply(if *is_regex { "搜索正则" } else { "搜索文本" }),
+                reply: result.to_reply(if *is_regex {
+                    "搜索正则"
+                } else {
+                    "搜索文本"
+                }),
             }
         }
         Intent::RunTests { command } => {
@@ -207,6 +211,10 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
             success: false,
             reply: "⚠️ 问 Copilot 目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
         },
+        Intent::AskCodex { .. } => ExecutionOutcome {
+            success: false,
+            reply: "⚠️ 问 Codex 目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+        },
         Intent::StartAgentRun { .. } => ExecutionOutcome {
             success: false,
             reply: "⚠️ Agent Runtime 启动目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
@@ -217,7 +225,8 @@ pub fn execute_runnable_intent(intent: &Intent) -> ExecutionOutcome {
         },
         Intent::ShowAgentRunStatus => ExecutionOutcome {
             success: false,
-            reply: "⚠️ Agent Runtime 状态查询目前只支持直接命令调用，暂未接入计划执行器。".to_string(),
+            reply: "⚠️ Agent Runtime 状态查询目前只支持直接命令调用，暂未接入计划执行器。"
+                .to_string(),
         },
         Intent::ApproveAgentRun { .. } => ExecutionOutcome {
             success: false,

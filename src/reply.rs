@@ -2,6 +2,126 @@ use crate::session::StoredSession;
 use crate::vscode;
 use crate::Intent;
 
+pub fn format_feishu_attachment_probe_reply(
+    inbound: &crate::feishu::InboundMessage,
+    downloaded: Option<&crate::feishu::DownloadedAttachment>,
+    download_error: Option<&str>,
+) -> String {
+    let Some(attachment) = inbound.attachment.as_ref() else {
+        return "⚠️ 当前消息里没有可验证的飞书附件信息。".to_string();
+    };
+
+    let mut blocks = vec!["✅ 已收到飞书图片，桥接链路已通。".to_string()];
+    if downloaded.is_some() {
+        blocks.push("这一步已进一步验证到本地落盘，不会上传到 NAS。".to_string());
+    } else {
+        blocks.push("这一步只验证飞书入站消息和机器人回包，不会上传到 NAS。".to_string());
+    }
+    blocks.push(format!("消息类型: {}", inbound.message_type));
+    blocks.push(format!("消息 ID: {}", inbound.message_id));
+    blocks.push(format!("图片 key: {}", attachment.resource_key));
+
+    if let Some(file_name) = attachment
+        .file_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        blocks.push(format!("文件名: {}", file_name.trim()));
+    }
+
+    if let Some(downloaded) = downloaded {
+        blocks.push(format!("本地文件: {}", downloaded.local_path.display()));
+        blocks.push(format!("保存文件名: {}", downloaded.file_name));
+        blocks.push(format!("文件大小: {} B", downloaded.size_bytes));
+        if let Some(content_type) = downloaded
+            .content_type
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            blocks.push(format!("内容类型: {}", content_type.trim()));
+        }
+    }
+
+    if let Some(download_error) = download_error.filter(|value| !value.trim().is_empty()) {
+        blocks.push("⚠️ 已识别图片消息，但本地下载失败。".to_string());
+        blocks.push(format!("下载错误: {}", download_error.trim()));
+    }
+
+    blocks.push(format!("会话类型: {}", inbound.chat_type));
+    if downloaded.is_some() {
+        blocks.push(
+            "如果上面的本地文件路径存在，说明“飞书发图 -> 本地落盘”链路已经打通。".to_string(),
+        );
+    } else {
+        blocks
+            .push("如果这条回复能正常回来，说明飞书图片消息已经成功进入当前桥接链路。".to_string());
+    }
+    blocks.join("\n\n")
+}
+
+pub fn agent_decision_command(
+    decision: &crate::agent_runtime::PendingUserDecision,
+    option: &crate::agent_runtime::AgentDecisionOption,
+) -> String {
+    match (&decision.control_kind, option.option_id.as_str()) {
+        (crate::agent_runtime::ControlPointKind::Pacing, "continue_run") => {
+            "继续本轮 agent".to_string()
+        }
+        (crate::agent_runtime::ControlPointKind::Pacing, "cancel_run") => "先停在这里".to_string(),
+        (crate::agent_runtime::ControlPointKind::Authorization, "approve_tool") => {
+            "批准本次写入".to_string()
+        }
+        (crate::agent_runtime::ControlPointKind::Authorization, "reject_tool") => {
+            "拒绝本次写入".to_string()
+        }
+        (crate::agent_runtime::ControlPointKind::Authorization, "cancel_run") => {
+            "取消 agent".to_string()
+        }
+        (_, "keep_result") => "保留 agent 结果".to_string(),
+        (_, "revert_result") => "回滚 agent 结果".to_string(),
+        (_, "abandon_result") => "放弃 agent 结果".to_string(),
+        (_, "cancel_run") => "取消 agent".to_string(),
+        _ => format!("批准 agent {}", option.option_id),
+    }
+}
+
+pub fn agent_decision_quick_commands(
+    decision: &crate::agent_runtime::PendingUserDecision,
+) -> Vec<String> {
+    decision
+        .options
+        .iter()
+        .map(|option| agent_decision_command(decision, option))
+        .collect()
+}
+
+pub fn format_agent_waiting_reason(
+    waiting_reason: Option<&str>,
+    decision: Option<&crate::agent_runtime::PendingUserDecision>,
+) -> Option<String> {
+    let normalized = waiting_reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    let label = match normalized.as_deref() {
+        Some("authorization") => Some("等待授权".to_string()),
+        Some("authorization_rejected") => Some("授权被拒，等待下一步".to_string()),
+        Some("model_availability") => Some("等待模型恢复可用".to_string()),
+        Some("result_disposition") => Some("等待结果处置".to_string()),
+        Some("pacing") => Some("等待继续节奏决策".to_string()),
+        Some(other) => Some(other.to_string()),
+        None => decision.map(|decision| match decision.control_kind {
+            crate::agent_runtime::ControlPointKind::Authorization => "等待授权".to_string(),
+            crate::agent_runtime::ControlPointKind::ResultDisposition => "等待结果处置".to_string(),
+            crate::agent_runtime::ControlPointKind::GoalRevision => "等待目标修正".to_string(),
+            crate::agent_runtime::ControlPointKind::Pacing => "等待继续节奏决策".to_string(),
+        }),
+    };
+
+    label.filter(|value| !value.trim().is_empty())
+}
+
 pub fn format_agent_run_status(status: &str) -> String {
     match status.trim().to_ascii_lowercase().as_str() {
         "initialized" => "已初始化".to_string(),
@@ -76,15 +196,32 @@ pub fn format_agent_reply_with_action(
 ) -> String {
     let mut blocks = vec!["🧭 Agent 任务更新".to_string()];
 
-    if let Some(session_id) = result.session_id.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(session_id) = result
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         blocks.push(format!("🆔 session: {}", session_id));
     }
 
-    blocks.push(format!("🎯 当前任务: {}", task_text.trim().trim_end_matches('\n')));
-    blocks.push(format!("📌 最近状态: {}", format_agent_status(&result.status)));
-    blocks.push(format!("🧾 上次动作: {}  ({}ms)", action_label, result.duration_ms));
+    blocks.push(format!(
+        "🎯 当前任务: {}",
+        task_text.trim().trim_end_matches('\n')
+    ));
+    blocks.push(format!(
+        "📌 最近状态: {}",
+        format_agent_status(&result.status)
+    ));
+    blocks.push(format!(
+        "🧾 上次动作: {}  ({}ms)",
+        action_label, result.duration_ms
+    ));
 
-    if let Some(action) = result.current_action.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(action) = result
+        .current_action
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         blocks.push(format!("⚙️ 当前动作: {}", action.trim()));
     }
 
@@ -97,7 +234,11 @@ pub fn format_agent_reply_with_action(
         blocks.push(format!("📄 相关文件: {}", result.related_files.join("、")));
     }
 
-    if let Some(tool_call) = result.tool_call.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(tool_call) = result
+        .tool_call
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         blocks.push(format!("🛠 工具动作: {}", tool_call.trim()));
     }
 
@@ -109,12 +250,20 @@ pub fn format_agent_reply_with_action(
         blocks.push(format!("🔎 工具结果: {}", tool_result_summary.trim()));
     }
 
-    if let Some(next_action) = result.next_action.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(next_action) = result
+        .next_action
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         blocks.push(format!("➡️ 下一步建议: {}", next_action.trim()));
         blocks.push("🤝 采纳这一步可直接发送：按建议继续".to_string());
     }
 
-    if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(error) = result
+        .error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         blocks.push(format!("❌ 错误: {}", error.trim()));
     }
 
@@ -122,10 +271,17 @@ pub fn format_agent_reply_with_action(
     blocks.join("\n\n")
 }
 
-pub fn format_agent_run_reply(task_text: &str, action_label: &str, result: &vscode::AgentRunResult) -> String {
+pub fn format_agent_run_reply(
+    task_text: &str,
+    action_label: &str,
+    result: &vscode::AgentRunResult,
+) -> String {
     let mut blocks = vec!["🧭 Agent Runtime 更新".to_string()];
 
-    blocks.push(format!("🎯 当前任务: {}", task_text.trim().trim_end_matches('\n')));
+    blocks.push(format!(
+        "🎯 当前任务: {}",
+        task_text.trim().trim_end_matches('\n')
+    ));
     blocks.push(format!("🧾 上次动作: {}", action_label));
 
     if !result.session_id.trim().is_empty() {
@@ -134,18 +290,33 @@ pub fn format_agent_run_reply(task_text: &str, action_label: &str, result: &vsco
 
     if let Some(run) = result.run.as_ref() {
         blocks.push(format!("🏃 run: {}", run.run_id));
-        blocks.push(format!("📌 最近状态: {}", format_agent_run_status(run.status.as_str())));
+        blocks.push(format!(
+            "📌 最近状态: {}",
+            format_agent_run_status(run.status.as_str())
+        ));
         blocks.push(format!("⚙️ 当前动作: {}", run.current_action.trim()));
         blocks.push(format!("📌 结果摘要: {}", run.summary.trim()));
-        blocks.push(format!("🧾 结果处置: {}", match run.result_disposition {
-            crate::agent_runtime::ResultDisposition::Pending => "待决定",
-            crate::agent_runtime::ResultDisposition::Kept => "已保留",
-            crate::agent_runtime::ResultDisposition::Reverted => "已回滚",
-            crate::agent_runtime::ResultDisposition::Abandoned => "已放弃",
-        }));
+        blocks.push(format!(
+            "🧾 结果处置: {}",
+            match run.result_disposition {
+                crate::agent_runtime::ResultDisposition::Pending => "待决定",
+                crate::agent_runtime::ResultDisposition::Kept => "已保留",
+                crate::agent_runtime::ResultDisposition::Reverted => "已回滚",
+                crate::agent_runtime::ResultDisposition::Abandoned => "已放弃",
+            }
+        ));
 
         if !run.next_action.trim().is_empty() {
             blocks.push(format!("➡️ 下一步: {}", run.next_action.trim()));
+        }
+
+        if run.status == crate::agent_runtime::AgentRunStatus::WaitingUser {
+            if let Some(waiting_reason) = format_agent_waiting_reason(
+                run.waiting_reason.as_deref(),
+                run.pending_user_decision.as_ref(),
+            ) {
+                blocks.push(format!("⏸ 等待类型: {}", waiting_reason));
+            }
         }
 
         if let Some(decision) = run.pending_user_decision.as_ref() {
@@ -163,7 +334,10 @@ pub fn format_agent_run_reply(task_text: &str, action_label: &str, result: &vsco
                         .collect::<Vec<_>>()
                         .join("；")
                 ));
-                blocks.push("🤝 可直接发送：批准 agent 或 批准 agent <option_id>".to_string());
+                blocks.push(format!(
+                    "🤝 可直接发送：{}",
+                    agent_decision_quick_commands(decision).join(" / ")
+                ));
             }
         }
 
@@ -179,7 +353,11 @@ pub fn format_agent_run_reply(task_text: &str, action_label: &str, result: &vsco
         }
     }
 
-    if let Some(error) = result.error.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(error) = result
+        .error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         blocks.push(format!("❌ 错误: {}", error.trim()));
     }
 
@@ -214,7 +392,10 @@ pub fn format_stored_session_summary(stored: &StoredSession) -> String {
     }
 
     if stored.recent_file_paths.len() > 1 {
-        blocks.push(format!("🗂 最近文件队列: {}", stored.recent_file_paths.join("、")));
+        blocks.push(format!(
+            "🗂 最近文件队列: {}",
+            stored.recent_file_paths.join("、")
+        ));
     }
 
     if let Some(last_diff) = stored.last_diff.as_ref() {
@@ -241,7 +422,10 @@ pub fn format_stored_session_summary(stored: &StoredSession) -> String {
         }
     }
 
-    blocks.push(format!("➡️ 下一步建议: {}", continuation_next_step_hint(stored)));
+    blocks.push(format!(
+        "➡️ 下一步建议: {}",
+        continuation_next_step_hint(stored)
+    ));
 
     format_follow_up_reply("任务连续性回放", stored, blocks)
 }
@@ -289,11 +473,19 @@ pub fn format_last_result_reply(stored: &StoredSession) -> String {
 
     let mut blocks = vec![format!(
         "🧾 上一步结果: {}",
-        if last_step.success { "成功" } else { "失败" }
+        if last_step.success {
+            "成功"
+        } else {
+            "失败"
+        }
     )];
     blocks.push(format!(
         "📎 导语: 上一步已经{}，这里先给你摘要，再附上原始结果。",
-        if last_step.success { "完成" } else { "返回失败结果" }
+        if last_step.success {
+            "完成"
+        } else {
+            "返回失败结果"
+        }
     ));
     blocks.push(format!("📌 上一步: {}", last_step.description));
     if let Some(snippet) = summarize_reply_snippet(&last_step.reply, 3, 220) {
@@ -306,7 +498,10 @@ pub fn format_last_result_reply(stored: &StoredSession) -> String {
         blocks.push(format!("📄 相关文件: {}", path));
     }
     if stored.recent_file_paths.len() > 1 {
-        blocks.push(format!("🗂 最近文件列表: {}", stored.recent_file_paths.join("、")));
+        blocks.push(format!(
+            "🗂 最近文件列表: {}",
+            stored.recent_file_paths.join("、")
+        ));
     }
 
     format_follow_up_reply("上一步结果回放", stored, blocks)
@@ -319,7 +514,10 @@ pub fn format_last_diff_reply(stored: &StoredSession) -> String {
 
     let mut blocks = vec![format!("🧩 最近一次 diff: {}", last_diff.description)];
     if !stored.recent_file_paths.is_empty() {
-        blocks.push(format!("📄 相关文件: {}", stored.recent_file_paths.join("、")));
+        blocks.push(format!(
+            "📄 相关文件: {}",
+            stored.recent_file_paths.join("、")
+        ));
     }
     blocks.push(format!("📤 diff 内容:\n{}", last_diff.content));
 
@@ -331,7 +529,10 @@ pub fn format_recent_files_reply(stored: &StoredSession) -> String {
         return "⚠️ 最近一次任务里没有记录到文件列表。可以先发送「读取 <文件>」、「查看 diff」或「应用补丁 ...」。".to_string();
     }
 
-    let mut blocks = vec![format!("📚 最近改动文件列表（{}）", stored.recent_file_paths.len())];
+    let mut blocks = vec![format!(
+        "📚 最近改动文件列表（{}）",
+        stored.recent_file_paths.len()
+    )];
     blocks.extend(
         stored
             .recent_file_paths
@@ -343,7 +544,11 @@ pub fn format_recent_files_reply(stored: &StoredSession) -> String {
     format_follow_up_reply("最近文件回放", stored, blocks)
 }
 
-pub fn format_follow_up_reply(title: &str, stored: &StoredSession, detail_blocks: Vec<String>) -> String {
+pub fn format_follow_up_reply(
+    title: &str,
+    stored: &StoredSession,
+    detail_blocks: Vec<String>,
+) -> String {
     let mut blocks = vec![format!("🧭 {}", title)];
     blocks.push(format!(
         "🎯 当前任务: {}",
@@ -358,11 +563,19 @@ pub fn format_follow_up_reply(title: &str, stored: &StoredSession, detail_blocks
         blocks.push(format!("📌 最近状态: {}", last_result.status));
     }
 
-    if let Some(last_action) = stored.last_action.as_deref().filter(|action| !action.is_empty()) {
+    if let Some(last_action) = stored
+        .last_action
+        .as_deref()
+        .filter(|action| !action.is_empty())
+    {
         blocks.push(format!("🧾 上次动作: {}", last_action));
     }
 
-    blocks.extend(detail_blocks.into_iter().filter(|block| !block.trim().is_empty()));
+    blocks.extend(
+        detail_blocks
+            .into_iter()
+            .filter(|block| !block.trim().is_empty()),
+    );
 
     blocks.join("\n\n")
 }
@@ -379,16 +592,29 @@ pub fn describe_intent(intent: &Intent) -> String {
         Intent::UninstallExtension { ext_id } => format!("卸载扩展 {ext_id}"),
         Intent::ListExtensions => "列出扩展".to_string(),
         Intent::DiffFiles { file1, file2 } => format!("对比 {file1} 和 {file2}"),
-        Intent::ReadFile { path, start_line, end_line } => match (start_line, end_line) {
-            (Some(start_line), Some(end_line)) => format!("读取文件 {path}:{start_line}-{end_line}"),
+        Intent::ReadFile {
+            path,
+            start_line,
+            end_line,
+        } => match (start_line, end_line) {
+            (Some(start_line), Some(end_line)) => {
+                format!("读取文件 {path}:{start_line}-{end_line}")
+            }
             _ => format!("读取文件 {path}"),
         },
         Intent::ListDirectory { path } => match path {
             Some(path) => format!("列出目录 {path}"),
             None => "列出当前目录".to_string(),
         },
-        Intent::SearchText { query, path, is_regex } => match path {
-            Some(path) => format!("{}搜索 {query} 于 {path}", if *is_regex { "正则" } else { "文本" }),
+        Intent::SearchText {
+            query,
+            path,
+            is_regex,
+        } => match path {
+            Some(path) => format!(
+                "{}搜索 {query} 于 {path}",
+                if *is_regex { "正则" } else { "文本" }
+            ),
             None => format!("{}搜索 {query}", if *is_regex { "正则" } else { "文本" }),
         },
         Intent::RunTests { command } => match command {
@@ -416,22 +642,29 @@ pub fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::AskCodex { prompt } => format!("问 Codex {prompt}"),
         Intent::StartAgentRun { prompt } => format!("启动 Agent Runtime：{prompt}"),
         Intent::ContinueAgentRun { prompt } => match prompt {
-            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent Runtime：{}", prompt.trim()),
+            Some(prompt) if !prompt.trim().is_empty() => {
+                format!("继续 Agent Runtime：{}", prompt.trim())
+            }
             _ => "继续 Agent Runtime".to_string(),
         },
         Intent::ShowAgentRunStatus => "查看 Agent Runtime 状态".to_string(),
         Intent::ApproveAgentRun { option_id } => match option_id {
-            Some(option_id) if !option_id.trim().is_empty() => format!("批准 Agent Runtime 决策 {}", option_id.trim()),
+            Some(option_id) if !option_id.trim().is_empty() => {
+                format!("批准 Agent Runtime 决策 {}", option_id.trim())
+            }
             _ => "批准当前 Agent Runtime 决策".to_string(),
         },
         Intent::CancelAgentRun => "取消 Agent Runtime".to_string(),
         Intent::ContinueAgent { prompt } => match prompt {
-            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent 任务：{}", prompt.trim()),
-            _ => "继续 Agent 任务".to_string(),
+            Some(prompt) if !prompt.trim().is_empty() => {
+                format!("继续当前任务：{}", prompt.trim())
+            }
+            _ => "继续当前任务".to_string(),
         },
-        Intent::ContinueAgentSuggested => "按建议继续 Agent 任务".to_string(),
+        Intent::ContinueAgentSuggested => "按建议继续当前任务".to_string(),
         Intent::ResetAgentSession => "重置 Copilot 会话".to_string(),
         Intent::ShowProjectPicker => "打开项目选择卡片".to_string(),
         Intent::ShowProjectBrowser { path } => match path {
@@ -483,7 +716,10 @@ pub fn describe_intent(intent: &Intent) -> String {
 
 fn failure_next_step_hint(stored: &StoredSession) -> String {
     if let Some(step) = stored.pending_steps.first() {
-        return format!("建议先处理失败点，再继续后面的步骤，例如先回到「{}」。", step);
+        return format!(
+            "建议先处理失败点，再继续后面的步骤，例如先回到「{}」。",
+            step
+        );
     }
 
     if let Some(path) = stored
@@ -492,7 +728,10 @@ fn failure_next_step_hint(stored: &StoredSession) -> String {
         .map(String::as_str)
         .or(stored.last_file_path.as_deref())
     {
-        return format!("建议先检查相关文件 {}，确认后再决定重试还是继续追问。", path);
+        return format!(
+            "建议先检查相关文件 {}，确认后再决定重试还是继续追问。",
+            path
+        );
     }
 
     "建议先看原始结果里的退出码或报错正文，再决定是重试、改文件还是调整命令。".to_string()
@@ -505,7 +744,10 @@ fn result_next_step_hint(stored: &StoredSession) -> String {
         .map(String::as_str)
         .or(stored.last_file_path.as_deref())
     {
-        return format!("如果要继续这个上下文，可以直接继续处理 {}，或再追问最近 diff。", path);
+        return format!(
+            "如果要继续这个上下文，可以直接继续处理 {}，或再追问最近 diff。",
+            path
+        );
     }
 
     if let Some(step) = stored.pending_steps.first() {
@@ -538,4 +780,46 @@ fn continuation_next_step_hint(stored: &StoredSession) -> String {
     }
 
     "可以直接发下一条开发指令，或先追问最近结果和文件上下文。".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_feishu_attachment_probe_reply_includes_key_details() {
+        let inbound = crate::feishu::InboundMessage {
+            reply_target: crate::feishu::ReplyTarget {
+                receive_id: "oc_demo".to_string(),
+                receive_id_type: "chat_id".to_string(),
+            },
+            chat_id: "oc_demo".to_string(),
+            chat_type: "p2p".to_string(),
+            sender_id: "ou_demo".to_string(),
+            message_type: "image".to_string(),
+            text: "飞书图片消息".to_string(),
+            message_id: "om_demo".to_string(),
+            attachment: Some(crate::feishu::InboundAttachment {
+                kind: "image".to_string(),
+                resource_key: "img_demo".to_string(),
+                file_name: None,
+            }),
+            unsupported_reason: None,
+        };
+
+        let downloaded = crate::feishu::DownloadedAttachment {
+            local_path: std::path::PathBuf::from("C:/temp/bridge/image.png"),
+            file_name: "image.png".to_string(),
+            size_bytes: 1024,
+            content_type: Some("image/png".to_string()),
+        };
+
+        let reply = format_feishu_attachment_probe_reply(&inbound, Some(&downloaded), None);
+
+        assert!(reply.contains("已收到飞书图片"));
+        assert!(reply.contains("img_demo"));
+        assert!(reply.contains("om_demo"));
+        assert!(reply.contains("本地文件"));
+        assert!(reply.contains("image.png"));
+    }
 }

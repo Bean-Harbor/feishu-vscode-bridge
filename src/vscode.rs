@@ -6,9 +6,11 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::agent_runtime::AgentRunState;
@@ -27,6 +29,8 @@ const AGENT_STATUS_PATH: &str = "/v1/chat/agent/status";
 const AGENT_APPROVE_PATH: &str = "/v1/chat/agent/approve";
 const AGENT_CANCEL_PATH: &str = "/v1/chat/agent/cancel";
 const MAX_AGENT_TOOL_SUMMARY_CHARS: usize = 240;
+const AGENT_START_RETRY_ATTEMPTS: usize = 4;
+const AGENT_START_RETRY_DELAY_MS: u64 = 600;
 
 #[derive(Deserialize)]
 struct AgentTaskStateResponse {
@@ -297,13 +301,10 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
         let mut carried_tool_call = None;
         let mut carried_tool_result_summary = None;
 
-        if agent_status_from_response(&payload)
-            .eq_ignore_ascii_case("needs_tool")
-        {
-            let tool_request = payload
-                .tool_request
-                .clone()
-                .ok_or_else(|| "agent bridge 请求了工具，但没有返回可执行的 toolRequest。".to_string())?;
+        if agent_status_from_response(&payload).eq_ignore_ascii_case("needs_tool") {
+            let tool_request = payload.tool_request.clone().ok_or_else(|| {
+                "agent bridge 请求了工具，但没有返回可执行的 toolRequest。".to_string()
+            })?;
 
             let executed = execute_agent_tool_call(&tool_request);
             carried_tool_call = Some(format_agent_tool_call(&tool_request));
@@ -320,7 +321,9 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
                         "执行只读工具失败: {}",
                         format_agent_tool_call(&tool_request)
                     )),
-                    next_action: Some("请调整问题描述、检查路径参数，或改为更明确的文件/符号后重试。".to_string()),
+                    next_action: Some(
+                        "请调整问题描述、检查路径参数，或改为更明确的文件/符号后重试。".to_string(),
+                    ),
                     related_files: executed.related_files,
                     tool_call: carried_tool_call,
                     tool_result_summary: carried_tool_result_summary,
@@ -432,7 +435,9 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
             message: err.clone(),
             summary: Some(err.clone()),
             current_action: Some("向本地 agent bridge 发起请求失败".to_string()),
-            next_action: Some("确认 VS Code companion extension 已启动，并检查本地 bridge 健康状态。".to_string()),
+            next_action: Some(
+                "确认 VS Code companion extension 已启动，并检查本地 bridge 健康状态。".to_string(),
+            ),
             related_files: Vec::new(),
             tool_call: None,
             tool_result_summary: None,
@@ -446,9 +451,7 @@ pub fn ask_agent(session_id: &str, prompt: &str) -> AgentAskResult {
 fn call_agent_run_endpoint(payload_path: &str, payload: serde_json::Value) -> AgentRunResult {
     let result = (|| -> Result<AgentRunResponse, String> {
         let endpoint = format!("{}{}", agent_bridge_base_url()?, payload_path);
-        let response = ureq::post(&endpoint)
-            .set("Content-Type", "application/json")
-            .send_json(&payload)
+        let response = post_agent_run_request(&endpoint, &payload, payload_path)
             .map_err(|err| format_agent_bridge_error(err, &endpoint))?;
 
         response
@@ -476,6 +479,44 @@ fn call_agent_run_endpoint(payload_path: &str, payload: serde_json::Value) -> Ag
             error: Some(err),
         },
     }
+}
+
+fn post_agent_run_request(
+    endpoint: &str,
+    payload: &serde_json::Value,
+    payload_path: &str,
+) -> Result<ureq::Response, ureq::Error> {
+    let max_attempts = if payload_path == AGENT_START_PATH {
+        AGENT_START_RETRY_ATTEMPTS
+    } else {
+        1
+    };
+
+    let mut last_error: Option<ureq::Error> = None;
+
+    for attempt in 1..=max_attempts {
+        match ureq::post(endpoint)
+            .set("Content-Type", "application/json")
+            .send_json(payload)
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let should_retry = payload_path == AGENT_START_PATH
+                    && attempt < max_attempts
+                    && matches!(error, ureq::Error::Transport(_));
+
+                if should_retry {
+                    thread::sleep(Duration::from_millis(AGENT_START_RETRY_DELAY_MS));
+                    last_error = Some(error);
+                    continue;
+                }
+
+                return Err(error);
+            }
+        }
+    }
+
+    Err(last_error.expect("agent run retry loop exited without a captured error"))
 }
 
 #[derive(Debug, Clone)]
@@ -540,16 +581,14 @@ fn execute_agent_read_file(tool_call: &AgentToolCall) -> ExecutedAgentTool {
         };
     };
 
-    let start_line = tool_call
-        .args
-        .get("startLine")
-        .and_then(value_to_usize);
-    let end_line = tool_call
-        .args
-        .get("endLine")
-        .and_then(value_to_usize);
+    let start_line = tool_call.args.get("startLine").and_then(value_to_usize);
+    let end_line = tool_call.args.get("endLine").and_then(value_to_usize);
     let result = read_file(path, start_line, end_line);
-    build_executed_agent_tool(result, format_agent_tool_call(tool_call), vec![path.to_string()])
+    build_executed_agent_tool(
+        result,
+        format_agent_tool_call(tool_call),
+        vec![path.to_string()],
+    )
 }
 
 fn execute_agent_search_text(tool_call: &AgentToolCall) -> ExecutedAgentTool {
@@ -700,7 +739,11 @@ fn value_to_usize(value: &Value) -> Option<usize> {
     value
         .as_u64()
         .and_then(|value| usize::try_from(value).ok())
-        .or_else(|| value.as_str().and_then(|value| value.trim().parse::<usize>().ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
 }
 
 pub fn reset_agent_session(session_id: &str) -> CmdResult {
@@ -829,8 +872,8 @@ pub fn read_file(path: &str, start_line: Option<usize>, end_line: Option<usize>)
     let start = Instant::now();
     let result = (|| -> Result<String, String> {
         let resolved = resolve_workspace_target(path)?;
-        let content = fs::read_to_string(&resolved)
-            .map_err(|err| format!("读取文件失败: {err}"))?;
+        let content =
+            fs::read_to_string(&resolved).map_err(|err| format!("读取文件失败: {err}"))?;
         let lines: Vec<&str> = content.lines().collect();
 
         if lines.is_empty() {
@@ -911,7 +954,12 @@ pub fn list_directory(path: Option<&str>) -> CmdResult {
 
         let total = items.len();
         let shown = items.iter().take(200).cloned().collect::<Vec<_>>();
-        let mut output = format!("目录: {}\n项目数: {}\n\n{}", target.display(), total, shown.join("\n"));
+        let mut output = format!(
+            "目录: {}\n项目数: {}\n\n{}",
+            target.display(),
+            total,
+            shown.join("\n")
+        );
         if total > shown.len() {
             output.push_str(&format!("\n\n… 仅显示前 {} 项。", shown.len()));
         }
@@ -1061,7 +1109,13 @@ pub fn git_diff(path: Option<&str>) -> CmdResult {
     let pathspec_ref = pathspec.as_str();
     run_cmd(
         "git",
-        &["-C", workspace.to_string_lossy().as_ref(), "diff", "--", pathspec_ref],
+        &[
+            "-C",
+            workspace.to_string_lossy().as_ref(),
+            "diff",
+            "--",
+            pathspec_ref,
+        ],
         30,
     )
 }
@@ -1120,7 +1174,10 @@ pub fn reverse_patch(patch: &str) -> CmdResult {
         return with_step_label("git apply --reverse", apply);
     }
 
-    combine_results(&[("git apply --check --reverse", check), ("git apply --reverse", apply)])
+    combine_results(&[
+        ("git apply --check --reverse", check),
+        ("git apply --reverse", apply),
+    ])
 }
 
 /// 执行任意 shell 命令（用户通过飞书发送时需要谨慎）
@@ -1210,7 +1267,11 @@ pub fn git_push_all(repo_path: Option<&str>, message: &str) -> CmdResult {
         return with_step_label("git add -A", add);
     }
 
-    let commit = run_git(resolved_repo_path.as_deref(), &["commit", "-m", message], 30);
+    let commit = run_git(
+        resolved_repo_path.as_deref(),
+        &["commit", "-m", message],
+        30,
+    );
     if !commit.success {
         if is_nothing_to_commit(&commit) {
             return CmdResult {
@@ -1784,7 +1845,11 @@ fn format_grouped_search_reply(
     for (path, items) in groups {
         rendered.push(path);
         for item in items.iter().take(SEARCH_MATCH_LIMIT_PER_FILE) {
-            rendered.push(format!("  {}: {}", item.line_number, item.line_text.trim_end()));
+            rendered.push(format!(
+                "  {}: {}",
+                item.line_number,
+                item.line_text.trim_end()
+            ));
         }
         if items.len() > SEARCH_MATCH_LIMIT_PER_FILE {
             truncated_per_file = true;
@@ -1846,12 +1911,18 @@ fn fallback_text_search(query: &str, target: &Path, is_regex: bool) -> Result<St
         None
     };
 
-    let matches = search_text_in_files(target, SearchOptions { exclude_test_paths: false, exclude_inline_rust_tests: false, exclude_runtime_artifacts: false }, |_, line| {
-        match &regex {
+    let matches = search_text_in_files(
+        target,
+        SearchOptions {
+            exclude_test_paths: false,
+            exclude_inline_rust_tests: false,
+            exclude_runtime_artifacts: false,
+        },
+        |_, line| match &regex {
             Some(regex) => regex.is_match(line),
             None => line.contains(query),
-        }
-    })?;
+        },
+    )?;
 
     let mut result = format!(
         "搜索范围: {}\n模式: {}\n关键词: {}\n",
@@ -1882,9 +1953,7 @@ fn fallback_symbol_search(
     let pattern = symbol_definition_pattern(query);
     let regex = Regex::new(&pattern).map_err(|err| format!("符号搜索模式无效: {err}"))?;
 
-    let matches = search_text_in_files(target, options, |_, line| {
-        regex.is_match(line)
-    })?;
+    let matches = search_text_in_files(target, options, |_, line| regex.is_match(line))?;
 
     let mut result = format!("搜索范围: {}\n符号: {}\n", target.display(), query);
 
@@ -1984,7 +2053,14 @@ fn fallback_implementation_search(
 fn format_search_match_lines(matches: &[SearchMatch]) -> Vec<String> {
     matches
         .iter()
-        .map(|item| format!("{}:{}:{}", item.path.display(), item.line_number, item.line_text))
+        .map(|item| {
+            format!(
+                "{}:{}:{}",
+                item.path.display(),
+                item.line_number,
+                item.line_text
+            )
+        })
         .collect()
 }
 
@@ -2016,11 +2092,13 @@ fn is_rust_inline_test_line(
         return false;
     }
 
-    let ranges = inline_test_ranges.entry(item.path.clone()).or_insert_with(|| {
-        fs::read_to_string(&item.path)
-            .map(|content| rust_inline_test_module_ranges(&content))
-            .unwrap_or_default()
-    });
+    let ranges = inline_test_ranges
+        .entry(item.path.clone())
+        .or_insert_with(|| {
+            fs::read_to_string(&item.path)
+                .map(|content| rust_inline_test_module_ranges(&content))
+                .unwrap_or_default()
+        });
 
     ranges
         .iter()
@@ -2177,7 +2255,10 @@ where
         if file_type.is_dir() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".next" | "dist" | "build") {
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | "node_modules" | ".next" | "dist" | "build"
+            ) {
                 continue;
             }
             if options.exclude_test_paths && is_test_path(&path) {
@@ -2199,7 +2280,13 @@ where
 }
 
 fn excluded_test_globs() -> &'static [&'static str] {
-    &["!tests/**", "!test/**", "!__tests__/**", "!spec/**", "!specs/**"]
+    &[
+        "!tests/**",
+        "!test/**",
+        "!__tests__/**",
+        "!spec/**",
+        "!specs/**",
+    ]
 }
 
 fn excluded_runtime_artifact_globs() -> &'static [&'static str] {
@@ -2241,7 +2328,10 @@ fn is_test_component(name: &str) -> bool {
 }
 
 fn is_runtime_artifact_name(name: &str) -> bool {
-    matches!(name, ".feishu-vscode-bridge-audit.jsonl" | ".feishu-vscode-bridge-session.json")
+    matches!(
+        name,
+        ".feishu-vscode-bridge-audit.jsonl" | ".feishu-vscode-bridge-session.json"
+    )
 }
 
 fn error_cmd_result(message: String) -> CmdResult {
@@ -2515,7 +2605,10 @@ fn into_cmd_result(result: Result<String, String>, duration_ms: u64) -> CmdResul
 fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() + 8);
     for c in s.chars() {
-        if matches!(c, '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\') {
+        if matches!(
+            c,
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+        ) {
             escaped.push('\\');
         }
         escaped.push(c);
@@ -2575,7 +2668,10 @@ fn tail_lines(text: &str, count: usize) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(count);
-    lines[start..].iter().map(|line| (*line).to_string()).collect()
+    lines[start..]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect()
 }
 
 fn run_git(repo_path: Option<&str>, git_args: &[&str], timeout_secs: u64) -> CmdResult {
@@ -2770,7 +2866,10 @@ mod tests {
         }
 
         let resolved = resolve_workspace_target("src/lib.rs").unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/workspace-root").join("src/lib.rs"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/workspace-root").join("src/lib.rs")
+        );
 
         unsafe {
             std::env::remove_var(WORKSPACE_PATH_ENV);
@@ -3014,9 +3113,14 @@ mod tests {
         assert!(!SearchOptions::from_explicit_path(Some("tests")).exclude_inline_rust_tests);
         assert!(SearchOptions::from_explicit_path(Some("tests")).exclude_runtime_artifacts);
         assert!(!SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_test_paths);
-        assert!(!SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_inline_rust_tests);
+        assert!(
+            !SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_inline_rust_tests
+        );
         assert!(SearchOptions::from_explicit_path(Some("src/__tests__")).exclude_runtime_artifacts);
-        assert!(!SearchOptions::from_explicit_path(Some(".feishu-vscode-bridge-audit.jsonl")).exclude_runtime_artifacts);
+        assert!(
+            !SearchOptions::from_explicit_path(Some(".feishu-vscode-bridge-audit.jsonl"))
+                .exclude_runtime_artifacts
+        );
     }
 
     #[test]
@@ -3169,7 +3273,11 @@ mod tests {
     fn build_test_file_command_maps_rust_integration_test() {
         let workspace = unique_temp_dir("test-file-command");
         fs::create_dir_all(workspace.join("tests")).unwrap();
-        fs::write(workspace.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         let test_file = workspace.join("tests/approval_card_flow.rs");
         fs::write(&test_file, "#[test]\nfn demo() {}\n").unwrap();
 
@@ -3183,9 +3291,16 @@ mod tests {
     fn should_isolate_rust_test_target_dir_for_cargo_test_commands() {
         let workspace = unique_temp_dir("test-target-dir");
         fs::create_dir_all(&workspace).unwrap();
-        fs::write(workspace.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
 
-        assert!(should_isolate_rust_test_target_dir(&workspace, "cargo test --test approval_card_flow"));
+        assert!(should_isolate_rust_test_target_dir(
+            &workspace,
+            "cargo test --test approval_card_flow"
+        ));
         assert_eq!(
             isolated_rust_test_target_dir(&workspace),
             workspace.join("target").join("bridge-test-runner")
@@ -3281,7 +3396,10 @@ mod tests {
     fn extract_primary_patch_path_returns_last_modified_file() {
         let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/src/bridge.rs b/src/bridge.rs\n--- a/src/bridge.rs\n+++ b/src/bridge.rs\n@@ -1 +1 @@\n-a\n+b\n";
 
-        assert_eq!(extract_primary_patch_path(patch), Some("src/bridge.rs".to_string()));
+        assert_eq!(
+            extract_primary_patch_path(patch),
+            Some("src/bridge.rs".to_string())
+        );
     }
 
     #[test]
@@ -3298,7 +3416,10 @@ mod tests {
     fn extract_primary_patch_path_handles_deleted_file() {
         let patch = "diff --git a/src/old.rs b/src/old.rs\n--- a/src/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
 
-        assert_eq!(extract_primary_patch_path(patch), Some("src/old.rs".to_string()));
+        assert_eq!(
+            extract_primary_patch_path(patch),
+            Some("src/old.rs".to_string())
+        );
     }
 
     #[test]
@@ -3333,11 +3454,21 @@ mod tests {
 
         let apply = apply_patch(patch);
         assert!(apply.success, "{}", apply.to_reply("apply patch"));
-        assert_eq!(fs::read_to_string(&file_path).unwrap().replace("\r\n", "\n"), "new\n");
+        assert_eq!(
+            fs::read_to_string(&file_path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "new\n"
+        );
 
         let reverse = reverse_patch(patch);
         assert!(reverse.success, "{}", reverse.to_reply("reverse patch"));
-        assert_eq!(fs::read_to_string(&file_path).unwrap().replace("\r\n", "\n"), "old\n");
+        assert_eq!(
+            fs::read_to_string(&file_path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "old\n"
+        );
 
         unsafe {
             std::env::remove_var(WORKSPACE_PATH_ENV);

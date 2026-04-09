@@ -71,35 +71,49 @@ impl ApprovalPolicy {
             Self::from_spec("none")
         };
 
-        for token in normalized.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+        for token in normalized
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
             match token {
                 token if token.eq_ignore_ascii_case("default") => policy = Self::default(),
                 token if token.eq_ignore_ascii_case("shell") => policy.require_shell = true,
-                token if token.eq_ignore_ascii_case("git_push") || token.eq_ignore_ascii_case("push") => {
+                token
+                    if token.eq_ignore_ascii_case("git_push")
+                        || token.eq_ignore_ascii_case("push") =>
+                {
                     policy.require_git_push = true;
                 }
-                token if token.eq_ignore_ascii_case("git_pull") || token.eq_ignore_ascii_case("pull") => {
+                token
+                    if token.eq_ignore_ascii_case("git_pull")
+                        || token.eq_ignore_ascii_case("pull") =>
+                {
                     policy.require_git_pull = true;
                 }
-                token if token.eq_ignore_ascii_case("apply_patch")
-                    || token.eq_ignore_ascii_case("patch") =>
+                token
+                    if token.eq_ignore_ascii_case("apply_patch")
+                        || token.eq_ignore_ascii_case("patch") =>
                 {
                     policy.require_apply_patch = true;
                 }
-                token if token.eq_ignore_ascii_case("write_file")
-                    || token.eq_ignore_ascii_case("write") =>
+                token
+                    if token.eq_ignore_ascii_case("write_file")
+                        || token.eq_ignore_ascii_case("write") =>
                 {
                     policy.require_write_file = true;
                 }
-                token if token.eq_ignore_ascii_case("install_extension")
-                    || token.eq_ignore_ascii_case("extension_install")
-                    || token.eq_ignore_ascii_case("extensions") =>
+                token
+                    if token.eq_ignore_ascii_case("install_extension")
+                        || token.eq_ignore_ascii_case("extension_install")
+                        || token.eq_ignore_ascii_case("extensions") =>
                 {
                     policy.require_extension_install = true;
                 }
-                token if token.eq_ignore_ascii_case("uninstall_extension")
-                    || token.eq_ignore_ascii_case("extension_uninstall")
-                    || token.eq_ignore_ascii_case("extensions") =>
+                token
+                    if token.eq_ignore_ascii_case("uninstall_extension")
+                        || token.eq_ignore_ascii_case("extension_uninstall")
+                        || token.eq_ignore_ascii_case("extensions") =>
                 {
                     policy.require_extension_uninstall = true;
                 }
@@ -107,7 +121,8 @@ impl ApprovalPolicy {
                     policy.require_git_push = true;
                     policy.require_git_pull = true;
                 }
-                token if token.eq_ignore_ascii_case("all") || token.eq_ignore_ascii_case("none") => {}
+                token
+                    if token.eq_ignore_ascii_case("all") || token.eq_ignore_ascii_case("none") => {}
                 _ => {}
             }
         }
@@ -171,13 +186,23 @@ pub enum Intent {
         mode: ExecutionMode,
     },
     ContinuePlan,
-    ShowPlanPrompt { prompt: String },
-    StartAgentRun { prompt: String },
-    ContinueAgentRun { prompt: Option<String> },
+    ShowPlanPrompt {
+        prompt: String,
+    },
+    StartAgentRun {
+        prompt: String,
+    },
+    ContinueAgentRun {
+        prompt: Option<String>,
+    },
     ShowAgentRunStatus,
-    ApproveAgentRun { option_id: Option<String> },
+    ApproveAgentRun {
+        option_id: Option<String>,
+    },
     CancelAgentRun,
-    ContinueAgent { prompt: Option<String> },
+    ContinueAgent {
+        prompt: Option<String>,
+    },
     ContinueAgentSuggested,
     RetryFailedStep,
     ExecuteAll,
@@ -191,26 +216,46 @@ pub enum Intent {
     UndoLastPatch,
 
     // VS Code 操作
-    OpenFile { path: String, line: Option<u32> },
-    OpenFolder { path: String },
-    InstallExtension { ext_id: String },
-    UninstallExtension { ext_id: String },
+    OpenFile {
+        path: String,
+        line: Option<u32>,
+    },
+    OpenFolder {
+        path: String,
+    },
+    InstallExtension {
+        ext_id: String,
+    },
+    UninstallExtension {
+        ext_id: String,
+    },
     ListExtensions,
-    DiffFiles { file1: String, file2: String },
+    DiffFiles {
+        file1: String,
+        file2: String,
+    },
     ReadFile {
         path: String,
         start_line: Option<usize>,
         end_line: Option<usize>,
     },
-    ListDirectory { path: Option<String> },
+    ListDirectory {
+        path: Option<String>,
+    },
     SearchText {
         query: String,
         path: Option<String>,
         is_regex: bool,
     },
-    RunTests { command: Option<String> },
-    GitDiff { path: Option<String> },
-    ApplyPatch { patch: String },
+    RunTests {
+        command: Option<String>,
+    },
+    GitDiff {
+        path: Option<String>,
+    },
+    ApplyPatch {
+        patch: String,
+    },
     SearchSymbol {
         query: String,
         path: Option<String>,
@@ -223,48 +268,78 @@ pub enum Intent {
         query: String,
         path: Option<String>,
     },
-    RunSpecificTest { filter: String },
-    RunTestFile { path: String },
-    WriteFile { path: String, content: String },
-    AskAgent { prompt: String },
+    RunSpecificTest {
+        filter: String,
+    },
+    RunTestFile {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    AskAgent {
+        prompt: String,
+    },
+    AskCodex {
+        prompt: String,
+    },
     ResetAgentSession,
     ShowProjectPicker,
-    ShowProjectBrowser { path: Option<String> },
+    ShowProjectBrowser {
+        path: Option<String>,
+    },
     ShowCurrentProject,
 
     // Git 操作
-    GitStatus { repo: Option<String> },
-    GitSync { repo: Option<String> },
-    GitPull { repo: Option<String> },
-    GitPushAll { repo: Option<String>, message: String },
-    GitLog { count: Option<usize>, path: Option<String> },
-    GitBlame { path: String },
+    GitStatus {
+        repo: Option<String>,
+    },
+    GitSync {
+        repo: Option<String>,
+    },
+    GitPull {
+        repo: Option<String>,
+    },
+    GitPushAll {
+        repo: Option<String>,
+        message: String,
+    },
+    GitLog {
+        count: Option<usize>,
+        path: Option<String>,
+    },
+    GitBlame {
+        path: String,
+    },
 
     // Shell
-    RunShell { cmd: String },
+    RunShell {
+        cmd: String,
+    },
 
     // 通用
     Help,
     Unknown(String),
 }
 
-pub mod executor;
-pub mod agent_runtime;
 pub mod agent_backend;
-pub mod bridge_context;
-pub mod direct_command;
-pub mod follow_up;
-pub mod intent_executor;
-pub mod plan_dispatch;
+pub mod agent_runtime;
 pub mod audit;
 pub mod bridge;
+pub mod bridge_context;
 pub mod card;
+pub mod direct_command;
+pub mod executor;
 pub mod feishu;
+pub mod follow_up;
+pub mod intent_executor;
 pub mod plan;
+pub mod plan_dispatch;
 pub mod reply;
+pub mod semantic_planner;
 pub mod session;
 pub mod vscode;
-pub mod semantic_planner;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -283,7 +358,10 @@ fn parse_intent_internal(text: &str, allow_natural_language: bool) -> Intent {
     let text = text.trim();
     let lower = text.to_lowercase();
 
-    if matches!(lower.as_str(), "批准" | "同意" | "允许执行" | "approve" | "approve pending") {
+    if matches!(
+        lower.as_str(),
+        "批准" | "同意" | "允许执行" | "approve" | "approve pending"
+    ) {
         return Intent::ApprovePending;
     }
 
@@ -380,7 +458,10 @@ fn parse_intent_internal(text: &str, allow_natural_language: bool) -> Intent {
         return Intent::ShowProjectBrowser { path: None };
     }
 
-    if matches!(lower.as_str(), "当前项目" | "current project" | "project status") {
+    if matches!(
+        lower.as_str(),
+        "当前项目" | "current project" | "project status"
+    ) {
         return Intent::ShowCurrentProject;
     }
 
@@ -443,10 +524,8 @@ fn parse_intent_internal(text: &str, allow_natural_language: bool) -> Intent {
         return Intent::ExecuteAll;
     }
 
-    if let Some(rest) = strip_prefix_any(
-        &lower,
-        &["执行计划 ", "计划 ", "step by step ", "plan "],
-    ) {
+    if let Some(rest) = strip_prefix_any(&lower, &["执行计划 ", "计划 ", "step by step ", "plan "])
+    {
         let rest = text[text.len() - rest.len()..].trim();
         if let Some(intent) = parse_plan(rest, ExecutionMode::StepByStep) {
             return intent;
@@ -484,13 +563,7 @@ fn parse_plan_prompt_intent(text: &str, lower: &str) -> Option<String> {
     let prompt = strip_command_prefix(
         text,
         lower,
-        &[
-            "/plan",
-            "规划",
-            "给我计划",
-            "帮我规划",
-            "plan prompt",
-        ],
+        &["/plan", "规划", "给我计划", "帮我规划", "plan prompt"],
     )?
     .trim();
 
@@ -509,19 +582,22 @@ fn split_plan_steps(text: &str) -> Vec<&str> {
 }
 
 fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) -> Intent {
-
     // ── 帮助 ──
     if lower.is_empty() || matches!(lower, "help" | "帮助" | "?") {
         return Intent::Help;
     }
 
     // ── 列出扩展 ──
-    if matches!(lower, "扩展列表" | "列出扩展" | "插件列表" | "list extensions" | "list ext") {
+    if matches!(
+        lower,
+        "扩展列表" | "列出扩展" | "插件列表" | "list extensions" | "list ext"
+    ) {
         return Intent::ListExtensions;
     }
 
     // ── 读取文件 ──
-    if let Some(rest) = strip_prefix_any(&lower, &["读取文件 ", "读取 ", "read file ", "read "]) {
+    if let Some(rest) = strip_prefix_any(&lower, &["读取文件 ", "读取 ", "read file ", "read "])
+    {
         let rest = text[text.len() - rest.len()..].trim();
         let (path, start_line, end_line) = parse_read_target(rest);
         if !path.is_empty() {
@@ -534,10 +610,22 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     }
 
     // ── 列目录 ──
-    if matches!(lower, "列出目录" | "列目录" | "ls" | "list dir" | "list directory") {
+    if matches!(
+        lower,
+        "列出目录" | "列目录" | "ls" | "list dir" | "list directory"
+    ) {
         return Intent::ListDirectory { path: None };
     }
-    if let Some(rest) = strip_prefix_any(&lower, &["列出目录 ", "列目录 ", "list dir ", "list directory ", "ls "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "列出目录 ",
+            "列目录 ",
+            "list dir ",
+            "list directory ",
+            "ls ",
+        ],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::ListDirectory {
             path: Some(rest.to_string()),
@@ -557,7 +645,7 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
         return intent;
     }
 
-    // ── 询问 Copilot / Agent ──
+    // ── 询问 Copilot / Codex / Agent ──
     if let Some(intent) = parse_agent_reset_intent(lower) {
         return intent;
     }
@@ -576,10 +664,22 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     }
 
     // ── Git diff ──
-    if matches!(lower, "查看 diff" | "查看git diff" | "git diff" | "查看差异" | "查看变更") {
+    if matches!(
+        lower,
+        "查看 diff" | "查看git diff" | "git diff" | "查看差异" | "查看变更"
+    ) {
         return Intent::GitDiff { path: None };
     }
-    if let Some(rest) = strip_prefix_any(&lower, &["查看 diff ", "查看git diff ", "git diff ", "查看差异 ", "查看变更 "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "查看 diff ",
+            "查看git diff ",
+            "git diff ",
+            "查看差异 ",
+            "查看变更 ",
+        ],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::GitDiff {
             path: (!rest.is_empty()).then(|| rest.to_string()),
@@ -594,7 +694,14 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     }
     if let Some(rest) = strip_prefix_any(
         &lower,
-        &["应用补丁\n", "应用补丁 ", "apply patch\n", "apply patch ", "按以下补丁修改\n", "按以下补丁修改 "],
+        &[
+            "应用补丁\n",
+            "应用补丁 ",
+            "apply patch\n",
+            "apply patch ",
+            "按以下补丁修改\n",
+            "按以下补丁修改 ",
+        ],
     ) {
         let patch = text[text.len() - rest.len()..]
             .trim_start_matches(|c| matches!(c, ' ' | '\n' | '\r' | '\t'))
@@ -603,10 +710,16 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     }
 
     // ── 运行测试 ──
-    if matches!(lower, "运行测试" | "跑测试" | "测试" | "run tests" | "run test") {
+    if matches!(
+        lower,
+        "运行测试" | "跑测试" | "测试" | "run tests" | "run test"
+    ) {
         return Intent::RunTests { command: None };
     }
-    if let Some(rest) = strip_prefix_any(&lower, &["运行测试 ", "跑测试 ", "测试 ", "run tests ", "run test "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &["运行测试 ", "跑测试 ", "测试 ", "run tests ", "run test "],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::RunTests {
             command: (!rest.is_empty()).then(|| rest.to_string()),
@@ -614,37 +727,65 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     }
 
     // ── 运行指定测试 ──
-    if let Some(rest) = strip_prefix_any(&lower, &["运行指定测试 ", "跑指定测试 ", "指定测试 ", "test filter ", "test name "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "运行指定测试 ",
+            "跑指定测试 ",
+            "指定测试 ",
+            "test filter ",
+            "test name ",
+        ],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         if !rest.is_empty() {
-            return Intent::RunSpecificTest { filter: rest.to_string() };
+            return Intent::RunSpecificTest {
+                filter: rest.to_string(),
+            };
         }
     }
 
     // ── 运行测试文件 ──
-    if let Some(rest) = strip_prefix_any(&lower, &["运行测试文件 ", "测试文件 ", "run test file ", "test file "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &["运行测试文件 ", "测试文件 ", "run test file ", "test file "],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         if !rest.is_empty() {
-            return Intent::RunTestFile { path: rest.to_string() };
+            return Intent::RunTestFile {
+                path: rest.to_string(),
+            };
         }
     }
 
     // ── VS Code 打开文件夹 ──
-    if let Some(rest) = strip_prefix_any(&lower, &["选择项目 ", "切换项目 ", "select project ", "use project "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &["选择项目 ", "切换项目 ", "select project ", "use project "],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::OpenFolder {
             path: rest.to_string(),
         };
     }
 
-    if let Some(rest) = strip_prefix_any(&lower, &["浏览项目 ", "浏览文件夹 ", "browse project ", "browse folder "]) {
+    if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "浏览项目 ",
+            "浏览文件夹 ",
+            "browse project ",
+            "browse folder ",
+        ],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::ShowProjectBrowser {
             path: Some(rest.to_string()),
         };
     }
 
-    if let Some(rest) = strip_prefix_any(&lower, &["打开文件夹 ", "打开目录 ", "open folder "]) {
+    if let Some(rest) = strip_prefix_any(&lower, &["打开文件夹 ", "打开目录 ", "open folder "])
+    {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::OpenFolder {
             path: rest.to_string(),
@@ -670,7 +811,13 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     // ── 安装扩展 ──
     if let Some(rest) = strip_prefix_any(
         &lower,
-        &["安装扩展 ", "安装插件 ", "install extension ", "install ext ", "install "],
+        &[
+            "安装扩展 ",
+            "安装插件 ",
+            "install extension ",
+            "install ext ",
+            "install ",
+        ],
     ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::InstallExtension {
@@ -681,7 +828,13 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     // ── 卸载扩展 ──
     if let Some(rest) = strip_prefix_any(
         &lower,
-        &["卸载扩展 ", "卸载插件 ", "uninstall extension ", "uninstall ext ", "uninstall "],
+        &[
+            "卸载扩展 ",
+            "卸载插件 ",
+            "uninstall extension ",
+            "uninstall ext ",
+            "uninstall ",
+        ],
     ) {
         let rest = text[text.len() - rest.len()..].trim();
         return Intent::UninstallExtension {
@@ -772,9 +925,14 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
 
     // ── Git log ──
     if matches!(lower, "git log" | "提交历史" | "提交记录" | "历史记录") {
-        return Intent::GitLog { count: None, path: None };
+        return Intent::GitLog {
+            count: None,
+            path: None,
+        };
     }
-    if let Some(rest) = strip_prefix_any(&lower, &["git log ", "提交历史 ", "提交记录 ", "历史记录 "]) {
+    if let Some(rest) =
+        strip_prefix_any(&lower, &["git log ", "提交历史 ", "提交记录 ", "历史记录 "])
+    {
         let rest = text[text.len() - rest.len()..].trim();
         let (count, path) = parse_git_log_args(rest);
         return Intent::GitLog { count, path };
@@ -784,7 +942,9 @@ fn parse_single_intent(text: &str, lower: &str, allow_natural_language: bool) ->
     if let Some(rest) = strip_prefix_any(&lower, &["git blame ", "blame ", "追溯 "]) {
         let rest = text[text.len() - rest.len()..].trim();
         if !rest.is_empty() {
-            return Intent::GitBlame { path: rest.to_string() };
+            return Intent::GitBlame {
+                path: rest.to_string(),
+            };
         }
     }
 
@@ -830,25 +990,26 @@ impl Intent {
                 | Intent::UninstallExtension { .. }
                 | Intent::ListExtensions
                 | Intent::DiffFiles { .. }
-                    | Intent::ReadFile { .. }
-                    | Intent::ListDirectory { .. }
-                    | Intent::SearchText { .. }
+                | Intent::ReadFile { .. }
+                | Intent::ListDirectory { .. }
+                | Intent::SearchText { .. }
                 | Intent::RunTests { .. }
-                    | Intent::GitDiff { .. }
-                    | Intent::ApplyPatch { .. }
-                    | Intent::SearchSymbol { .. }
-                    | Intent::FindReferences { .. }
-                    | Intent::FindImplementations { .. }
-                    | Intent::RunSpecificTest { .. }
-                    | Intent::RunTestFile { .. }
-                    | Intent::WriteFile { .. }
-                    | Intent::AskAgent { .. }
-                    | Intent::StartAgentRun { .. }
-                    | Intent::ContinueAgentRun { .. }
-                    | Intent::ContinueAgent { .. }
-                    | Intent::ResetAgentSession
+                | Intent::GitDiff { .. }
+                | Intent::ApplyPatch { .. }
+                | Intent::SearchSymbol { .. }
+                | Intent::FindReferences { .. }
+                | Intent::FindImplementations { .. }
+                | Intent::RunSpecificTest { .. }
+                | Intent::RunTestFile { .. }
+                | Intent::WriteFile { .. }
+                | Intent::AskAgent { .. }
+                | Intent::AskCodex { .. }
+                | Intent::StartAgentRun { .. }
+                | Intent::ContinueAgentRun { .. }
+                | Intent::ContinueAgent { .. }
+                | Intent::ResetAgentSession
                 | Intent::GitStatus { .. }
-                    | Intent::GitSync { .. }
+                | Intent::GitSync { .. }
                 | Intent::GitPull { .. }
                 | Intent::GitPushAll { .. }
                 | Intent::GitLog { .. }
@@ -858,17 +1019,17 @@ impl Intent {
     }
 }
 
-    fn looks_like_continue_plan_phrase(lower: &str) -> bool {
-        let has_continue_plan = lower.contains("继续plan")
-            || lower.contains("继续 plan")
-            || lower.contains("continue plan");
-        let has_pending_work = lower.contains("没完成")
-            || lower.contains("未完成")
-            || lower.contains("unfinished")
-            || lower.contains("pending");
+fn looks_like_continue_plan_phrase(lower: &str) -> bool {
+    let has_continue_plan = lower.contains("继续plan")
+        || lower.contains("继续 plan")
+        || lower.contains("continue plan");
+    let has_pending_work = lower.contains("没完成")
+        || lower.contains("未完成")
+        || lower.contains("unfinished")
+        || lower.contains("pending");
 
-        has_continue_plan && has_pending_work
-    }
+    has_continue_plan && has_pending_work
+}
 
 /// 辅助：尝试匹配多个前缀，返回去掉前缀后的剩余文本
 fn strip_prefix_any<'a>(lower: &'a str, prefixes: &[&str]) -> Option<&'a str> {
@@ -930,7 +1091,12 @@ fn match_command_words(lower: &str, prefix: &str) -> Option<usize> {
         }
     }
 
-    if lower[offset..].is_empty() || lower[offset..].chars().next().is_some_and(char::is_whitespace) {
+    if lower[offset..].is_empty()
+        || lower[offset..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
         Some(offset)
     } else {
         None
@@ -955,16 +1121,29 @@ fn parse_natural_language_intent(text: &str, lower: &str) -> Option<Intent> {
 }
 
 fn parse_natural_project_intent(text: &str, lower: &str) -> Option<Intent> {
-    if contains_any(lower, &["当前项目", "现在在哪个项目", "现在在哪个仓库", "当前仓库"]) {
+    if contains_any(
+        lower,
+        &["当前项目", "现在在哪个项目", "现在在哪个仓库", "当前仓库"],
+    ) {
         return Some(Intent::ShowCurrentProject);
     }
 
     let looks_like_navigation_request = !contains_any(
         lower,
-        &["工作", "任务", "实现", "修复", "继续", "未完成", "readme", "docs/", "src/"],
+        &[
+            "工作",
+            "任务",
+            "实现",
+            "修复",
+            "继续",
+            "未完成",
+            "readme",
+            "docs/",
+            "src/",
+        ],
     );
 
-    if contains_any(lower, &["浏览", "看看", "看一下", "查看"]) 
+    if contains_any(lower, &["浏览", "看看", "看一下", "查看"])
         && contains_any(lower, &["项目", "目录", "文件夹", "本地文件夹"])
         && looks_like_navigation_request
     {
@@ -984,18 +1163,35 @@ fn parse_natural_git_intent(lower: &str) -> Option<Intent> {
     let mentions_remote = contains_any(lower, &["github", "远程", "仓库", "origin"]);
     let mentions_local_changes = contains_any(lower, &["本地", "改动", "变更", "代码", "提交"]);
 
-    if contains_any(lower, &["同步", "推送", "提交", "上传", "发上去"]) && mentions_remote && mentions_local_changes {
+    if contains_any(lower, &["同步", "推送", "提交", "上传", "发上去"])
+        && mentions_remote
+        && mentions_local_changes
+    {
         return Some(Intent::GitPushAll {
             repo: None,
             message: "auto commit via feishu-bridge".to_string(),
         });
     }
 
-    if contains_any(lower, &["拉取", "更新本地", "同步到本地", "拉下来"]) && mentions_remote {
+    if contains_any(lower, &["拉取", "更新本地", "同步到本地", "拉下来"]) && mentions_remote
+    {
         return Some(Intent::GitPull { repo: None });
     }
 
-    if contains_any(lower, &["看看状态", "查看状态", "仓库状态", "git状态", "git 状态", "有没有改动", "有哪些改动", "本地改动", "工作区状态"]) {
+    if contains_any(
+        lower,
+        &[
+            "看看状态",
+            "查看状态",
+            "仓库状态",
+            "git状态",
+            "git 状态",
+            "有没有改动",
+            "有哪些改动",
+            "本地改动",
+            "工作区状态",
+        ],
+    ) {
         return Some(Intent::GitStatus { repo: None });
     }
 
@@ -1006,9 +1202,32 @@ fn parse_natural_agent_request(text: &str, lower: &str) -> Option<Intent> {
     let has_task_verb = contains_any(
         lower,
         &[
-            "检查", "分析", "解释", "看看", "查看", "阅读", "读取", "搜索", "查找", "继续",
-            "修复", "修改", "实现", "重构", "review", "inspect", "analyze", "explain",
-            "check", "read", "search", "find", "continue", "fix", "implement", "update",
+            "检查",
+            "分析",
+            "解释",
+            "看看",
+            "查看",
+            "阅读",
+            "读取",
+            "搜索",
+            "查找",
+            "继续",
+            "修复",
+            "修改",
+            "实现",
+            "重构",
+            "review",
+            "inspect",
+            "analyze",
+            "explain",
+            "check",
+            "read",
+            "search",
+            "find",
+            "continue",
+            "fix",
+            "implement",
+            "update",
             "modify",
         ],
     );
@@ -1033,7 +1252,12 @@ fn extract_path_candidate(text: &str) -> Option<String> {
 }
 
 fn trim_wrapping_punctuation(token: &str) -> &str {
-    token.trim_matches(|c: char| matches!(c, '"' | '\'' | '，' | '。' | '：' | ':' | '；' | ';' | '（' | '）' | '(' | ')' | '、'))
+    token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '，' | '。' | '：' | ':' | '；' | ';' | '（' | '）' | '(' | ')' | '、'
+        )
+    })
 }
 
 fn looks_like_path_candidate(token: &str) -> bool {
@@ -1114,15 +1338,16 @@ fn parse_line_range(s: &str) -> Option<(usize, usize)> {
 }
 
 fn parse_search_intent(text: &str, lower: &str) -> Option<Intent> {
-    let (rest, is_regex) = if let Some(rest) = strip_prefix_any(&lower, &["搜索正则 ", "search regex "]) {
-        (rest, true)
-    } else if let Some(rest) = strip_prefix_any(&lower, &["搜索文本 ", "search text "]) {
-        (rest, false)
-    } else if let Some(rest) = strip_prefix_any(&lower, &["搜索 ", "search "]) {
-        (rest, false)
-    } else {
-        return None;
-    };
+    let (rest, is_regex) =
+        if let Some(rest) = strip_prefix_any(&lower, &["搜索正则 ", "search regex "]) {
+            (rest, true)
+        } else if let Some(rest) = strip_prefix_any(&lower, &["搜索文本 ", "search text "]) {
+            (rest, false)
+        } else if let Some(rest) = strip_prefix_any(&lower, &["搜索 ", "search "]) {
+            (rest, false)
+        } else {
+            return None;
+        };
 
     let rest = text[text.len() - rest.len()..].trim();
     let (query, path) = split_search_scope(rest);
@@ -1163,23 +1388,54 @@ fn split_search_scope(s: &str) -> (String, Option<String>) {
 }
 
 fn parse_symbol_search_intent(text: &str, lower: &str) -> Option<Intent> {
-    let rest = if let Some(rest) = strip_prefix_any(&lower, &["搜索符号 ", "查找符号 ", "search symbol ", "find symbol "]) {
+    let rest = if let Some(rest) = strip_prefix_any(
+        &lower,
+        &["搜索符号 ", "查找符号 ", "search symbol ", "find symbol "],
+    ) {
         rest
-    } else if let Some(rest) = strip_prefix_any(&lower, &["查找引用 ", "搜索引用 ", "find references ", "find refs ", "references "]) {
+    } else if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "查找引用 ",
+            "搜索引用 ",
+            "find references ",
+            "find refs ",
+            "references ",
+        ],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         let (query, path) = split_search_scope(rest);
         if query.is_empty() {
             return None;
         }
         return Some(Intent::FindReferences { query, path });
-    } else if let Some(rest) = strip_prefix_any(&lower, &["查找实现 ", "搜索实现 ", "find implementations ", "find impl ", "implementations "]) {
+    } else if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "查找实现 ",
+            "搜索实现 ",
+            "find implementations ",
+            "find impl ",
+            "implementations ",
+        ],
+    ) {
         let rest = text[text.len() - rest.len()..].trim();
         let (query, path) = split_search_scope(rest);
         if query.is_empty() {
             return None;
         }
         return Some(Intent::FindImplementations { query, path });
-    } else if let Some(rest) = strip_prefix_any(&lower, &["搜索定义 ", "查找定义 ", "跳定义 ", "search definition ", "find definition ", "go to definition "]) {
+    } else if let Some(rest) = strip_prefix_any(
+        &lower,
+        &[
+            "搜索定义 ",
+            "查找定义 ",
+            "跳定义 ",
+            "search definition ",
+            "find definition ",
+            "go to definition ",
+        ],
+    ) {
         rest
     } else {
         return None;
@@ -1195,7 +1451,9 @@ fn parse_symbol_search_intent(text: &str, lower: &str) -> Option<Intent> {
 }
 
 fn parse_write_file_intent(text: &str, lower: &str) -> Option<Intent> {
-    let rest = if let Some(rest) = strip_prefix_any(&lower, &["写入文件 ", "写入 ", "write file ", "write "]) {
+    let rest = if let Some(rest) =
+        strip_prefix_any(&lower, &["写入文件 ", "写入 ", "write file ", "write "])
+    {
         rest
     } else if let Some(rest) = strip_prefix_any(&lower, &["创建文件 ", "create file "]) {
         rest
@@ -1226,10 +1484,23 @@ fn parse_write_file_intent(text: &str, lower: &str) -> Option<Intent> {
 }
 
 fn parse_agent_ask_intent(text: &str, lower: &str) -> Option<Intent> {
+    let codex_prompt =
+        strip_command_prefix(text, lower, &["/codex", "问 codex", "问codex", "ask codex"]);
+    if let Some(prompt) = codex_prompt {
+        if prompt.is_empty() {
+            return None;
+        }
+
+        return Some(Intent::AskCodex {
+            prompt: prompt.to_string(),
+        });
+    }
+
     let prompt = strip_command_prefix(
         text,
         lower,
         &[
+            "/copilot",
             "问 copilot",
             "问copilot",
             "问 agent",
@@ -1307,6 +1578,67 @@ fn parse_agent_runtime_action_intent(text: &str, lower: &str) -> Option<Intent> 
         let option_id = rest.trim();
         return Some(Intent::ApproveAgentRun {
             option_id: (!option_id.is_empty()).then(|| option_id.to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "继续本轮 agent",
+            "继续当前 agent",
+            "继续这轮 agent",
+            "继续本轮agent",
+            "继续当前agent",
+            "继续这轮agent",
+            "continue this run",
+            "continue run",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("continue_run".to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "先停在这里",
+            "停在这里",
+            "先停这轮 agent",
+            "停止在这里",
+            "stop here",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("cancel_run".to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "批准本次写入",
+            "批准这次写入",
+            "允许本次写入",
+            "approve this write",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("approve_tool".to_string()),
+        });
+    }
+
+    if matches_command_any(
+        lower,
+        &[
+            "拒绝本次写入",
+            "拒绝这次写入",
+            "不允许本次写入",
+            "reject this write",
+        ],
+    ) {
+        return Some(Intent::ApproveAgentRun {
+            option_id: Some("reject_tool".to_string()),
         });
     }
 
@@ -1441,7 +1773,10 @@ fn parse_git_log_args(s: &str) -> (Option<usize>, Option<String>) {
     // Try parsing leading number as count
     let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
     if let Ok(n) = parts[0].parse::<usize>() {
-        let path = parts.get(1).map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        let path = parts
+            .get(1)
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
         return (Some(n), path);
     }
 
@@ -1533,10 +1868,16 @@ pub fn help_text() -> &'static str {
     运行测试文件 <路径>      — 按测试文件执行测试
     写入文件 <路径>\n<内容>  — 创建或覆盖文件（需审批）
     问 Copilot <问题>        — 通过 companion extension 发起一次 ask-style agent 会话
+    /copilot <问题>          — 直接调用 Copilot 提问当前项目
+    /codex <问题>            — 直接调用本机 Codex CLI 提问当前项目
     /agent <任务>            — 启动 autonomous agent runtime
     agent 状态              — 查看当前 agent runtime 状态
     继续 agent [要求]       — 在当前 agent runtime 中继续推进
+    继续本轮 agent          — 当 agent 暂停等待时，按推荐节奏继续本轮推进
     批准 agent [option_id]  — 批准当前 agent runtime 决策；不传时默认用推荐选项
+    批准本次写入           — 当 agent 等待写入审批时，批准本次工具写入
+    拒绝本次写入           — 当 agent 等待写入审批时，拒绝本次工具写入
+    先停在这里             — 当 agent 等待继续决策时，保持当前结果并先暂停
     保留 agent 结果         — 显式保留当前 runtime 结果快照
     回滚 agent 结果         — 显式回滚当前 runtime 结果快照
     放弃 agent 结果         — 显式放弃当前 runtime 结果快照
@@ -1623,10 +1964,7 @@ mod tests {
 
     #[test]
     fn parse_git_status() {
-        assert_eq!(
-            parse_intent("git status"),
-            Intent::GitStatus { repo: None }
-        );
+        assert_eq!(parse_intent("git status"), Intent::GitStatus { repo: None });
     }
 
     #[test]
@@ -1677,10 +2015,7 @@ mod tests {
 
     #[test]
     fn parse_run_tests_default() {
-        assert_eq!(
-            parse_intent("运行测试"),
-            Intent::RunTests { command: None }
-        );
+        assert_eq!(parse_intent("运行测试"), Intent::RunTests { command: None });
     }
 
     #[test]
@@ -1714,6 +2049,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_copilot() {
+        assert_eq!(
+            parse_intent("/copilot explain parse_intent"),
+            Intent::AskAgent {
+                prompt: "explain parse_intent".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_slash_codex() {
+        assert_eq!(
+            parse_intent("/codex explain parse_intent"),
+            Intent::AskCodex {
+                prompt: "explain parse_intent".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_ask_agent_with_fullwidth_space() {
         assert_eq!(
             parse_intent("问　Copilot　parse_intent 这个函数是干什么的"),
@@ -1724,9 +2079,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_ask_codex_chinese() {
+        assert_eq!(
+            parse_intent("问 Codex parse_intent 这个函数是干什么的"),
+            Intent::AskCodex {
+                prompt: "parse_intent 这个函数是干什么的".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_reset_agent_session() {
         assert_eq!(parse_intent("重置 Copilot 会话"), Intent::ResetAgentSession);
-        assert_eq!(parse_intent("reset agent session"), Intent::ResetAgentSession);
+        assert_eq!(
+            parse_intent("reset agent session"),
+            Intent::ResetAgentSession
+        );
     }
 
     #[test]
@@ -1793,8 +2161,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_agent_runtime_waiting_state_aliases() {
+        assert_eq!(
+            parse_intent("继续本轮 agent"),
+            Intent::ApproveAgentRun {
+                option_id: Some("continue_run".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_intent("先停在这里"),
+            Intent::ApproveAgentRun {
+                option_id: Some("cancel_run".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_intent("批准本次写入"),
+            Intent::ApproveAgentRun {
+                option_id: Some("approve_tool".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_intent("拒绝本次写入"),
+            Intent::ApproveAgentRun {
+                option_id: Some("reject_tool".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn parse_reset_agent_session_with_fullwidth_space() {
-        assert_eq!(parse_intent("重置　Copilot　会话"), Intent::ResetAgentSession);
+        assert_eq!(
+            parse_intent("重置　Copilot　会话"),
+            Intent::ResetAgentSession
+        );
     }
 
     #[test]
@@ -1894,7 +2293,10 @@ mod tests {
     #[test]
     fn parse_project_and_git_sync_commands() {
         assert_eq!(parse_intent("选择项目"), Intent::ShowProjectPicker);
-        assert_eq!(parse_intent("浏览项目"), Intent::ShowProjectBrowser { path: None });
+        assert_eq!(
+            parse_intent("浏览项目"),
+            Intent::ShowProjectBrowser { path: None }
+        );
         assert_eq!(
             parse_intent("选择项目 C:/work/demo"),
             Intent::OpenFolder {
@@ -1908,7 +2310,10 @@ mod tests {
             }
         );
         assert_eq!(parse_intent("当前项目"), Intent::ShowCurrentProject);
-        assert_eq!(parse_intent("同步 Git 状态"), Intent::GitSync { repo: None });
+        assert_eq!(
+            parse_intent("同步 Git 状态"),
+            Intent::GitSync { repo: None }
+        );
     }
 
     #[test]
@@ -1920,10 +2325,7 @@ mod tests {
                 message: "auto commit via feishu-bridge".to_string(),
             }
         );
-        assert_eq!(
-            parse_intent("看看当前项目"),
-            Intent::ShowCurrentProject
-        );
+        assert_eq!(parse_intent("看看当前项目"), Intent::ShowCurrentProject);
         assert_eq!(
             parse_intent("浏览一下本地项目目录"),
             Intent::ShowProjectBrowser { path: None }
@@ -1969,7 +2371,10 @@ mod tests {
         assert_eq!(parse_intent("继续这个文件"), Intent::ContinueLastFile);
         assert_eq!(parse_intent("把刚才的 diff 发我"), Intent::ShowLastDiff);
         assert_eq!(parse_intent("看 diff"), Intent::ShowLastDiff);
-        assert_eq!(parse_intent("把刚才改动的文件列表发我"), Intent::ShowRecentFiles);
+        assert_eq!(
+            parse_intent("把刚才改动的文件列表发我"),
+            Intent::ShowRecentFiles
+        );
         assert_eq!(parse_intent("看文件列表"), Intent::ShowRecentFiles);
         assert_eq!(parse_intent("撤回刚才的补丁"), Intent::UndoLastPatch);
         assert_eq!(parse_intent("撤回补丁"), Intent::UndoLastPatch);
@@ -2179,11 +2584,17 @@ mod tests {
     fn parse_git_log_default() {
         assert_eq!(
             parse_intent("git log"),
-            Intent::GitLog { count: None, path: None }
+            Intent::GitLog {
+                count: None,
+                path: None
+            }
         );
         assert_eq!(
             parse_intent("提交历史"),
-            Intent::GitLog { count: None, path: None }
+            Intent::GitLog {
+                count: None,
+                path: None
+            }
         );
     }
 
@@ -2191,7 +2602,10 @@ mod tests {
     fn parse_git_log_with_count() {
         assert_eq!(
             parse_intent("git log 5"),
-            Intent::GitLog { count: Some(5), path: None }
+            Intent::GitLog {
+                count: Some(5),
+                path: None
+            }
         );
     }
 
@@ -2199,7 +2613,10 @@ mod tests {
     fn parse_git_log_with_path() {
         assert_eq!(
             parse_intent("git log src/lib.rs"),
-            Intent::GitLog { count: None, path: Some("src/lib.rs".to_string()) }
+            Intent::GitLog {
+                count: None,
+                path: Some("src/lib.rs".to_string())
+            }
         );
     }
 
@@ -2207,7 +2624,10 @@ mod tests {
     fn parse_git_log_with_count_and_path() {
         assert_eq!(
             parse_intent("git log 10 src/bridge.rs"),
-            Intent::GitLog { count: Some(10), path: Some("src/bridge.rs".to_string()) }
+            Intent::GitLog {
+                count: Some(10),
+                path: Some("src/bridge.rs".to_string())
+            }
         );
     }
 
@@ -2215,11 +2635,15 @@ mod tests {
     fn parse_git_blame() {
         assert_eq!(
             parse_intent("git blame src/lib.rs"),
-            Intent::GitBlame { path: "src/lib.rs".to_string() }
+            Intent::GitBlame {
+                path: "src/lib.rs".to_string()
+            }
         );
         assert_eq!(
             parse_intent("追溯 src/main.rs"),
-            Intent::GitBlame { path: "src/main.rs".to_string() }
+            Intent::GitBlame {
+                path: "src/main.rs".to_string()
+            }
         );
     }
 

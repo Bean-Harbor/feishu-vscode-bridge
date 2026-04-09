@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::bridge::{BridgeResponse, render_bridge_response, response_kind};
+use crate::bridge::{render_bridge_response, response_kind, BridgeResponse};
 use crate::plan::PlanProgress;
 use crate::reply;
 use crate::session::{self, StoredSession};
@@ -105,9 +105,9 @@ pub(crate) fn new_plan_action_audit_entry(
         response_kind: response_kind(response).to_string(),
         response_preview: reply::truncate_session_text(render_bridge_response(response), 300),
         result_status: result.map(|item| item.status.clone()),
-        result_summary: result.map(|item| item.summary.clone()).or_else(|| {
-            progress.map(|item| session::stored_result_from_progress(item).summary)
-        }),
+        result_summary: result
+            .map(|item| item.summary.clone())
+            .or_else(|| progress.map(|item| session::stored_result_from_progress(item).summary)),
         success: result.map(|item| item.success).unwrap_or(true),
         error: None,
     })
@@ -120,7 +120,9 @@ pub(crate) fn append_plan_action_audit(
     stored: &StoredSession,
     progress: Option<&PlanProgress>,
 ) {
-    let Some(entry) = new_plan_action_audit_entry(session_key, action_name, response, stored, progress) else {
+    let Some(entry) =
+        new_plan_action_audit_entry(session_key, action_name, response, stored, progress)
+    else {
         return;
     };
 
@@ -144,8 +146,7 @@ pub fn append_audit_entry(entry: &AuditEntry) -> Result<(), String> {
 }
 
 pub(crate) fn append_audit_entry_to_path(path: &Path, entry: &AuditEntry) -> Result<(), String> {
-    let line = serde_json::to_string(entry)
-        .map_err(|err| format!("序列化审计日志失败: {err}"))?;
+    let line = serde_json::to_string(entry).map_err(|err| format!("序列化审计日志失败: {err}"))?;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -159,8 +160,8 @@ pub(crate) fn append_audit_entry_to_path(path: &Path, entry: &AuditEntry) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::test_support::unique_temp_path;
+    use std::fs;
 
     #[test]
     fn feishu_session_key_isolates_senders_in_same_chat() {
@@ -203,7 +204,10 @@ mod tests {
         assert_eq!(entry.command, "拒绝");
         assert_eq!(entry.action_name.as_deref(), Some("拒绝"));
         assert_eq!(entry.result_status.as_deref(), Some("已取消"));
-        assert_eq!(entry.result_summary.as_deref(), Some("当前待审批任务已被拒绝并取消。"));
+        assert_eq!(
+            entry.result_summary.as_deref(),
+            Some("当前待审批任务已被拒绝并取消。")
+        );
         assert!(!entry.success);
     }
 

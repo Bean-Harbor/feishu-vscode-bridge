@@ -175,8 +175,8 @@ pub fn save_session_store(
         return Err("无法定位会话存储目录".to_string());
     };
 
-    let content = serde_json::to_string_pretty(store)
-        .map_err(|err| format!("序列化计划会话失败: {err}"))?;
+    let content =
+        serde_json::to_string_pretty(store).map_err(|err| format!("序列化计划会话失败: {err}"))?;
     std::fs::write(path, content).map_err(|err| format!("写入计划会话失败: {err}"))
 }
 
@@ -236,8 +236,16 @@ pub fn build_stored_session(
         last_step: progress.executed.last().map(stored_step_from_execution),
         last_file_path: recent_file_paths.first().cloned(),
         recent_file_paths,
-        last_diff: progress.executed.iter().rev().find_map(stored_diff_from_execution),
-        last_patch: progress.executed.iter().rev().find_map(stored_patch_from_execution),
+        last_diff: progress
+            .executed
+            .iter()
+            .rev()
+            .find_map(stored_diff_from_execution),
+        last_patch: progress
+            .executed
+            .iter()
+            .rev()
+            .find_map(stored_patch_from_execution),
         plan,
     }
 }
@@ -265,6 +273,7 @@ pub fn stored_session_from_agent_result(
     intent: &Intent,
     result: &vscode::AgentAskResult,
     reply: &str,
+    current_project_path: Option<String>,
 ) -> StoredSession {
     StoredSession {
         session_kind: StoredSessionKind::Agent,
@@ -277,7 +286,7 @@ pub fn stored_session_from_agent_result(
             tool_result_summary: result.tool_result_summary.clone(),
             run: result.run.clone(),
         }),
-        current_project_path: None,
+        current_project_path,
         plan: None,
         current_task: Some(task_text.trim().to_string()).filter(|value| !value.is_empty()),
         pending_steps: Vec::new(),
@@ -387,7 +396,7 @@ pub fn is_agent_task_session(stored: &StoredSession) -> bool {
         || stored
             .current_task
             .as_deref()
-            .map(|task| task.trim_start().starts_with("问 Copilot"))
+            .map(is_agent_task_text)
             .unwrap_or(false)
 }
 
@@ -408,7 +417,10 @@ pub fn suggested_agent_next_action(stored: &StoredSession) -> Option<String> {
 }
 
 pub fn current_agent_run(stored: &StoredSession) -> Option<&AgentRunState> {
-    stored.agent_state.as_ref().and_then(|state| state.run.as_ref())
+    stored
+        .agent_state
+        .as_ref()
+        .and_then(|state| state.run.as_ref())
 }
 
 pub fn current_agent_run_id(stored: &StoredSession) -> Option<String> {
@@ -436,24 +448,40 @@ pub fn suggested_agent_decision_option(stored: &StoredSession) -> Option<String>
                 .find(|option| option.primary)
                 .map(|option| option.option_id.clone())
         })
-        .or_else(|| decision.options.first().map(|option| option.option_id.clone()))
+        .or_else(|| {
+            decision
+                .options
+                .first()
+                .map(|option| option.option_id.clone())
+        })
 }
 
-    pub fn selected_project_path(stored: &StoredSession) -> Option<String> {
-        stored
+pub fn selected_project_path(stored: &StoredSession) -> Option<String> {
+    stored
         .current_project_path
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-    }
+}
 
 fn is_agent_step_description(description: &str) -> bool {
     let trimmed = description.trim_start();
     trimmed.starts_with("问 Copilot")
+        || trimmed.starts_with("问 Codex")
         || trimmed.starts_with("继续 Agent 任务")
         || trimmed.starts_with("启动 Agent Runtime")
         || trimmed.starts_with("继续 Agent Runtime")
+}
+
+fn is_agent_task_text(task: &str) -> bool {
+    let trimmed = task.trim_start();
+    trimmed.starts_with("问 Copilot")
+        || trimmed.starts_with("问 Codex")
+        || trimmed.starts_with("/copilot")
+        || trimmed.starts_with("/codex")
+        || trimmed.to_ascii_lowercase().starts_with("ask copilot")
+        || trimmed.to_ascii_lowercase().starts_with("ask codex")
 }
 
 pub(crate) fn stored_result_from_progress(progress: &PlanProgress) -> StoredResult {
@@ -495,14 +523,21 @@ pub(crate) fn stored_result_from_progress(progress: &PlanProgress) -> StoredResu
     } else {
         StoredResult {
             status: "待继续".to_string(),
-            summary: format!("下一步是第 {} / {} 步。", progress.next_step + 1, progress.total_steps),
+            summary: format!(
+                "下一步是第 {} / {} 步。",
+                progress.next_step + 1,
+                progress.total_steps
+            ),
             success: true,
         }
     }
 }
 
 fn stored_session_from_legacy(session: PlanSession) -> StoredSession {
-    let recent_file_paths = session.current_step().map(paths_for_intent).unwrap_or_default();
+    let recent_file_paths = session
+        .current_step()
+        .map(paths_for_intent)
+        .unwrap_or_default();
 
     StoredSession {
         session_kind: StoredSessionKind::Plan,
@@ -655,15 +690,24 @@ fn describe_intent(intent: &Intent) -> String {
             start_line,
             end_line,
         } => match (start_line, end_line) {
-            (Some(start_line), Some(end_line)) => format!("读取文件 {path}:{start_line}-{end_line}"),
+            (Some(start_line), Some(end_line)) => {
+                format!("读取文件 {path}:{start_line}-{end_line}")
+            }
             _ => format!("读取文件 {path}"),
         },
         Intent::ListDirectory { path } => match path {
             Some(path) => format!("列出目录 {path}"),
             None => "列出当前目录".to_string(),
         },
-        Intent::SearchText { query, path, is_regex } => match path {
-            Some(path) => format!("{}搜索 {query} 于 {path}", if *is_regex { "正则" } else { "文本" }),
+        Intent::SearchText {
+            query,
+            path,
+            is_regex,
+        } => match path {
+            Some(path) => format!(
+                "{}搜索 {query} 于 {path}",
+                if *is_regex { "正则" } else { "文本" }
+            ),
             None => format!("{}搜索 {query}", if *is_regex { "正则" } else { "文本" }),
         },
         Intent::RunTests { command } => match command {
@@ -691,22 +735,29 @@ fn describe_intent(intent: &Intent) -> String {
         Intent::RunTestFile { path } => format!("运行测试文件 {path}"),
         Intent::WriteFile { path, .. } => format!("写入文件 {path}"),
         Intent::AskAgent { prompt } => format!("问 Copilot {prompt}"),
+        Intent::AskCodex { prompt } => format!("问 Codex {prompt}"),
         Intent::StartAgentRun { prompt } => format!("启动 Agent Runtime：{prompt}"),
         Intent::ContinueAgentRun { prompt } => match prompt {
-            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent Runtime：{}", prompt.trim()),
+            Some(prompt) if !prompt.trim().is_empty() => {
+                format!("继续 Agent Runtime：{}", prompt.trim())
+            }
             _ => "继续 Agent Runtime".to_string(),
         },
         Intent::ShowAgentRunStatus => "查看 Agent Runtime 状态".to_string(),
         Intent::ApproveAgentRun { option_id } => match option_id {
-            Some(option_id) if !option_id.trim().is_empty() => format!("批准 Agent Runtime 决策 {}", option_id.trim()),
+            Some(option_id) if !option_id.trim().is_empty() => {
+                format!("批准 Agent Runtime 决策 {}", option_id.trim())
+            }
             _ => "批准当前 Agent Runtime 决策".to_string(),
         },
         Intent::CancelAgentRun => "取消 Agent Runtime".to_string(),
         Intent::ContinueAgent { prompt } => match prompt {
-            Some(prompt) if !prompt.trim().is_empty() => format!("继续 Agent 任务：{}", prompt.trim()),
-            _ => "继续 Agent 任务".to_string(),
+            Some(prompt) if !prompt.trim().is_empty() => {
+                format!("继续当前任务：{}", prompt.trim())
+            }
+            _ => "继续当前任务".to_string(),
         },
-        Intent::ContinueAgentSuggested => "按建议继续 Agent 任务".to_string(),
+        Intent::ContinueAgentSuggested => "按建议继续当前任务".to_string(),
         Intent::ResetAgentSession => "重置 Copilot 会话".to_string(),
         Intent::ShowProjectPicker => "打开项目选择卡片".to_string(),
         Intent::ShowProjectBrowser { path } => match path {
@@ -787,7 +838,13 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = build_stored_session(StoredSessionKind::Plan, None, "应用补丁", "执行计划", &progress);
+        let stored = build_stored_session(
+            StoredSessionKind::Plan,
+            None,
+            "应用补丁",
+            "执行计划",
+            &progress,
+        );
 
         assert_eq!(stored.last_file_path, Some("src/demo.rs".to_string()));
         assert_eq!(stored.recent_file_paths, vec!["src/demo.rs".to_string()]);
@@ -815,14 +872,27 @@ mod tests {
             approval_request: None,
         };
 
-        let stored = build_stored_session(StoredSessionKind::Plan, None, "应用补丁", "执行计划", &progress);
+        let stored = build_stored_session(
+            StoredSessionKind::Plan,
+            None,
+            "应用补丁",
+            "执行计划",
+            &progress,
+        );
 
         assert_eq!(
             stored.recent_file_paths,
             vec!["src/bridge.rs".to_string(), "src/lib.rs".to_string()]
         );
-        assert!(stored.last_diff.as_ref().is_some_and(|diff| diff.content.contains("diff --git a/src/lib.rs")));
-        assert!(stored.last_patch.as_ref().is_some_and(|patch| patch.file_paths == vec!["src/bridge.rs".to_string(), "src/lib.rs".to_string()]));
+        assert!(stored
+            .last_diff
+            .as_ref()
+            .is_some_and(|diff| diff.content.contains("diff --git a/src/lib.rs")));
+        assert!(stored
+            .last_patch
+            .as_ref()
+            .is_some_and(|patch| patch.file_paths
+                == vec!["src/bridge.rs".to_string(), "src/lib.rs".to_string()]));
     }
 
     #[test]
@@ -885,6 +955,7 @@ mod tests {
                     current_action: "Waiting for follow-up".to_string(),
                     next_action: "继续检查 parser 边界情况".to_string(),
                     current_step: Some("waiting_user".to_string()),
+                    waiting_reason: None,
                     authorization_policy: None,
                     result_disposition: ResultDisposition::Pending,
                     pending_user_decision: None,
@@ -933,6 +1004,47 @@ mod tests {
     }
 
     #[test]
+    fn detects_codex_task_session_from_current_task() {
+        let stored = StoredSession {
+            session_kind: StoredSessionKind::Direct,
+            agent_state: Some(StoredAgentState {
+                session_id: Some("codex-session".to_string()),
+                status: Some("已回答".to_string()),
+                current_action: Some("Executed Codex CLI prompt".to_string()),
+                next_action: Some("继续检查 src/bridge.rs".to_string()),
+                tool_call: None,
+                tool_result_summary: None,
+                run: None,
+            }),
+            current_project_path: Some("C:/work/demo".to_string()),
+            plan: None,
+            current_task: Some("/codex 修复当前桥接".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已回答".to_string(),
+                summary: "已定位 bridge 入口".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "问 Codex 修复当前桥接".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/bridge.rs".to_string()),
+            recent_file_paths: vec!["src/bridge.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        assert!(is_agent_task_session(&stored));
+        assert_eq!(
+            suggested_agent_next_action(&stored).as_deref(),
+            Some("继续检查 src/bridge.rs")
+        );
+    }
+
+    #[test]
     fn stored_session_from_agent_result_preserves_runtime_run() {
         let result = crate::vscode::AgentAskResult {
             success: true,
@@ -953,6 +1065,7 @@ mod tests {
                 current_action: "Waiting for follow-up".to_string(),
                 next_action: "继续查看 src/lib.rs 120-180".to_string(),
                 current_step: Some("waiting_user".to_string()),
+                waiting_reason: None,
                 authorization_policy: None,
                 result_disposition: ResultDisposition::Pending,
                 pending_user_decision: None,
@@ -975,6 +1088,7 @@ mod tests {
             },
             &result,
             "reply",
+            None,
         );
 
         assert_eq!(stored.session_kind, StoredSessionKind::Agent);
@@ -1017,11 +1131,26 @@ mod tests {
         );
 
         assert_eq!(stored.session_kind, StoredSessionKind::Plan);
-        assert_eq!(stored.current_project_path.as_deref(), Some("C:\\work\\demo"));
-        assert_eq!(stored.current_task.as_deref(), Some("/plan 修复当前测试失败"));
-        assert_eq!(stored.last_result.as_ref().map(|value| value.status.as_str()), Some("待确认"));
         assert_eq!(
-            stored.last_result.as_ref().map(|value| value.summary.as_str()),
+            stored.current_project_path.as_deref(),
+            Some("C:\\work\\demo")
+        );
+        assert_eq!(
+            stored.current_task.as_deref(),
+            Some("/plan 修复当前测试失败")
+        );
+        assert_eq!(
+            stored
+                .last_result
+                .as_ref()
+                .map(|value| value.status.as_str()),
+            Some("待确认")
+        );
+        assert_eq!(
+            stored
+                .last_result
+                .as_ref()
+                .map(|value| value.summary.as_str()),
             Some("先确认修复范围，再开始执行。")
         );
         assert_eq!(
@@ -1029,7 +1158,10 @@ mod tests {
             vec!["只修 parser -> 先只修 parser 相关测试".to_string()]
         );
         assert_eq!(
-            stored.last_step.as_ref().map(|step| step.description.as_str()),
+            stored
+                .last_step
+                .as_ref()
+                .map(|step| step.description.as_str()),
             Some("Plan 模式：修复当前测试失败")
         );
     }
@@ -1097,7 +1229,10 @@ mod tests {
         persist_session(Some(&session_path), "cli", &later_agent_write).unwrap();
 
         let merged = load_persisted_session(Some(&session_path), "cli").unwrap();
-        assert_eq!(selected_project_path(&merged).as_deref(), Some("C:/work/demo"));
+        assert_eq!(
+            selected_project_path(&merged).as_deref(),
+            Some("C:/work/demo")
+        );
         assert_eq!(merged.session_kind, StoredSessionKind::Agent);
 
         let _ = fs::remove_file(session_path);

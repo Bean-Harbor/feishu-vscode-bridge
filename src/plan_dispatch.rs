@@ -69,7 +69,9 @@ pub fn resume_plan(
     run_all: bool,
     action_name: &str,
 ) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(mut stored) =
+        session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text("⚠️ 当前没有待继续的计划。\n\n发送「执行计划 <命令1>; <命令2>」创建逐步计划，或发送「执行全部 <命令1>; <命令2>」连续执行。".to_string());
     };
 
@@ -78,25 +80,31 @@ pub fn resume_plan(
     };
 
     let progress = if run_all {
-        session.execute_remaining_with_policy(context.executor(), |step_index, step_number, intent, run_all_after_approval| {
-            build_approval_request(
-                context.approval_policy(),
-                step_index,
-                step_number,
-                intent,
-                run_all_after_approval,
-            )
-        })
+        session.execute_remaining_with_policy(
+            context.executor(),
+            |step_index, step_number, intent, run_all_after_approval| {
+                build_approval_request(
+                    context.approval_policy(),
+                    step_index,
+                    step_number,
+                    intent,
+                    run_all_after_approval,
+                )
+            },
+        )
     } else {
-        session.execute_next_with_policy(context.executor(), |step_index, step_number, intent, run_all_after_approval| {
-            build_approval_request(
-                context.approval_policy(),
-                step_index,
-                step_number,
-                intent,
-                run_all_after_approval,
-            )
-        })
+        session.execute_next_with_policy(
+            context.executor(),
+            |step_index, step_number, intent, run_all_after_approval| {
+                build_approval_request(
+                    context.approval_policy(),
+                    step_index,
+                    step_number,
+                    intent,
+                    run_all_after_approval,
+                )
+            },
+        )
     };
     stored = session::build_stored_session(
         session::StoredSessionKind::Plan,
@@ -116,11 +124,10 @@ pub fn resume_plan(
     reply
 }
 
-pub fn approve_plan(
-    context: &BridgeContext<'_>,
-    session_key: &str,
-) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+pub fn approve_plan(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
+    let Some(mut stored) =
+        session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text("⚠️ 当前没有待审批的计划。".to_string());
     };
 
@@ -129,18 +136,23 @@ pub fn approve_plan(
     };
 
     if !session.has_pending_approval() {
-        return BridgeResponse::Text("⚠️ 当前没有待审批步骤。可以发送「继续」或「执行全部」推进计划。".to_string());
+        return BridgeResponse::Text(
+            "⚠️ 当前没有待审批步骤。可以发送「继续」或「执行全部」推进计划。".to_string(),
+        );
     }
 
-    let progress = session.approve_pending_with_policy(context.executor(), |step_index, step_number, intent, run_all_after_approval| {
-        build_approval_request(
-            context.approval_policy(),
-            step_index,
-            step_number,
-            intent,
-            run_all_after_approval,
-        )
-    });
+    let progress = session.approve_pending_with_policy(
+        context.executor(),
+        |step_index, step_number, intent, run_all_after_approval| {
+            build_approval_request(
+                context.approval_policy(),
+                step_index,
+                step_number,
+                intent,
+                run_all_after_approval,
+            )
+        },
+    );
     stored = session::build_stored_session(
         session::StoredSessionKind::Plan,
         if progress.completed {
@@ -160,7 +172,9 @@ pub fn approve_plan(
 }
 
 pub fn reject_plan(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(mut stored) =
+        session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text("⚠️ 当前没有待审批的计划。".to_string());
     };
 

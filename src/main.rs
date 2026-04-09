@@ -2,9 +2,10 @@ use std::sync::Mutex;
 
 use feishu_vscode_bridge::audit::{append_audit_entry, feishu_session_key, new_audit_entry};
 use feishu_vscode_bridge::bridge::{
-    BridgeApp, BridgeResponse, render_bridge_response, response_kind,
+    render_bridge_response, response_kind, BridgeApp, BridgeResponse,
 };
 use feishu_vscode_bridge::feishu::{FeishuClient, FeishuEvent, ReplyTarget};
+use feishu_vscode_bridge::reply;
 use feishu_vscode_bridge::MessageDedup;
 
 static DEDUP: Mutex<Option<MessageDedup>> = Mutex::new(None);
@@ -61,9 +62,53 @@ fn handle_event(client: &FeishuClient, event: FeishuEvent) {
 
             let session_key = feishu_session_key(&msg.chat_id, &msg.sender_id);
             let reply = if let Some(reason) = msg.unsupported_reason.as_ref() {
-                println!("⚠️ 检测到非纯文本输入 [{}]: {}", msg.sender_id, msg.message_type);
+                println!(
+                    "⚠️ 检测到非纯文本输入 [{}]: {}",
+                    msg.sender_id, msg.message_type
+                );
                 BridgeResponse::Text(reason.clone())
+            } else if msg.attachment.is_some() {
+                println!(
+                    "🖼️ 检测到飞书附件输入 [{}]: {}",
+                    msg.sender_id, msg.message_type
+                );
+                match client.download_attachment_to_temp(&msg) {
+                    Ok(downloaded) => {
+                        println!(
+                            "💾 飞书附件已保存 [{}]: {}",
+                            msg.sender_id,
+                            downloaded.local_path.display()
+                        );
+                        BridgeResponse::Text(reply::format_feishu_attachment_probe_reply(
+                            &msg,
+                            Some(&downloaded),
+                            None,
+                        ))
+                    }
+                    Err(error) => {
+                        eprintln!("❌ 飞书附件下载失败 [{}]: {}", msg.sender_id, error);
+                        BridgeResponse::Text(reply::format_feishu_attachment_probe_reply(
+                            &msg,
+                            None,
+                            Some(&error),
+                        ))
+                    }
+                }
             } else {
+                if should_send_processing_ack(&msg.text) {
+                    let ack_text =
+                        "⏳ 已收到，正在处理。\n\n我先在本地继续执行，完成后把结果发回飞书。";
+                    if let Err(error) = client.send_text_to(
+                        &msg.reply_target.receive_id,
+                        &msg.reply_target.receive_id_type,
+                        ack_text,
+                    ) {
+                        eprintln!("⚠️ 发送处理中回执失败 [{}]: {}", msg.sender_id, error);
+                    } else {
+                        println!("🕐 已发送处理中回执 [{}]", msg.sender_id);
+                    }
+                }
+
                 let app = BridgeApp::default();
                 app.dispatch(&msg.text, &session_key)
             };
@@ -75,7 +120,11 @@ fn handle_event(client: &FeishuClient, event: FeishuEvent) {
             if let Err(e) = &send_result {
                 eprintln!("❌ 回复失败: {e}");
             } else {
-                println!("✅ 回复已发送 [{}]: {}", msg.sender_id, response_kind(&reply));
+                println!(
+                    "✅ 回复已发送 [{}]: {}",
+                    msg.sender_id,
+                    response_kind(&reply)
+                );
             }
 
             let audit = new_audit_entry(
@@ -94,20 +143,32 @@ fn handle_event(client: &FeishuClient, event: FeishuEvent) {
             }
         }
         FeishuEvent::CardAction(action) => {
-            println!("🖱️ 收到卡片点击 [{}]: {}", action.sender_id, action.action_command);
+            println!(
+                "🖱️ 收到卡片点击 [{}]: {}",
+                action.sender_id, action.action_command
+            );
 
             let app = BridgeApp::default();
-            let session_key = feishu_session_key(&action.reply_target.receive_id, &action.sender_id);
+            let session_key =
+                feishu_session_key(&action.reply_target.receive_id, &action.sender_id);
             let reply = app.dispatch(&action.action_command, &session_key);
 
-            println!("↩️ 准备卡片回复 [{}]: {}", action.sender_id, response_kind(&reply));
+            println!(
+                "↩️ 准备卡片回复 [{}]: {}",
+                action.sender_id,
+                response_kind(&reply)
+            );
 
             let send_result = send_bridge_response(client, &action.reply_target, &reply);
 
             if let Err(e) = &send_result {
                 eprintln!("❌ 卡片回复失败: {e}");
             } else {
-                println!("✅ 卡片回复已发送 [{}]: {}", action.sender_id, response_kind(&reply));
+                println!(
+                    "✅ 卡片回复已发送 [{}]: {}",
+                    action.sender_id,
+                    response_kind(&reply)
+                );
             }
 
             let audit = new_audit_entry(
@@ -128,14 +189,43 @@ fn handle_event(client: &FeishuClient, event: FeishuEvent) {
     }
 }
 
+fn should_send_processing_ack(text: &str) -> bool {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+
+    lower.starts_with("/codex")
+        || lower.starts_with("/copilot")
+        || lower.starts_with("/agent")
+        || lower.starts_with("问 codex")
+        || lower.starts_with("问 copilot")
+        || lower.starts_with("ask codex")
+        || lower.starts_with("ask copilot")
+        || matches!(
+            lower.as_str(),
+            "继续"
+                | "继续吧"
+                | "直接继续"
+                | "按建议继续"
+                | "做第一个"
+                | "做第二个"
+                | "做第三个"
+                | "按保守方案继续"
+        )
+}
+
 fn send_bridge_response(
     client: &FeishuClient,
     target: &ReplyTarget,
     response: &BridgeResponse,
 ) -> Result<(), String> {
     match response {
-        BridgeResponse::Text(text) => client.send_text_to(&target.receive_id, &target.receive_id_type, text),
-        BridgeResponse::Card { fallback_text: _, card } => client.reply_card(target, card),
+        BridgeResponse::Text(text) => {
+            client.send_text_to(&target.receive_id, &target.receive_id_type, text)
+        }
+        BridgeResponse::Card {
+            fallback_text: _,
+            card,
+        } => client.reply_card(target, card),
     }
 }
 

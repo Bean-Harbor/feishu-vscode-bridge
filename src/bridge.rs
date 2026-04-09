@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 
+use crate::bridge_context::BridgeContext;
 use crate::direct_command;
 use crate::follow_up;
-use crate::bridge_context::BridgeContext;
 use crate::intent_executor::execute_runnable_intent;
-use crate::plan_dispatch;
 use crate::plan::ExecutionOutcome;
+use crate::plan_dispatch;
 use crate::reply;
 use crate::semantic_planner::{self, SemanticDispatch};
 use crate::session;
-use crate::{ApprovalPolicy, ExecutionMode, Intent, help_text, parse_explicit_intent};
+use crate::{help_text, parse_explicit_intent, ApprovalPolicy, ExecutionMode, Intent};
 
 pub type IntentExecutor = fn(&Intent) -> ExecutionOutcome;
 pub type SemanticPlanner = for<'a> fn(&BridgeContext<'a>, &str, &str) -> SemanticDispatch;
@@ -84,6 +84,11 @@ impl BridgeApp {
         let intent = parse_explicit_intent(trimmed_text);
 
         if matches!(intent, Intent::Unknown(_)) {
+            if let Some(response) =
+                follow_up::resolve_contextual_follow_up(&context, session_key, trimmed_text)
+            {
+                return response;
+            }
             return match (self.semantic_planner)(&context, session_key, trimmed_text) {
                 SemanticDispatch::Planned(planned) => {
                     self.dispatch_intent(&context, session_key, trimmed_text, planned)
@@ -102,7 +107,9 @@ impl BridgeApp {
         task_text: &str,
         intent: Intent,
     ) -> BridgeResponse {
-        if let Some(response) = self.dispatch_required_approval(context, session_key, task_text, &intent) {
+        if let Some(response) =
+            self.dispatch_required_approval(context, session_key, task_text, &intent)
+        {
             return response;
         }
 
@@ -117,7 +124,9 @@ impl BridgeApp {
             | Intent::RetryFailedStep
             | Intent::ExecuteAll
             | Intent::ApprovePending
-            | Intent::RejectPending => dispatch_plan_action(context, session_key, task_text, intent),
+            | Intent::RejectPending => {
+                dispatch_plan_action(context, session_key, task_text, intent)
+            }
             Intent::StartAgentRun { .. }
             | Intent::ContinueAgentRun { .. }
             | Intent::ShowAgentRunStatus
@@ -138,9 +147,9 @@ impl BridgeApp {
             | Intent::ShowRecentFiles
             | Intent::UndoLastPatch => dispatch_follow_up_action(context, session_key, intent),
             Intent::Help => BridgeResponse::Text(help_text().to_string()),
-            Intent::Unknown(raw) => {
-                BridgeResponse::Text(format!("❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令"))
-            }
+            Intent::Unknown(raw) => BridgeResponse::Text(format!(
+                "❓ 无法识别指令: {raw}\n\n发送「帮助」查看可用命令"
+            )),
             other => direct_command::execute_direct_command(context, session_key, task_text, other),
         }
     }
@@ -186,8 +195,10 @@ fn dispatch_plan_action(
 ) -> BridgeResponse {
     match intent {
         Intent::ContinuePlan => {
-            let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
-                return BridgeResponse::Text("⚠️ 当前没有待继续的计划。\n\n发送「执行计划 <命令1>; <命令2>」创建逐步计划，或先发送「问 Copilot <问题>」建立 agent 任务。".to_string());
+            let Some(stored) =
+                session::load_persisted_session(context.session_store_path(), session_key)
+            else {
+                return BridgeResponse::Text("⚠️ 当前没有待继续的计划。\n\n发送「执行计划 <命令1>; <命令2>」创建逐步计划，或先发送「/copilot <问题>」或「/codex <问题>」建立 agent 任务。".to_string());
             };
 
             if stored.plan.is_some() {
@@ -244,7 +255,9 @@ mod tests {
     use std::fs;
 
     use crate::semantic_planner::SemanticDispatch;
-    use crate::session::{self, StoredDiff, StoredResult, StoredSession, StoredSessionKind, StoredStep};
+    use crate::session::{
+        self, StoredDiff, StoredResult, StoredSession, StoredSessionKind, StoredStep,
+    };
     use crate::test_support::unique_temp_path;
 
     fn planner_returns_git_sync(
@@ -274,7 +287,10 @@ mod tests {
             current_project_path: None,
             plan: None,
             current_task: Some("应用补丁后继续检查 bridge 回复".to_string()),
-            pending_steps: vec!["运行测试命令 cargo test".to_string(), "查看当前工作区 diff".to_string()],
+            pending_steps: vec![
+                "运行测试命令 cargo test".to_string(),
+                "查看当前工作区 diff".to_string(),
+            ],
             last_result: Some(StoredResult {
                 status: "待继续".to_string(),
                 summary: "下一步是第 2 / 3 步。".to_string(),
@@ -290,7 +306,8 @@ mod tests {
             recent_file_paths: vec!["src/bridge.rs".to_string(), "docs/work_log.md".to_string()],
             last_diff: Some(StoredDiff {
                 description: "查看当前工作区 diff".to_string(),
-                content: "diff --git a/src/bridge.rs b/src/bridge.rs\n@@ -1 +1 @@\n-old\n+new".to_string(),
+                content: "diff --git a/src/bridge.rs b/src/bridge.rs\n@@ -1 +1 @@\n-old\n+new"
+                    .to_string(),
             }),
             last_patch: None,
         };
@@ -368,5 +385,4 @@ mod tests {
 
         let _ = fs::remove_file(session_path);
     }
-
 }

@@ -1,8 +1,8 @@
-use crate::card::{self, DirectoryChoice, ProjectChoice};
+use crate::agent_backend;
 use crate::bridge::BridgeResponse;
 use crate::bridge_context::BridgeContext;
+use crate::card::{self, DirectoryChoice, ProjectChoice};
 use crate::plan::ExecutionOutcome;
-use crate::agent_backend;
 use crate::reply;
 use crate::session;
 use crate::vscode;
@@ -44,6 +44,10 @@ pub fn execute_direct_command(
         );
     }
 
+    if let Intent::AskCodex { prompt } = &intent {
+        return execute_codex_turn(context, session_key, task_text, prompt, &intent, "问 Codex");
+    }
+
     if let Intent::StartAgentRun { prompt } = &intent {
         return execute_agent_runtime_start(context, session_key, task_text, prompt, &intent);
     }
@@ -77,16 +81,25 @@ pub fn execute_direct_command(
     }
 
     if let Intent::ShowCurrentProject = &intent {
-        let current_project = selected_project_path(context, session_key).or_else(default_workspace_path);
+        let current_project =
+            selected_project_path(context, session_key).or_else(default_workspace_path);
         let reply = match current_project.clone() {
             Some(path) => format!("📁 当前项目: {path}"),
-            None => "⚠️ 当前还没有绑定项目。先发送「选择项目 <路径>」或「打开文件夹 <路径>」。".to_string(),
+            None => "⚠️ 当前还没有绑定项目。先发送「选择项目 <路径>」或「打开文件夹 <路径>」。"
+                .to_string(),
         };
         let outcome = ExecutionOutcome {
             success: true,
             reply,
         };
-        return persist_direct_outcome(context, session_key, task_text, &intent, outcome, current_project);
+        return persist_direct_outcome(
+            context,
+            session_key,
+            task_text,
+            &intent,
+            outcome,
+            current_project,
+        );
     }
 
     if let Intent::GitStatus { repo } = &intent {
@@ -96,7 +109,14 @@ pub fn execute_direct_command(
             success: result.success,
             reply: result.to_reply("Git 状态"),
         };
-        return persist_direct_outcome(context, session_key, task_text, &intent, outcome, effective_repo);
+        return persist_direct_outcome(
+            context,
+            session_key,
+            task_text,
+            &intent,
+            outcome,
+            effective_repo,
+        );
     }
 
     if let Intent::GitSync { repo } = &intent {
@@ -106,7 +126,14 @@ pub fn execute_direct_command(
             success: result.success,
             reply: result.to_reply("同步 Git 状态"),
         };
-        return persist_direct_outcome(context, session_key, task_text, &intent, outcome, effective_repo);
+        return persist_direct_outcome(
+            context,
+            session_key,
+            task_text,
+            &intent,
+            outcome,
+            effective_repo,
+        );
     }
 
     if let Intent::GitPull { repo } = &intent {
@@ -116,7 +143,14 @@ pub fn execute_direct_command(
             success: result.success,
             reply: result.to_reply("Git Pull"),
         };
-        return persist_direct_outcome(context, session_key, task_text, &intent, outcome, effective_repo);
+        return persist_direct_outcome(
+            context,
+            session_key,
+            task_text,
+            &intent,
+            outcome,
+            effective_repo,
+        );
     }
 
     if let Intent::GitPushAll { repo, message } = &intent {
@@ -126,7 +160,14 @@ pub fn execute_direct_command(
             success: result.success,
             reply: result.to_reply("Git Push"),
         };
-        return persist_direct_outcome(context, session_key, task_text, &intent, outcome, effective_repo);
+        return persist_direct_outcome(
+            context,
+            session_key,
+            task_text,
+            &intent,
+            outcome,
+            effective_repo,
+        );
     }
 
     if let Intent::ResetAgentSession = &intent {
@@ -150,13 +191,76 @@ pub fn execute_agent_turn(
     intent: &Intent,
     action_label: &str,
 ) -> BridgeResponse {
-    let prompt = augment_agent_prompt_with_project(
+    execute_llm_turn(
+        context,
+        session_key,
+        task_text,
         prompt,
-        selected_project_path(context, session_key).as_deref(),
+        intent,
+        action_label,
+        agent_backend::ask_agent,
+    )
+}
+
+pub fn execute_codex_turn(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    prompt: &str,
+    intent: &Intent,
+    action_label: &str,
+) -> BridgeResponse {
+    let current_project =
+        selected_project_path(context, session_key).or_else(default_workspace_path);
+    let prompt = augment_agent_prompt_with_project(prompt, current_project.as_deref());
+    let result = agent_backend::ask_codex(session_key, &prompt, current_project.as_deref());
+    let mut reply = reply::format_agent_reply_with_action(task_text, action_label, &result);
+    if let Some(current_project) = current_project.as_deref() {
+        reply = format!("📁 当前项目: {current_project}\n\n{reply}");
+    } else {
+        reply = format!(
+            "⚠️ 当前还没有绑定项目；这轮 Codex 只能依赖当前工作目录上下文。建议先发送「选择项目 <路径>」。\n\n{reply}"
+        );
+    }
+    let stored = session::stored_session_from_agent_result(
+        task_text,
+        intent,
+        &result,
+        &reply,
+        current_project,
     );
-    let result = agent_backend::ask_agent(session_key, &prompt);
-    let reply = reply::format_agent_reply_with_action(task_text, action_label, &result);
-    let stored = session::stored_session_from_agent_result(task_text, intent, &result, &reply);
+    let _ = session::persist_session(context.session_store_path(), session_key, &stored);
+    BridgeResponse::Text(reply)
+}
+
+fn execute_llm_turn(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+    prompt: &str,
+    intent: &Intent,
+    action_label: &str,
+    ask_fn: fn(&str, &str, Option<&str>) -> vscode::AgentAskResult,
+) -> BridgeResponse {
+    let current_project =
+        selected_project_path(context, session_key).or_else(default_workspace_path);
+    let prompt = augment_agent_prompt_with_project(prompt, current_project.as_deref());
+    let result = ask_fn(session_key, &prompt, current_project.as_deref());
+    let mut reply = reply::format_agent_reply_with_action(task_text, action_label, &result);
+    if let Some(current_project) = current_project.as_deref() {
+        reply = format!("📁 当前项目: {current_project}\n\n{reply}");
+    } else {
+        reply = format!(
+            "⚠️ 当前还没有绑定项目；这轮 agent 只能依赖 VS Code 当前窗口上下文。建议先发送「选择项目 <路径>」。\n\n{reply}"
+        );
+    }
+    let stored = session::stored_session_from_agent_result(
+        task_text,
+        intent,
+        &result,
+        &reply,
+        current_project,
+    );
     let _ = session::persist_session(context.session_store_path(), session_key, &stored);
     card::format_agent_reply_card(task_text, action_label, &result)
 }
@@ -168,10 +272,18 @@ fn execute_agent_runtime_start(
     prompt: &str,
     intent: &Intent,
 ) -> BridgeResponse {
-    let current_project = selected_project_path(context, session_key).or_else(default_workspace_path);
+    let current_project =
+        selected_project_path(context, session_key).or_else(default_workspace_path);
     let prompt = augment_agent_prompt_with_project(prompt, current_project.as_deref());
     let result = agent_backend::start_agent_run(session_key, &prompt, current_project.as_deref());
-    let reply_text = reply::format_agent_run_reply(task_text, "启动 Agent Runtime", &result);
+    let mut reply_text = reply::format_agent_run_reply(task_text, "启动 Agent Runtime", &result);
+    if let Some(current_project) = current_project.as_deref() {
+        reply_text = format!("📁 当前项目: {current_project}\n\n{reply_text}");
+    } else {
+        reply_text = format!(
+            "⚠️ 当前还没有绑定项目；这轮 runtime 只能依赖 VS Code 当前窗口上下文。建议先发送「选择项目 <路径>」。\n\n{reply_text}"
+        );
+    }
     let stored = session::stored_session_from_agent_run_result(
         task_text,
         intent,
@@ -190,17 +302,32 @@ fn execute_agent_runtime_continue(
     prompt: Option<&str>,
     intent: &Intent,
 ) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
-        return BridgeResponse::Text("⚠️ 当前没有可继续的 agent runtime。请先发送「/agent <任务>」。".to_string());
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
+        return BridgeResponse::Text(
+            "⚠️ 当前没有可继续的 agent runtime。请先发送「/agent <任务>」。".to_string(),
+        );
     };
 
     let Some(run_id) = session::current_agent_run_id(&stored) else {
-        return BridgeResponse::Text("⚠️ 当前没有 active agent runtime。请先发送「/agent <任务>」。".to_string());
+        return BridgeResponse::Text(
+            "⚠️ 当前没有 active agent runtime。请先发送「/agent <任务>」。".to_string(),
+        );
     };
 
     let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
-    let result = agent_backend::continue_agent_run(session_key, &run_id, prompt);
-    let reply_text = reply::format_agent_run_reply(task_text, "继续 Agent Runtime", &result);
+    let augmented_prompt =
+        prompt.map(|value| augment_agent_prompt_with_project(value, current_project.as_deref()));
+    let result =
+        agent_backend::continue_agent_run(session_key, &run_id, augmented_prompt.as_deref());
+    let mut reply_text = reply::format_agent_run_reply(task_text, "继续 Agent Runtime", &result);
+    if let Some(current_project) = current_project.as_deref() {
+        reply_text = format!("📁 当前项目: {current_project}\n\n{reply_text}");
+    } else {
+        reply_text = format!(
+            "⚠️ 当前还没有绑定项目；这轮 runtime 只能依赖 VS Code 当前窗口上下文。建议先发送「选择项目 <路径>」。\n\n{reply_text}"
+        );
+    }
     let stored = session::stored_session_from_agent_run_result(
         task_text,
         intent,
@@ -218,12 +345,17 @@ fn execute_agent_runtime_status(
     task_text: &str,
     intent: &Intent,
 ) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
-        return BridgeResponse::Text("⚠️ 当前没有 agent runtime 记录。请先发送「/agent <任务>」。".to_string());
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
+        return BridgeResponse::Text(
+            "⚠️ 当前没有 agent runtime 记录。请先发送「/agent <任务>」。".to_string(),
+        );
     };
 
     let Some(run_id) = session::current_agent_run_id(&stored) else {
-        return BridgeResponse::Text("⚠️ 当前没有 active agent runtime。请先发送「/agent <任务>」。".to_string());
+        return BridgeResponse::Text(
+            "⚠️ 当前没有 active agent runtime。请先发送「/agent <任务>」。".to_string(),
+        );
     };
 
     let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
@@ -247,12 +379,18 @@ fn execute_agent_runtime_approve(
     option_id: Option<&str>,
     intent: &Intent,
 ) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
-        return BridgeResponse::Text("⚠️ 当前没有可批准的 agent runtime 决策。请先发送「/agent <任务>」。".to_string());
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
+        return BridgeResponse::Text(
+            "⚠️ 当前没有可批准的 agent runtime 决策。请先发送「/agent <任务>」。".to_string(),
+        );
     };
 
     let Some((run, decision)) = session::current_agent_decision(&stored) else {
-        return BridgeResponse::Text("⚠️ 当前 agent runtime 没有待处理的用户决策。可以先发送「agent 状态」查看当前状态。".to_string());
+        return BridgeResponse::Text(
+            "⚠️ 当前 agent runtime 没有待处理的用户决策。可以先发送「agent 状态」查看当前状态。"
+                .to_string(),
+        );
     };
 
     let chosen_option = option_id
@@ -266,7 +404,12 @@ fn execute_agent_runtime_approve(
     };
 
     let current_project = session::selected_project_path(&stored).or_else(default_workspace_path);
-    let result = agent_backend::approve_agent_run(session_key, &run.run_id, &decision.decision_id, &chosen_option);
+    let result = agent_backend::approve_agent_run(
+        session_key,
+        &run.run_id,
+        &decision.decision_id,
+        &chosen_option,
+    );
     let reply_text = reply::format_agent_run_reply(task_text, "批准 Agent Runtime 决策", &result);
     let stored = session::stored_session_from_agent_run_result(
         task_text,
@@ -285,7 +428,8 @@ fn execute_agent_runtime_cancel(
     task_text: &str,
     intent: &Intent,
 ) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text("⚠️ 当前没有可取消的 agent runtime。".to_string());
     };
 
@@ -344,7 +488,8 @@ fn show_project_browser(
     session_key: &str,
     path: Option<&str>,
 ) -> BridgeResponse {
-    let current_project = selected_project_path(context, session_key).or_else(default_workspace_path);
+    let current_project =
+        selected_project_path(context, session_key).or_else(default_workspace_path);
 
     let browser = match build_project_browser(path) {
         Ok(browser) => browser,
@@ -715,7 +860,10 @@ fn select_project_folder(
 }
 
 fn augment_agent_prompt_with_project(prompt: &str, current_project_path: Option<&str>) -> String {
-    let Some(current_project_path) = current_project_path.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(current_project_path) = current_project_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return prompt.to_string();
     };
 
@@ -861,7 +1009,10 @@ mod tests {
         );
 
         match app.dispatch("选择项目", "cli") {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("请选择项目"));
                 assert!(fallback_text.contains(project_path.to_string_lossy().as_ref()));
@@ -902,7 +1053,10 @@ mod tests {
         );
 
         match app.dispatch(&format!("浏览项目 {}", root_dir.to_string_lossy()), "cli") {
-            BridgeResponse::Card { fallback_text, card } => {
+            BridgeResponse::Card {
+                fallback_text,
+                card,
+            } => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("浏览项目"));
                 assert!(card_text.contains("Alpha"));

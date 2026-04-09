@@ -3,13 +3,40 @@ use crate::bridge_context::BridgeContext;
 use crate::direct_command;
 use crate::reply;
 use crate::session::{self, StoredDiff, StoredResult, StoredStep};
-use crate::Intent;
 use crate::vscode;
+use crate::Intent;
 
 const NO_SESSION_TEXT: &str = "⚠️ 当前没有可回看的任务记录。";
 
+pub fn resolve_contextual_follow_up(
+    context: &BridgeContext<'_>,
+    session_key: &str,
+    task_text: &str,
+) -> Option<BridgeResponse> {
+    let stored = session::load_persisted_session(context.session_store_path(), session_key)?;
+
+    if let Some(option_id) = match_decision_phrase(task_text, &stored) {
+        let intent = Intent::ApproveAgentRun {
+            option_id: Some(option_id),
+        };
+        return Some(direct_command::execute_direct_command(
+            context,
+            session_key,
+            task_text,
+            intent,
+        ));
+    }
+
+    if matches_continue_phrase(task_text) && session::is_agent_task_session(&stored) {
+        return Some(continue_agent_task(context, session_key, task_text, None));
+    }
+
+    None
+}
+
 pub fn explain_last_failure(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -17,7 +44,8 @@ pub fn explain_last_failure(context: &BridgeContext<'_>, session_key: &str) -> B
 }
 
 pub fn show_last_result(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -30,8 +58,12 @@ pub fn continue_agent_task(
     task_text: &str,
     prompt_override: Option<&str>,
 ) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
-        return BridgeResponse::Text("⚠️ 当前没有可继续的 agent 任务。请先发送「问 Copilot <问题>」。".to_string());
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
+        return BridgeResponse::Text(
+            "⚠️ 当前没有可继续的 agent 任务。请先发送「/copilot <问题>」或「/codex <问题>」。"
+                .to_string(),
+        );
     };
 
     if session::current_agent_run(&stored).is_some() {
@@ -56,14 +88,24 @@ pub fn continue_agent_task(
             .map(ToString::to_string),
     };
 
-    direct_command::execute_agent_turn(
-        context,
-        session_key,
-        task_text,
-        &prompt,
-        &intent,
-        "继续 Agent 任务",
-    )
+    match preferred_agent_action_label(&stored) {
+        "问 Codex" => direct_command::execute_codex_turn(
+            context,
+            session_key,
+            task_text,
+            &prompt,
+            &intent,
+            "继续 Codex 任务",
+        ),
+        _ => direct_command::execute_agent_turn(
+            context,
+            session_key,
+            task_text,
+            &prompt,
+            &intent,
+            "继续 Copilot 任务",
+        ),
+    }
 }
 
 pub fn continue_agent_suggested_action(
@@ -71,8 +113,12 @@ pub fn continue_agent_suggested_action(
     session_key: &str,
     task_text: &str,
 ) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
-        return BridgeResponse::Text("⚠️ 当前没有可继续的 agent 任务。请先发送「问 Copilot <问题>」。".to_string());
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
+        return BridgeResponse::Text(
+            "⚠️ 当前没有可继续的 agent 任务。请先发送「/copilot <问题>」或「/codex <问题>」。"
+                .to_string(),
+        );
     };
 
     if !session::is_agent_task_session(&stored) {
@@ -80,14 +126,18 @@ pub fn continue_agent_suggested_action(
     }
 
     let Some(next_action) = session::suggested_agent_next_action(&stored) else {
-        return BridgeResponse::Text("⚠️ 上一轮 agent 结果里没有明确的下一步建议。可以直接发送「继续，<你的要求>」。".to_string());
+        return BridgeResponse::Text(
+            "⚠️ 上一轮 agent 结果里没有明确的下一步建议。可以直接发送「继续，<你的要求>」。"
+                .to_string(),
+        );
     };
 
     continue_agent_task(context, session_key, task_text, Some(&next_action))
 }
 
 pub fn continue_last_file(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -114,11 +164,16 @@ pub fn continue_last_file(context: &BridgeContext<'_>, session_key: &str) -> Bri
     }
 
     blocks.push(result.to_reply(&format!("读取文件 {path}")));
-    BridgeResponse::Text(reply::format_follow_up_reply("继续文件上下文", &stored, blocks))
+    BridgeResponse::Text(reply::format_follow_up_reply(
+        "继续文件上下文",
+        &stored,
+        blocks,
+    ))
 }
 
 pub fn show_last_diff(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -126,7 +181,8 @@ pub fn show_last_diff(context: &BridgeContext<'_>, session_key: &str) -> BridgeR
 }
 
 pub fn show_recent_files(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(stored) = session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
@@ -134,12 +190,16 @@ pub fn show_recent_files(context: &BridgeContext<'_>, session_key: &str) -> Brid
 }
 
 pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> BridgeResponse {
-    let Some(mut stored) = session::load_persisted_session(context.session_store_path(), session_key) else {
+    let Some(mut stored) =
+        session::load_persisted_session(context.session_store_path(), session_key)
+    else {
         return BridgeResponse::Text(NO_SESSION_TEXT.to_string());
     };
 
     let Some(last_patch) = stored.last_patch.clone() else {
-        return BridgeResponse::Text("⚠️ 最近一次任务里没有可撤回的补丁记录。请先发送「应用补丁 ...」。".to_string());
+        return BridgeResponse::Text(
+            "⚠️ 最近一次任务里没有可撤回的补丁记录。请先发送「应用补丁 ...」。".to_string(),
+        );
     };
 
     let result = vscode::reverse_patch(&last_patch.content);
@@ -155,7 +215,10 @@ pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> Bridge
             "失败暂停".to_string()
         },
         summary: if result.success {
-            format!("最近一次补丁已撤回，共涉及 {} 个文件。", last_patch.file_paths.len())
+            format!(
+                "最近一次补丁已撤回，共涉及 {} 个文件。",
+                last_patch.file_paths.len()
+            )
         } else {
             "撤回最近一次补丁失败。".to_string()
         },
@@ -180,31 +243,208 @@ pub fn undo_last_patch(context: &BridgeContext<'_>, session_key: &str) -> Bridge
     BridgeResponse::Text(reply)
 }
 
-fn build_agent_continuation_prompt(stored: &session::StoredSession, prompt_override: Option<&str>) -> String {
+fn build_agent_continuation_prompt(
+    stored: &session::StoredSession,
+    prompt_override: Option<&str>,
+) -> String {
     let last_task = stored
         .current_task
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("问 Copilot");
+        .unwrap_or(preferred_agent_action_label(stored));
     let last_summary = stored
         .last_result
         .as_ref()
         .map(|result| result.summary.trim())
         .filter(|value| !value.is_empty());
 
-    let mut parts = vec![format!("继续同一个 agent 任务。上一轮任务：{}", last_task)];
+    let mut parts = vec![format!("继续同一个编码任务。上一轮任务：{}", last_task)];
 
     if let Some(summary) = last_summary {
         parts.push(format!("上一轮结果摘要：{}", summary));
     }
 
-    if let Some(prompt) = prompt_override.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(prompt) = prompt_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         parts.push(format!("本轮新的推进要求：{}", prompt));
     } else {
         parts.push("请不要重复总结上一轮内容，直接基于当前结论继续推进，并给出下一步最有价值的分析、检查建议或最小修复建议。".to_string());
     }
 
     parts.join("\n\n")
+}
+
+fn match_decision_phrase(task_text: &str, stored: &session::StoredSession) -> Option<String> {
+    let (_, decision) = session::current_agent_decision(stored)?;
+    let trimmed = task_text.trim();
+    let lower = trimmed.to_lowercase();
+
+    if matches_continue_current_run_phrase(&lower) {
+        return Some("continue_run".to_string());
+    }
+
+    if matches_stop_here_phrase(&lower) {
+        return Some("cancel_run".to_string());
+    }
+
+    if let Some(index) = positive_ordinal_choice(&lower) {
+        return decision
+            .options
+            .get(index)
+            .map(|option| option.option_id.clone());
+    }
+
+    if let Some(index) = negated_ordinal_choice(&lower) {
+        if decision.options.len() == 2 {
+            let other = if index == 0 { 1 } else { 0 };
+            return decision
+                .options
+                .get(other)
+                .map(|option| option.option_id.clone());
+        }
+    }
+
+    if lower.contains("保守")
+        || lower.contains("稳")
+        || lower.contains("安全")
+        || lower.contains("最小")
+        || lower.contains("先别冒进")
+    {
+        if let Some(option) = find_option_by_keywords(
+            decision,
+            &["保守", "安全", "最小", "确认", "暂停", "keep", "cancel"],
+        ) {
+            return Some(option.option_id.clone());
+        }
+    }
+
+    None
+}
+
+fn find_option_by_keywords<'a>(
+    decision: &'a crate::agent_runtime::PendingUserDecision,
+    keywords: &[&str],
+) -> Option<&'a crate::agent_runtime::AgentDecisionOption> {
+    decision.options.iter().find(|option| {
+        let haystack = format!(
+            "{} {}",
+            option.label,
+            option.note.as_deref().unwrap_or_default()
+        )
+        .to_lowercase();
+        keywords
+            .iter()
+            .any(|keyword| haystack.contains(&keyword.to_lowercase()))
+    })
+}
+
+fn positive_ordinal_choice(lower: &str) -> Option<usize> {
+    if matches_any_phrase(
+        lower,
+        &[
+            "做第一个",
+            "选第一个",
+            "第一个",
+            "做第1个",
+            "选第1个",
+            "选1",
+            "做1",
+        ],
+    ) {
+        return Some(0);
+    }
+    if matches_any_phrase(
+        lower,
+        &[
+            "做第二个",
+            "选第二个",
+            "第二个",
+            "做第2个",
+            "选第2个",
+            "选2",
+            "做2",
+        ],
+    ) {
+        return Some(1);
+    }
+    if matches_any_phrase(
+        lower,
+        &[
+            "做第三个",
+            "选第三个",
+            "第三个",
+            "做第3个",
+            "选第3个",
+            "选3",
+            "做3",
+        ],
+    ) {
+        return Some(2);
+    }
+    None
+}
+
+fn negated_ordinal_choice(lower: &str) -> Option<usize> {
+    if matches_any_phrase(
+        lower,
+        &[
+            "先别做第一个",
+            "不要第一个",
+            "不做第一个",
+            "先别选第一个",
+            "不要第1个",
+        ],
+    ) {
+        return Some(0);
+    }
+    if matches_any_phrase(
+        lower,
+        &[
+            "先别做第二个",
+            "不要第二个",
+            "不做第二个",
+            "先别选第二个",
+            "不要第2个",
+        ],
+    ) {
+        return Some(1);
+    }
+    if matches_any_phrase(
+        lower,
+        &[
+            "先别做第三个",
+            "不要第三个",
+            "不做第三个",
+            "先别选第三个",
+            "不要第3个",
+        ],
+    ) {
+        return Some(2);
+    }
+    None
+}
+
+fn matches_continue_phrase(task_text: &str) -> bool {
+    let lower = task_text.trim().to_lowercase();
+    matches_continue_current_run_phrase(&lower)
+        || matches_any_phrase(
+            &lower,
+            &["继续吧", "直接继续", "就这样继续", "继续往下做", "继续做"],
+        )
+}
+
+fn matches_continue_current_run_phrase(lower: &str) -> bool {
+    matches_any_phrase(lower, &["直接继续", "继续吧", "继续往下", "继续做吧"])
+}
+
+fn matches_stop_here_phrase(lower: &str) -> bool {
+    matches_any_phrase(lower, &["停在这里", "先停在这里", "先别继续", "暂停一下"])
+}
+
+fn matches_any_phrase(lower: &str, phrases: &[&str]) -> bool {
+    phrases.iter().any(|phrase| lower == *phrase)
 }
 
 #[cfg(test)]
@@ -388,10 +628,14 @@ mod tests {
             recent_file_paths: vec!["src/demo.rs".to_string()],
             last_diff: Some(StoredDiff {
                 description: "应用补丁到当前工作区".to_string(),
-                content: "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs".to_string(),
+                content:
+                    "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs"
+                        .to_string(),
             }),
             last_patch: Some(StoredPatch {
-                content: "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs".to_string(),
+                content:
+                    "diff --git a/src/demo.rs b/src/demo.rs\n--- a/src/demo.rs\n+++ b/src/demo.rs"
+                        .to_string(),
                 file_paths: vec!["src/demo.rs".to_string()],
             }),
         };
@@ -487,9 +731,149 @@ mod tests {
 
         let prompt = build_agent_continuation_prompt(&stored, Some("给我最小修复建议"));
 
-        assert!(prompt.contains("继续同一个 agent 任务"));
+        assert!(prompt.contains("继续同一个编码任务"));
         assert!(prompt.contains("问 Copilot 分析 parse_intent"));
         assert!(prompt.contains("parse_intent 负责把文本解析成 Intent"));
         assert!(prompt.contains("给我最小修复建议"));
+    }
+
+    #[test]
+    fn build_agent_continuation_prompt_uses_codex_context() {
+        let stored = StoredSession {
+            session_kind: StoredSessionKind::Agent,
+            agent_state: Some(session::StoredAgentState {
+                session_id: Some("session-2".to_string()),
+                status: Some("已回答".to_string()),
+                current_action: Some("已完成上一轮".to_string()),
+                next_action: Some("继续检查 bridge.rs".to_string()),
+                tool_call: None,
+                tool_result_summary: None,
+                run: None,
+            }),
+            current_project_path: Some("C:/work/demo".to_string()),
+            plan: None,
+            current_task: Some("/codex 修复当前桥接路由".to_string()),
+            pending_steps: Vec::new(),
+            last_result: Some(StoredResult {
+                status: "已回答".to_string(),
+                summary: "已经定位到 bridge.rs 的 dispatch 入口。".to_string(),
+                success: true,
+            }),
+            last_action: Some("直接执行".to_string()),
+            last_step: Some(StoredStep {
+                description: "问 Codex 修复当前桥接路由".to_string(),
+                reply: "ok".to_string(),
+                success: true,
+            }),
+            last_file_path: Some("src/bridge.rs".to_string()),
+            recent_file_paths: vec!["src/bridge.rs".to_string()],
+            last_diff: None,
+            last_patch: None,
+        };
+
+        let prompt = build_agent_continuation_prompt(&stored, None);
+
+        assert!(prompt.contains("继续同一个编码任务"));
+        assert!(prompt.contains("/codex 修复当前桥接路由"));
+        assert!(prompt.contains("已经定位到 bridge.rs 的 dispatch 入口"));
+    }
+
+    #[test]
+    fn match_decision_phrase_supports_positive_ordinal() {
+        let stored = StoredSession {
+            session_kind: StoredSessionKind::Agent,
+            agent_state: Some(session::StoredAgentState {
+                session_id: Some("session-3".to_string()),
+                status: Some("等待用户".to_string()),
+                current_action: Some("Waiting for choice".to_string()),
+                next_action: Some("请选择下一步".to_string()),
+                tool_call: None,
+                tool_result_summary: None,
+                run: Some(crate::agent_runtime::AgentRunState {
+                    run_id: "run-1".to_string(),
+                    mode: crate::agent_runtime::AgentRunMode::Agent,
+                    status: crate::agent_runtime::AgentRunStatus::WaitingUser,
+                    summary: "需要你确认下一步".to_string(),
+                    current_action: "Waiting for choice".to_string(),
+                    next_action: "请选择下一步".to_string(),
+                    current_step: Some("waiting_user".to_string()),
+                    waiting_reason: None,
+                    authorization_policy: None,
+                    result_disposition: crate::agent_runtime::ResultDisposition::Pending,
+                    pending_user_decision: Some(crate::agent_runtime::PendingUserDecision {
+                        decision_id: "decision-1".to_string(),
+                        control_kind: crate::agent_runtime::ControlPointKind::Pacing,
+                        summary: "继续还是暂停".to_string(),
+                        options: vec![
+                            crate::agent_runtime::AgentDecisionOption {
+                                option_id: "continue_run".to_string(),
+                                label: "继续".to_string(),
+                                note: None,
+                                primary: true,
+                            },
+                            crate::agent_runtime::AgentDecisionOption {
+                                option_id: "cancel_run".to_string(),
+                                label: "先停在这里".to_string(),
+                                note: Some("更保守".to_string()),
+                                primary: false,
+                            },
+                        ],
+                        recommended_option_id: Some("continue_run".to_string()),
+                    }),
+                    budget: crate::agent_runtime::RunBudget::default(),
+                    checkpoints: Vec::new(),
+                    reversible_artifacts: Vec::new(),
+                }),
+            }),
+            current_project_path: None,
+            plan: None,
+            current_task: Some("/codex 修复当前桥接".to_string()),
+            pending_steps: Vec::new(),
+            last_result: None,
+            last_action: None,
+            last_step: None,
+            last_file_path: None,
+            recent_file_paths: Vec::new(),
+            last_diff: None,
+            last_patch: None,
+        };
+
+        assert_eq!(
+            match_decision_phrase("做第一个", &stored).as_deref(),
+            Some("continue_run")
+        );
+        assert_eq!(
+            match_decision_phrase("先别做第二个", &stored).as_deref(),
+            Some("continue_run")
+        );
+        assert_eq!(
+            match_decision_phrase("按保守方案继续", &stored).as_deref(),
+            Some("cancel_run")
+        );
+    }
+}
+
+fn preferred_agent_action_label(stored: &session::StoredSession) -> &'static str {
+    let current_task = stored
+        .current_task
+        .as_deref()
+        .unwrap_or_default()
+        .trim_start();
+    let last_description = stored
+        .last_step
+        .as_ref()
+        .map(|step| step.description.trim_start())
+        .unwrap_or_default();
+
+    if current_task.starts_with("/codex")
+        || current_task.starts_with("问 Codex")
+        || current_task.starts_with("继续 Codex 任务")
+        || current_task.to_ascii_lowercase().starts_with("ask codex")
+        || last_description.starts_with("问 Codex")
+        || last_description.starts_with("继续 Codex 任务")
+    {
+        "问 Codex"
+    } else {
+        "问 Copilot"
     }
 }

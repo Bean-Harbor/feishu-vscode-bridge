@@ -46,7 +46,12 @@ pub fn run_cmd(program: &str, args: &[&str], timeout_secs: u64) -> CmdResult {
     run_cmd_in_dir(program, args, timeout_secs, Option::<&Path>::None)
 }
 
-pub fn run_cmd_in_dir<P>(program: &str, args: &[&str], timeout_secs: u64, cwd: Option<P>) -> CmdResult
+pub fn run_cmd_in_dir<P>(
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+    cwd: Option<P>,
+) -> CmdResult
 where
     P: AsRef<Path>,
 {

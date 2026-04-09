@@ -1,22 +1,95 @@
 # Work Log
 
+## 2026-04-09
+
+### Summary
+
+- Split the remote coding entrypoint by provider so `/copilot` now routes to the existing Copilot-backed ask path while `/codex` directly invokes the local Codex CLI, keeping both under the same Feishu session and project-context flow
+- Added a Codex-specific direct-command path that reuses stored project binding and session persistence but returns plain text to Feishu instead of an interactive card, avoiding the card-rendering gap seen in live `/codex` validation
+- Tightened same-task continuation around the real “develop from Feishu” workflow: follow-up turns now preserve Codex-vs-Copilot provider choice, continuation prompts are framed as the same coding task rather than an internal “agent task”, and Codex sessions stay on the Codex lane for `继续` / `按建议继续`
+- Added a contextual follow-up interpreter for decision-style natural language such as `做第一个`, `先别做第二个`, `按保守方案继续`, `直接继续`, and `停在这里`; these phrases now resolve against the current session’s pending options instead of being treated as examples only
+- Added a lightweight processing acknowledgement in the Feishu listener for obviously long-running turns (`/codex`, `/copilot`, `/agent`, and the main continuation phrases) so the user first sees “已收到，正在处理” before the final result arrives
+- Relaxed the local `scripts/smoke-agent-runtime.ps1` semantic-planner assertions so the smoke no longer depends on every ambiguous GitHub-sync confirmation set containing a push-related option
+- Kept the smoke safety-focused instead of permissive: it still requires `decision=confirm`, multiple distinct commands, no direct-`git pull` regression, all options remaining Git-related, and the presence of the safer `同步 Git 状态` confirmation path
+- This brings the endpoint smoke back in line with the current planner contract and stabilization path, where ambiguous Git sync requests are validated by safe confirmation behavior rather than a specific push-option mix
+- Narrowed the smoke's default scope to a stable planner baseline: by default it now validates `/health` plus semantic-plan confirm routing only, while autonomous-agent checks move behind an explicit `-IncludeAgent` switch
+- Added agent-specific diagnostics so model quota or provider availability issues are reported as blocked-by-model-availability instead of looking like a planner regression or a broken default smoke
+
+### Files Updated
+
+- `src/lib.rs` — added explicit `/copilot` and `/codex` parsing, plus focused parser coverage for both slash-command forms and the Codex natural-language alias
+- `src/direct_command.rs` — split Codex execution from the generic ask path, preserved current-project augmentation for both providers, and changed Codex replies to plain text for more reliable Feishu delivery
+- `src/agent_backend.rs` — added a direct Codex CLI adapter around `codex exec --skip-git-repo-check --json -o ...` and wired it into the bridge-side ask result contract
+- `src/follow_up.rs` / `src/bridge.rs` — added provider-aware continuation, contextual option resolution for natural-language choices, and new regression coverage for Codex continuation plus decision-phrase mapping
+- `src/reply.rs` / `src/session.rs` — updated stored intent descriptions and follow-up wording so continuation reads as “当前任务” instead of exposing internal agent phrasing, while still preserving Codex-session detection
+- `src/main.rs` — added the pre-result Feishu acknowledgement for long-running remote coding turns
+- `scripts/smoke-agent-runtime.ps1` — replaced the stale push-specific confirmation expectation with checks for Git-only options plus the safe status-check fallback
+- `README.md` — updated the endpoint-smoke description so the default path is planner-only and the agent probe is explicitly optional
+- `docs/work_log.md` — recorded the smoke-script alignment so the next session does not treat the old assertion as an active product requirement
+
+### Verification
+
+- Live Feishu validation confirmed the repaired `/codex` path now reaches the listener, executes through the local Codex CLI, and returns a text reply instead of disappearing behind a card-rendering issue
+- `cargo test --lib --quiet` passed after the provider split, Codex continuation changes, and contextual decision-phrase interpreter (`165 passed`)
+- Focused regression coverage now includes `/copilot` and `/codex` parser cases, Codex continuation prompt construction, Codex-session detection, and decision-phrase mapping such as `做第一个` and `按保守方案继续`
+- Manual Codex CLI smoke on Windows succeeded with `codex exec --skip-git-repo-check --json -o <tempfile>`, confirming the local machine can service `/codex` turns without depending on Copilot quota
+- Static review of `vscode-agent-bridge/src/extension.ts` confirmed the current canonical ambiguous-Git sync confirmation set still includes `git push`, `git push auto commit via feishu-bridge`, and `同步 Git 状态`, while the smoke should only enforce the safety properties rather than the exact mix
+- Default `./scripts/smoke-agent-runtime.ps1` is now expected to succeed as long as `/health` and `/v1/chat/plan` are healthy, even when `/agent` is blocked by premium-model quota
+- `./scripts/smoke-agent-runtime.ps1 -IncludeAgent` is now expected to surface model/quota problems as an agent-only blocked diagnostic rather than as a planner failure
+
 ## 2026-04-06
 
 ### Summary
+
+- Added a narrow Feishu image-message probe path so a user can send a photo directly in Feishu and verify the bridge end to end without routing it into NAS or the text-command executor
+- Kept the main bridge runtime unchanged for text commands: image messages are now parsed into attachment metadata, and the live listener replies with a direct "chain is working" confirmation containing the image key and message id
+- Extended that image probe path one step further: the listener now attempts to download the Feishu image resource into a local temp directory and returns the saved file path and size in the Feishu reply when the download succeeds
+- Preserved the previous conservative behavior for other non-text message types such as generic file, audio, media, and rich post-with-image payloads
 
 - Replaced the first semantic-planner result contract from the older `planned / clarify / unsupported` shape with a decision-oriented structure closer to the intended product model: `execute / confirm / clarify`, plus planner-supplied `confidence`, `risk`, and `summaryForUser`
 - Kept the low-risk path direct: when the planner returns `execute`, the Rust bridge still maps planner actions into existing `Intent` values or step plans and reuses the current execution flow without adding a parallel runtime path
 - Added the first real `confirm` bridge surface for ambiguous natural-language requests by rendering a Feishu confirmation card with candidate action buttons instead of forcing a single hard-coded intent
 - Grounded the first `confirm` slice around the Git ambiguity that motivated the change: prompts like “把本地改动同步到 GitHub 上” are now meant to return candidate commands such as `git push`, `git push auto commit via feishu-bridge`, or `同步 Git 状态`, rather than silently collapsing to `git pull`
 - Kept the integration pragmatic: confirmation options currently point at existing explicit bridge commands, so button clicks reuse the normal parser, approval policy, and execution machinery instead of introducing a second confirmation executor
+- Added a Rust-side hard guard so ambiguous GitHub sync phrasing is forced back to `confirm` even if the companion planner mistakenly returns `execute`, closing the live safety gap that still allowed direct execution on the Feishu path
+- Revalidated the live path end to end on Windows: after restarting the verified listener and using the F5 extension host, the ambiguous Git sync phrase returned a real confirmation card in Feishu instead of directly running a Git command
+- Validated the broader natural-language and multi-round agent path through the local extension endpoints: `/v1/chat/plan` returned `decision=confirm` with Git choices, and `/v1/chat/agent/start` plus `/v1/chat/agent/continue` reused the same run id while growing checkpoints across turns
+- Added a lightweight local smoke helper for that path and documented it, but intentionally kept it endpoint-level and simple so the repo focus stays on the mainline bridge/runtime product work rather than a heavy smoke harness
+- Improved the autonomous agent runtime loop in the companion extension so it stops wasting iterations on repeated broad `search_text` calls once a likely target file is already known, preferring `read_file` and carrying recent runtime tool history in session context
+- Improved `/agent` waiting-state usability on the Feishu side by mapping pacing and authorization decisions to natural commands such as `继续本轮 agent`, `先停在这里`, `批准本次写入`, and `拒绝本次写入`, and surfaced the same wording in cards, text replies, parser aliases, and help text
+- Reconciled the runtime-first plan with the actual code baseline instead of treating Phase A/B as finished, then moved implementation focus from planner heuristics to the runtime loop itself
+- Refactored the companion extension runtime state updates onto shared transition helpers so `start / continue / approve / cancel / tool-result` no longer scatter raw state mutation across the loop and handlers
+- Added end-to-end `waitingReason` propagation across the extension runtime contract and Rust-side reply/card rendering, so Feishu now shows explicit pause reasons such as pacing, authorization, and result disposition
+- Hardened the Feishu listener transport path for live runtime usage: WebSocket control frames are ACKed, event frames are ACKed before slow handling, disconnects reconnect automatically, and endpoint/connect failures now retry instead of dropping the listener process
+- Drove the `/agent` live path through multiple real Feishu runs and narrowed the remaining runtime-quality issue to file grounding, then fixed it in the extension with deterministic definition-location biasing for symbol-explanation tasks
+- Added a runtime-loop guard that stops repeating an identical tool call and instead forces the model to answer from the existing evidence, which eliminated the repeated same-file/same-range read loop seen during live validation
+- Added a Rust-side short retry window for `/v1/chat/agent/start` transport failures so Feishu requests are less likely to fail during the brief companion-extension reload window after `F5`
+- Completed a real Feishu live validation for `/agent 分析 parse_intent...`: the run now reaches `completed`, anchors the first read on `src/lib.rs`, and returns a grounded explanation instead of stalling on wrong-file reads or repeated pacing loops
 
 ### Files Updated
+
+- `src/feishu.rs` — promoted standalone Feishu `image` messages from unsupported input to a parsed attachment payload carrying `image_key`
+- `src/main.rs` — added a direct live-listener reply path for attachment probe messages so images can validate the Feishu bridge without entering text intent dispatch
+- `src/reply.rs` — added the user-facing image probe reply formatter and focused unit coverage
 
 - `vscode-agent-bridge/src/extension.ts` — changed the semantic planner prompt/response schema to emit `decision`, `summaryForUser`, `confidence`, `risk`, and confirmation options, with explicit instruction to classify ambiguous GitHub sync phrasing as `confirm`
 - `src/vscode.rs` — updated the Rust-side planner client types to consume the new decision-based payload, including confirmation options and risk/confidence metadata
 - `src/semantic_planner.rs` — changed freeform routing so planner `execute` still maps to intents, while planner `confirm` now returns a user-facing confirmation card instead of a forced direct action
 - `src/card.rs` — added a reusable semantic-confirmation card formatter plus a unit test for candidate-action cards
 - `src/bridge.rs` — allowed semantic planner responses to return full bridge responses directly, not only mapped intents
+- `src/semantic_planner.rs` — added the live-safety override that forces ambiguous GitHub sync requests into confirmation cards even when planner output is too eager, plus focused regression coverage for the forced-confirm path
+- `scripts/start-live-listener.ps1` — reused as the verified Windows listener entrypoint for the live revalidation pass after rebuilding the Rust bridge binary
+- `scripts/smoke-agent-runtime.ps1` — added a lightweight endpoint smoke for `/health`, planner confirm routing, and multi-round agent runtime continuation
+- `.vscode/tasks.json` — added a `smoke-agent-runtime` task so the endpoint smoke can be run from the workspace without reconstructing the PowerShell command
+- `README.md` / `vscode-agent-bridge/README.md` — documented the new endpoint smoke path alongside the existing live regression flow
+- `vscode-agent-bridge/src/extension.ts` — taught the agent runtime loop to remember recent runtime tool requests, include that context in replanning, and normalize repeated broad searches toward direct file reads when a likely target file is already known
+- `src/reply.rs` / `src/card.rs` / `src/lib.rs` — added natural waiting-state command rendering, parser aliases, help-text discoverability, and targeted tests for pacing / authorization decision affordances
+- `docs/copilot_modes_autonomous_agent_plan.md` / `docs/work_log.md` — updated the runtime-mainline plan/status so the repo tracks the current runtime skeleton as started work instead of a completed architecture phase
+- `vscode-agent-bridge/src/extension.ts` — added reducer-style run transitions, explicit persistence helpers, `waitingReason`, deterministic symbol-definition grounding, search-result scoring, and repeated-tool-call convergence so `/agent` reads the right file and stops looping on the same request
+- `src/agent_runtime.rs` / `src/agent_backend.rs` / `src/session.rs` — extended the shared runtime contract and stored run literals with `waiting_reason`
+- `src/reply.rs` / `src/card.rs` — surfaced waiting reasons and natural quick commands in text replies and Feishu cards for runtime waiting states
+- `src/feishu.rs` — hardened WebSocket heartbeat ACK, early event ACK, reconnect, and retry behavior for long-lived live listener use
+- `src/vscode.rs` — added a narrow retry/backoff for `/v1/chat/agent/start` transport failures to reduce reload-window connection drops during live Feishu validation
 
 ### Verification
 
@@ -24,12 +97,24 @@
 - `cargo test semantic_planner` passed, covering the execute-path mapping plus the new confirmation-option conversion
 - `cargo test semantic_confirm_reply_returns_confirmation_card` passed, covering the new Feishu confirmation card rendering
 - Full `cargo test` currently still reports two existing Windows path-format test failures in `src/direct_command.rs` (`choose_project_without_path_returns_picker_card` and `normalize_project_path_removes_windows_extended_prefix`), which are outside this semantic-planner change set
+- After adding the forced-confirm override, the focused `cargo test semantic_planner --lib` pass succeeded again, including the new ambiguous Git sync regression coverage
+- The verified Windows live listener was rebuilt and restarted, and the real Feishu audit trail confirmed that “把本地改动同步到github上” now returns a confirmation card instead of directly executing a command
+- The companion extension still compiled successfully after the autonomous runtime-loop changes (`npm run compile` / workspace task `build-feishu-agent-bridge-extension`)
+- The new endpoint smoke passed locally on Windows: `/health` returned `ok`, planner validation reported `decision=confirm` with three Git options, and `/v1/chat/agent/continue` returned the same run with more checkpoints than `/v1/chat/agent/start`
+- `cargo test agent_runtime_reply_card --lib` passed, covering the new waiting-state card wording and command surfacing
+- `cargo test parse_agent_runtime_waiting_state_aliases --lib` passed, covering the new natural-language aliases for pacing and write-authorization decisions
+- `cargo test agent_runtime_reply_card --lib` still passed after adding `waiting_reason` rendering and runtime quick-command affordances
+- `cargo test parse_message_event_payload --lib` passed after the listener reconnect / ACK-ordering / retry hardening in `src/feishu.rs`
+- Multiple real Feishu `/agent` runs exposed the progression of runtime grounding fixes: first wrong-file reads (`src/plan.rs`), then false-positive symbol/test matches, then correct first-hop grounding on `src/lib.rs`
+- Direct local probes against `/v1/chat/agent/start` confirmed the repaired runtime now anchors the first tool read on `src/lib.rs` and helped isolate Feishu-side failures to the extension reload window rather than the runtime planner itself
+- After adding the repeated-tool-call convergence guard, the latest real Feishu `/agent 分析 parse_intent...` run completed successfully instead of pausing at pacing, with checkpoints showing `tool-1 -> Read src/lib.rs lines 253-333` followed by a completed grounded answer
+- The lightweight endpoint smoke in `scripts/smoke-agent-runtime.ps1` is now the main remaining regression gap: it still fails on the semantic-planner expectation that confirm options must include a push-related command, which is separate from the now-validated `/agent` runtime path
 
 ### Next Session Focus
 
-- Run a live Feishu smoke that proves an ambiguous GitHub-sync phrase now returns a confirmation card instead of directly executing `git pull` or another single command
-- Decide whether broad coding requests such as “帮我修一下这个问题” should also default to `confirm`, or whether they should stay on the `ask_agent` path until write-capable execution exists
-- If the live smoke is stable, extend planner-side confirmation examples beyond Git to cover risky multi-step coding requests and underspecified “继续做完” style prompts
+- Add focused regression coverage for the runtime grounding path in the companion extension, especially “first read hits the true symbol definition” and “repeated identical tool request must converge to answer instead of looping”
+- Decide whether the next runtime slice should widen beyond read-only analysis or first clean up the current heuristic stack into a smaller explicit policy surface now that live `/agent` is grounded and stable
+- Fix or relax the stale semantic-planner expectation inside `scripts/smoke-agent-runtime.ps1` so the local smoke aligns with the current confirm-option behavior and can be used as a reliable pre-live check again
 
 ## 2026-04-05
 

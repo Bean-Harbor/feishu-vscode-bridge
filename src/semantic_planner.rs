@@ -18,10 +18,12 @@ pub fn plan_freeform_intent(
     session_key: &str,
     task_text: &str,
 ) -> SemanticDispatch {
-    let current_project = session::load_persisted_session(context.session_store_path(), session_key)
-        .and_then(|stored| session::selected_project_path(&stored));
+    let current_project =
+        session::load_persisted_session(context.session_store_path(), session_key)
+            .and_then(|stored| session::selected_project_path(&stored));
 
-    let result = agent_backend::plan_semantic_intent(session_key, task_text, current_project.as_deref());
+    let result =
+        agent_backend::plan_semantic_intent(session_key, task_text, current_project.as_deref());
     route_plan_result(task_text, result)
 }
 
@@ -31,9 +33,11 @@ pub fn show_plan_prompt(
     task_text: &str,
     prompt: &str,
 ) -> BridgeResponse {
-    let current_project = session::load_persisted_session(context.session_store_path(), session_key)
-        .and_then(|stored| session::selected_project_path(&stored));
-    let result = agent_backend::plan_semantic_intent(session_key, prompt, current_project.as_deref());
+    let current_project =
+        session::load_persisted_session(context.session_store_path(), session_key)
+            .and_then(|stored| session::selected_project_path(&stored));
+    let result =
+        agent_backend::plan_semantic_intent(session_key, prompt, current_project.as_deref());
     let response = render_plan_mode_reply(task_text, &result);
 
     if result.success {
@@ -119,13 +123,14 @@ fn route_plan_result(task_text: &str, result: SemanticPlanResult) -> SemanticDis
                 ))
             }
         }
-        "clarify" => SemanticDispatch::Response(BridgeResponse::Text(
-            if result.message.trim().is_empty() {
-                "⚠️ 我还不能可靠判断你要执行的 VS Code 动作，请补充目标项目、文件或期望结果。".to_string()
+        "clarify" => {
+            SemanticDispatch::Response(BridgeResponse::Text(if result.message.trim().is_empty() {
+                "⚠️ 我还不能可靠判断你要执行的 VS Code 动作，请补充目标项目、文件或期望结果。"
+                    .to_string()
             } else {
                 result.message
-            },
-        )),
+            }))
+        }
         _ => SemanticDispatch::Response(BridgeResponse::Text(format!(
             "❓ 还不能把这句话稳定映射为可执行动作：{task_text}\n\n{}",
             if result.message.trim().is_empty() {
@@ -253,6 +258,9 @@ fn action_to_intent(action: &SemanticPlanAction) -> Result<Intent, String> {
         "ask_agent" => Ok(Intent::AskAgent {
             prompt: required_string_arg(&action.args, "prompt")?,
         }),
+        "ask_codex" => Ok(Intent::AskCodex {
+            prompt: required_string_arg(&action.args, "prompt")?,
+        }),
         "continue_agent" => Ok(Intent::ContinueAgent {
             prompt: optional_string_arg(&action.args, "prompt"),
         }),
@@ -352,7 +360,11 @@ fn optional_bool_arg(args: &Value, key: &str) -> Option<bool> {
 
 fn optional_usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
-        .and_then(|value| value.as_u64().and_then(|number| usize::try_from(number).ok()))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+        })
         .or_else(|| {
             args.get(key)
                 .and_then(Value::as_str)
@@ -485,7 +497,10 @@ mod tests {
         };
 
         match route_plan_result("把本地改动同步到github上", result) {
-            SemanticDispatch::Response(BridgeResponse::Card { fallback_text, card }) => {
+            SemanticDispatch::Response(BridgeResponse::Card {
+                fallback_text,
+                card,
+            }) => {
                 let card_text = card.to_string();
                 assert!(fallback_text.contains("需要先确认"));
                 assert!(card_text.contains("请确认下一步"));
@@ -545,7 +560,10 @@ fn render_plan_mode_reply(task_text: &str, result: &SemanticPlanResult) -> Bridg
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(task_text),
-        non_empty_message(result.message.as_str(), "Planner returned an empty explanation."),
+        non_empty_message(
+            result.message.as_str(),
+            "Planner returned an empty explanation.",
+        ),
         &action_lines,
         &choices,
         result.confidence,
@@ -583,11 +601,19 @@ fn plan_result_pending_steps(result: &SemanticPlanResult) -> Vec<String> {
 
 fn describe_semantic_action(action: &SemanticPlanAction) -> String {
     let details = match action.name.as_str() {
-        "ask_agent" => optional_string_arg(&action.args, "prompt").unwrap_or_else(|| "向 Copilot 追问".to_string()),
-        "continue_agent" => optional_string_arg(&action.args, "prompt").unwrap_or_else(|| "继续最近的 agent 任务".to_string()),
-        "read_file" => optional_string_arg(&action.args, "path").map(|path| format!("读取文件 {path}")).unwrap_or_else(|| "读取文件".to_string()),
-        "search_text" => optional_string_arg(&action.args, "query").map(|query| format!("搜索文本 {query}")).unwrap_or_else(|| "搜索文本".to_string()),
-        "run_tests" => optional_string_arg(&action.args, "command").map(|cmd| format!("运行测试 {cmd}")).unwrap_or_else(|| "运行默认测试".to_string()),
+        "ask_agent" => optional_string_arg(&action.args, "prompt")
+            .unwrap_or_else(|| "向 Copilot 追问".to_string()),
+        "continue_agent" => optional_string_arg(&action.args, "prompt")
+            .unwrap_or_else(|| "继续最近的 agent 任务".to_string()),
+        "read_file" => optional_string_arg(&action.args, "path")
+            .map(|path| format!("读取文件 {path}"))
+            .unwrap_or_else(|| "读取文件".to_string()),
+        "search_text" => optional_string_arg(&action.args, "query")
+            .map(|query| format!("搜索文本 {query}"))
+            .unwrap_or_else(|| "搜索文本".to_string()),
+        "run_tests" => optional_string_arg(&action.args, "command")
+            .map(|cmd| format!("运行测试 {cmd}"))
+            .unwrap_or_else(|| "运行默认测试".to_string()),
         "git_status" => "查看 Git 状态".to_string(),
         "git_sync" => "同步 Git 状态".to_string(),
         "git_pull" => "拉取 Git 更新".to_string(),
