@@ -1,5 +1,27 @@
 # Work Log
 
+## 2026-04-10
+
+### Summary
+
+- Added focused regression coverage for the companion extension's runtime-grounding helpers so the next session can verify the two main stabilization goals directly instead of relying only on live Feishu repros
+- Extracted the runtime planning helpers that drive definition-first grounding, repeated-tool-call equivalence checks, search-to-read narrowing, and read-range normalization into a dedicated `runtimePlanning.ts` module so they can be tested without the full VS Code extension host
+- Added a lightweight Node test entrypoint for the extension package, covering symbol extraction, real-definition detection over quoted examples, source-vs-test snippet scoring, scoped recent-file narrowing, repeated identical `read_file(...)` detection, and read-range clamping
+- Kept the runtime behavior unchanged while reducing the chance of silent regressions in the exact areas that previously caused `/agent` to read the wrong file first or loop on the same tool call
+
+### Files Updated
+
+- `vscode-agent-bridge/src/runtimePlanning.ts` — extracted pure runtime-planning helpers for grounding, tool-request formatting/equivalence, and read-range normalization
+- `vscode-agent-bridge/src/runtimePlanning.test.ts` — added focused Node tests for first-hop definition grounding and repeated-tool-call convergence helpers
+- `vscode-agent-bridge/src/extension.ts` — switched the runtime loop to import the extracted helper module instead of duplicating those functions inline
+- `vscode-agent-bridge/package.json` — added `npm test` for the new extension-side regression suite
+- `docs/work_log.md` — recorded this regression-coverage pass and its verification
+
+### Verification
+
+- `cd vscode-agent-bridge && npm test`
+- The new extension-side regression suite passed (`7 passed`), including coverage for `parse_intent`-style symbol extraction, real definition selection over quoted false positives, source-file scoring over tests, and repeated identical `read_file(...)` request detection
+
 ## 2026-04-09
 
 ### Summary

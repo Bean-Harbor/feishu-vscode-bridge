@@ -50,6 +50,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "test": "npm run compile && node --test out/runtimePlanning.test.js",
     "watch": "tsc -watch -p ./",
     "package:vsix": "node -e \"require('fs').mkdirSync('dist', { recursive: true })\" && npx @vscode/vsce package --allow-missing-repository --skip-license --out dist/feishu-agent-bridge.vsix"
   },
